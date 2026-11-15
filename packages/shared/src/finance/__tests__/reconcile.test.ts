@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { rescaleExpense } from '../reconcile.js';
+import { planExpenseEdit, rescaleExpense } from '../reconcile.js';
 import { calculateExpenseShares } from '../splitting.js';
 import type { ExpenseRecord, FamilyEntity, ParticipantEntity } from '../../types/index.js';
 
@@ -263,5 +263,194 @@ describe('rescaleExpense', () => {
         overrideCustomShares: [{ participantId: 'a', amountPaisa: 2000 }],
       })
     ).toThrow(/only valid for CUSTOM/);
+  });
+});
+
+describe('planExpenseEdit', () => {
+  it('metadata-only edit on CUSTOM or WEIGHTED returns null payments and null shares (no recalculation)', () => {
+    const customExp = build(
+      500000,
+      'CUSTOM',
+      [{ participantId: 'a', amountPaisa: 500000 }],
+      {
+        customShares: [
+          { participantId: 'a', amountPaisa: 150000 },
+          { participantId: 'b', amountPaisa: 350000 },
+        ],
+      }
+    );
+    const planCustom = planExpenseEdit({
+      expense: customExp,
+      patch: {},
+      participants,
+      families,
+    });
+    expect(planCustom.payments).toBeNull();
+    expect(planCustom.shares).toBeNull();
+    expect(planCustom.amountPaisa).toBe(500000);
+    expect(planCustom.splitMethod).toBe('CUSTOM');
+
+    const weightedExp = build(
+      400000,
+      'WEIGHTED',
+      [{ participantId: 'a', amountPaisa: 400000 }],
+      {
+        includedParticipantIds: ['a', 'b', 'c'],
+        weights: [
+          { participantId: 'a', weight: 2 },
+          { participantId: 'b', weight: 1 },
+          { participantId: 'c', weight: 1 },
+        ],
+      }
+    );
+    const planWeighted = planExpenseEdit({
+      expense: weightedExp,
+      patch: { amountPaisa: 400000, splitMethod: 'WEIGHTED' },
+      participants,
+      families,
+    });
+    expect(planWeighted.payments).toBeNull();
+    expect(planWeighted.shares).toBeNull();
+  });
+
+  it('payments-only edit replaces payments and leaves shares untouched', () => {
+    const exp = build(
+      400000,
+      'CUSTOM',
+      [{ participantId: 'a', amountPaisa: 400000 }],
+      {
+        customShares: [
+          { participantId: 'a', amountPaisa: 100000 },
+          { participantId: 'b', amountPaisa: 300000 },
+        ],
+      }
+    );
+    const plan = planExpenseEdit({
+      expense: exp,
+      patch: {
+        payments: [
+          { participantId: 'a', amountPaisa: 250000 },
+          { participantId: 'b', amountPaisa: 150000 },
+        ],
+      },
+      participants,
+      families,
+    });
+    expect(plan.shares).toBeNull();
+    expect(plan.payments?.map((p) => p.amountPaisa)).toEqual([250000, 150000]);
+  });
+
+  it('amount-only edit on WEIGHTED and CUSTOM scales shares and multi-payer payments', () => {
+    const weightedExp = build(
+      400000,
+      'WEIGHTED',
+      [
+        { participantId: 'a', amountPaisa: 300000 },
+        { participantId: 'b', amountPaisa: 100000 },
+      ],
+      {
+        includedParticipantIds: ['a', 'b', 'c'],
+        weights: [
+          { participantId: 'a', weight: 2 },
+          { participantId: 'b', weight: 1 },
+          { participantId: 'c', weight: 1 },
+        ],
+      }
+    );
+    const plan = planExpenseEdit({
+      expense: weightedExp,
+      patch: { amountPaisa: 800000 },
+      participants,
+      families,
+    });
+    expect(plan.payments?.map((p) => p.amountPaisa)).toEqual([600000, 200000]);
+    expect(Object.fromEntries((plan.shares ?? []).map((s) => [s.participantId, s.sharePaisa]))).toEqual({
+      a: 400000,
+      b: 200000,
+      c: 200000,
+    });
+  });
+
+  it('PER_FAMILY edit maintains splitConfig and includes members of newly added families', () => {
+    const cfg = {
+      includedFamilyIds: ['F1', 'F2'],
+      familyWeights: [
+        { familyId: 'F1', weight: 1 },
+        { familyId: 'F2', weight: 1 },
+      ],
+    };
+    const exp = build(
+      400000,
+      'PER_FAMILY',
+      [{ participantId: 'a', amountPaisa: 400000 }],
+      { includedFamilyIds: cfg.includedFamilyIds, familyWeights: cfg.familyWeights },
+      cfg
+    );
+
+    const plan = planExpenseEdit({
+      expense: exp,
+      patch: {
+        includedFamilyIds: ['F1', 'F2', 'F3'],
+        familyWeights: [
+          { familyId: 'F1', weight: 1 },
+          { familyId: 'F2', weight: 1 },
+          { familyId: 'F3', weight: 2 },
+        ],
+      },
+      participants,
+      families,
+    });
+    expect(plan.splitConfig).toEqual({
+      includedFamilyIds: ['F1', 'F2', 'F3'],
+      familyWeights: [
+        { familyId: 'F1', weight: 1 },
+        { familyId: 'F2', weight: 1 },
+        { familyId: 'F3', weight: 2 },
+      ],
+    });
+    expect(plan.shares?.find((s) => s.participantId === 'e')?.sharePaisa).toBe(200000);
+    expect(sum(plan.shares ?? [])).toBe(400000);
+  });
+
+  it('clears splitConfig and packageConfig when switching away from PER_FAMILY or PACKAGE', () => {
+    const pkgExp = {
+      ...build(
+        900000,
+        'PACKAGE',
+        [{ participantId: 'a', amountPaisa: 900000 }],
+        { includedParticipantIds: ['a', 'b', 'c'], packageRatePerPersonPaisa: 300000 }
+      ),
+      packageConfig: { ratePerUnitPaisa: 300000, unitCount: 3 },
+    };
+    const plan = planExpenseEdit({
+      expense: pkgExp,
+      patch: { splitMethod: 'EQUAL' },
+      participants,
+      families,
+    });
+    expect(plan.packageConfig).toBeNull();
+    expect(plan.shares?.every((s) => s.sharePaisa === 300000)).toBe(true);
+  });
+
+  it('rejects changing includedParticipantIds on CUSTOM without explicit customShares', () => {
+    const customExp = build(
+      300000,
+      'CUSTOM',
+      [{ participantId: 'a', amountPaisa: 300000 }],
+      {
+        customShares: [
+          { participantId: 'a', amountPaisa: 100000 },
+          { participantId: 'b', amountPaisa: 200000 },
+        ],
+      }
+    );
+    expect(() =>
+      planExpenseEdit({
+        expense: customExp,
+        patch: { includedParticipantIds: ['a', 'b', 'c'] },
+        participants,
+        families,
+      })
+    ).toThrow(/requires explicit customShares/);
   });
 });

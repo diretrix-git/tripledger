@@ -5,10 +5,12 @@ import {
   calculateExpenseShares,
   createExpenseSchema,
   formatPaisaToNPR,
+  planExpenseEdit,
   rescaleExpense,
   updateExpenseSchema,
   validateExpensePayments,
   type ExpenseApprovalStatus,
+  type ExpenseEditPlan,
   type RescaleExpenseResult,
 } from '@tripledger/shared';
 import {
@@ -16,6 +18,7 @@ import {
   ExpensePaymentModel,
   ExpenseShareModel,
 } from '../models/index.js';
+import { runAtomically } from '../services/atomicWrite.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
 import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
 
@@ -197,6 +200,10 @@ export const updateExpense = asyncHandler(async (req: Request, res: Response) =>
   const actor = req.participant!;
   const { expenseId } = req.params;
 
+  if (!mongoose.isValidObjectId(expenseId)) {
+    throw new AppError('Invalid expense id.', 400, 'INVALID_ID');
+  }
+
   const expense = await ExpenseModel.findOne({
     _id: expenseId,
     tripId: trip._id,
@@ -224,39 +231,51 @@ export const updateExpense = asyncHandler(async (req: Request, res: Response) =>
 
   const parsed = updateExpenseSchema.parse(req.body);
   const currentData = await loadTripLedgerData(trip._id);
-  const existingRecord = currentData.expenses.find((e) => e.id === expense._id.toString())!;
+  const existingRecord = currentData.expenses.find((e) => e.id === expense._id.toString());
 
-  const newAmountPaisa = parsed.amountPaisa ?? expense.amountPaisa;
-  const newSplitMethod = parsed.splitMethod ?? expense.splitMethod;
-  const newPayments = parsed.payments ?? existingRecord.payments;
+  if (!existingRecord || existingRecord.isDeleted) {
+    throw new AppError('Expense not found.', 404, 'EXPENSE_NOT_FOUND');
+  }
 
-  const validParticipantIds = new Set(
-    currentData.participants.filter((p) => p.isActive).map((p) => p.id)
-  );
-  validateExpensePayments(newAmountPaisa, newPayments, validParticipantIds);
+  // ---- Phase 1: validate every referenced id and plan the full target state. No writes yet. ----
+  assertReferencedIdsBelongToTrip(parsed, currentData.participants, currentData.families);
 
-  const computedShares = calculateExpenseShares({
-    amountPaisa: newAmountPaisa,
-    splitMethod: newSplitMethod,
-    participants: currentData.participants,
-    families: currentData.families,
-    includedParticipantIds:
-      parsed.includedParticipantIds ??
-      existingRecord.shares.map((s) => s.participantId),
-    includedFamilyIds: parsed.includedFamilyIds,
-    customShares: parsed.customShares,
-    weights: parsed.weights,
-    familyWeights: parsed.familyWeights,
-    packageRatePerPersonPaisa:
-      parsed.packageRatePerPersonPaisa ??
-      expense.packageConfig?.ratePerUnitPaisa,
-  });
+  let plan: ExpenseEditPlan;
+  try {
+    plan = planExpenseEdit({
+      expense: existingRecord,
+      patch: {
+        amountPaisa: parsed.amountPaisa,
+        splitMethod: parsed.splitMethod,
+        payments: parsed.payments,
+        includedParticipantIds: parsed.includedParticipantIds,
+        includedFamilyIds: parsed.includedFamilyIds,
+        customShares: parsed.customShares,
+        weights: parsed.weights,
+        familyWeights: parsed.familyWeights,
+        packageRatePerPersonPaisa: parsed.packageRatePerPersonPaisa,
+      },
+      participants: currentData.participants,
+      families: currentData.families,
+    });
+  } catch (err) {
+    throw new AppError(
+      err instanceof Error ? err.message : 'Invalid expense update.',
+      400,
+      'INVALID_EXPENSE_UPDATE'
+    );
+  }
 
+  const financialChange = plan.payments !== null || plan.shares !== null;
+
+  // Snapshot the persisted expense document before mutating in-memory fields
+  const expenseSnapshot = expense.toObject();
+  const expectedVersion = typeof expenseSnapshot.__v === 'number' ? expenseSnapshot.__v : 0;
+
+  // Metadata (never affects the ledger)
   if (parsed.title !== undefined) expense.title = parsed.title;
   if (parsed.description !== undefined) expense.description = parsed.description;
   if (parsed.category !== undefined) expense.category = parsed.category;
-  expense.amountPaisa = newAmountPaisa;
-  expense.splitMethod = newSplitMethod;
   if (parsed.paymentMethod !== undefined) expense.paymentMethod = parsed.paymentMethod;
   if (parsed.isEstimated !== undefined) {
     expense.isEstimated = parsed.isEstimated;
@@ -268,14 +287,44 @@ export const updateExpense = asyncHandler(async (req: Request, res: Response) =>
     expense.approvalStatus = parsed.approvalStatus;
   }
 
-  await expense.save();
+  // Financial fields (only touched when the plan says so)
+  const wasPackageSplit = existingRecord.splitMethod === 'PACKAGE';
+  expense.amountPaisa = plan.amountPaisa;
+  expense.splitMethod = plan.splitMethod;
+  if (parsed.isPackage !== undefined) {
+    expense.isPackage = parsed.isPackage;
+  } else if (plan.splitMethod === 'PACKAGE') {
+    expense.isPackage = true;
+  } else if (wasPackageSplit) {
+    expense.isPackage = false;
+  }
 
-  // Atomically replace payments and shares for this expense
-  await ExpensePaymentModel.deleteMany({ expenseId: expense._id });
-  await ExpenseShareModel.deleteMany({ expenseId: expense._id });
+  if (plan.packageConfig === null) {
+    expense.set('packageConfig', undefined);
+  } else if (plan.packageConfig) {
+    expense.packageConfig = plan.packageConfig;
+  }
 
-  await ExpensePaymentModel.insertMany(
-    newPayments.map((pay) => ({
+  if (plan.splitConfig === null) {
+    expense.set('splitConfig', undefined);
+  } else if (plan.splitConfig) {
+    expense.splitConfig = plan.splitConfig;
+  }
+
+  // ---- Phase 2: persist ----
+  if (!financialChange) {
+    // Metadata-only edit touches only the Expense document (natively atomic in MongoDB).
+    await expense.save();
+  } else {
+    const oldPaymentDocs = plan.payments
+      ? await ExpensePaymentModel.find({ expenseId: expense._id }).lean()
+      : [];
+    const oldShareDocs = plan.shares
+      ? await ExpenseShareModel.find({ expenseId: expense._id }).lean()
+      : [];
+
+    const newPaymentDocs = (plan.payments ?? []).map((pay) => ({
+      _id: new mongoose.Types.ObjectId(),
       tripId: trip._id,
       expenseId: expense._id,
       participantId: new mongoose.Types.ObjectId(pay.participantId),
@@ -283,19 +332,146 @@ export const updateExpense = asyncHandler(async (req: Request, res: Response) =>
       paymentMethod: pay.paymentMethod ?? expense.paymentMethod,
       paidAt: expense.incurredAt,
       notes: pay.notes,
-    }))
-  );
-
-  await ExpenseShareModel.insertMany(
-    computedShares.map((sh) => ({
+    }));
+    const newShareDocs = (plan.shares ?? []).map((sh) => ({
+      _id: new mongoose.Types.ObjectId(),
       tripId: trip._id,
       expenseId: expense._id,
       participantId: new mongoose.Types.ObjectId(sh.participantId),
       familyId: sh.familyId ? new mongoose.Types.ObjectId(sh.familyId) : null,
       sharePaisa: sh.sharePaisa,
       weightUsed: sh.weightUsed ?? 1,
-    }))
-  );
+    }));
+
+    const unsetFields: Record<string, 1> = {};
+    if (plan.packageConfig === null) unsetFields.packageConfig = 1;
+    if (plan.splitConfig === null) unsetFields.splitConfig = 1;
+
+    const setFields: Record<string, unknown> = {
+      title: expense.title,
+      description: expense.description,
+      category: expense.category,
+      paymentMethod: expense.paymentMethod,
+      isEstimated: expense.isEstimated,
+      approvalStatus: expense.approvalStatus,
+      amountPaisa: expense.amountPaisa,
+      splitMethod: expense.splitMethod,
+      isPackage: expense.isPackage,
+    };
+    if (plan.packageConfig) setFields.packageConfig = plan.packageConfig;
+    else if (plan.packageConfig === undefined && expense.packageConfig?.ratePerUnitPaisa) {
+      setFields.packageConfig = expense.packageConfig;
+    }
+    if (plan.splitConfig) setFields.splitConfig = plan.splitConfig;
+    else if (plan.splitConfig === undefined && expense.splitConfig) {
+      setFields.splitConfig = expense.splitConfig;
+    }
+
+    let expenseModifiedByThisAttempt = false;
+
+    await runAtomically(
+      async (session) => {
+        const opts = session ? { session } : {};
+        expenseModifiedByThisAttempt = false;
+
+        // 1. Insert new payment and share documents first (old rows are still intact).
+        if (plan.payments) {
+          await ExpensePaymentModel.insertMany(newPaymentDocs, opts);
+        }
+        if (plan.shares) {
+          await ExpenseShareModel.insertMany(newShareDocs, opts);
+        }
+
+        // 2. Atomically update Expense with optimistic concurrency (__v) check before deleting old rows.
+        const updatedExpense = await ExpenseModel.findOneAndUpdate(
+          { _id: expense._id, tripId: trip._id, isDeleted: false, __v: expectedVersion },
+          {
+            $set: setFields,
+            ...(Object.keys(unsetFields).length > 0 ? { $unset: unsetFields } : {}),
+            $inc: { __v: 1 },
+          },
+          { new: true, runValidators: true, ...opts }
+        );
+
+        if (!updatedExpense) {
+          throw new AppError(
+            'Expense was modified concurrently by another request. Please refresh and try again.',
+            409,
+            'CONCURRENT_MODIFICATION'
+          );
+        }
+        expenseModifiedByThisAttempt = true;
+
+        // 3. Remove previous payment and share documents by explicit _id.
+        if (plan.payments && oldPaymentDocs.length > 0) {
+          await ExpensePaymentModel.deleteMany(
+            { _id: { $in: oldPaymentDocs.map((d) => d._id) } },
+            opts
+          );
+        }
+        if (plan.shares && oldShareDocs.length > 0) {
+          await ExpenseShareModel.deleteMany(
+            { _id: { $in: oldShareDocs.map((d) => d._id) } },
+            opts
+          );
+        }
+      },
+      async () => {
+        // Best-effort compensation (standalone non-production fallback only):
+        // Remove any newly inserted rows, re-upsert any deleted old rows, and restore Expense if modified.
+        if (plan.payments) {
+          await ExpensePaymentModel.deleteMany({ _id: { $in: newPaymentDocs.map((d) => d._id) } });
+          if (oldPaymentDocs.length > 0) {
+            await ExpensePaymentModel.bulkWrite(
+              oldPaymentDocs.map((d) => ({
+                updateOne: {
+                  filter: { _id: d._id },
+                  update: {
+                    $set: {
+                      tripId: d.tripId,
+                      expenseId: d.expenseId,
+                      participantId: d.participantId,
+                      amountPaisa: d.amountPaisa,
+                      paymentMethod: d.paymentMethod,
+                      paidAt: d.paidAt,
+                      notes: d.notes,
+                    },
+                  },
+                  upsert: true,
+                },
+              }))
+            );
+          }
+        }
+        if (plan.shares) {
+          await ExpenseShareModel.deleteMany({ _id: { $in: newShareDocs.map((d) => d._id) } });
+          if (oldShareDocs.length > 0) {
+            await ExpenseShareModel.bulkWrite(
+              oldShareDocs.map((d) => ({
+                updateOne: {
+                  filter: { _id: d._id },
+                  update: {
+                    $set: {
+                      tripId: d.tripId,
+                      expenseId: d.expenseId,
+                      participantId: d.participantId,
+                      familyId: d.familyId ?? null,
+                      sharePaisa: d.sharePaisa,
+                      weightUsed: d.weightUsed ?? 1,
+                    },
+                  },
+                  upsert: true,
+                },
+              }))
+            );
+          }
+        }
+        if (expenseModifiedByThisAttempt) {
+          await ExpenseModel.replaceOne({ _id: expense._id }, expenseSnapshot);
+        }
+      }
+    );
+  }
 
   await logTripActivity({
     tripId: trip._id,
@@ -305,7 +481,12 @@ export const updateExpense = asyncHandler(async (req: Request, res: Response) =>
     actionType: 'EXPENSE_EDITED',
     entityType: 'EXPENSE',
     entityId: expense._id,
-    summary: `${actor.name} updated expense "${expense.title}" to ${formatPaisaToNPR(expense.amountPaisa)}.`,
+    summary: `${actor.name} updated expense "${expense.title}" (${formatPaisaToNPR(expense.amountPaisa)}).`,
+    metadata: {
+      financialRecalculation: financialChange,
+      paymentsReplaced: plan.payments !== null,
+      sharesReplaced: plan.shares !== null,
+    },
   });
 
   const updatedLedgerData = await loadTripLedgerData(trip._id);
@@ -320,6 +501,66 @@ export const updateExpense = asyncHandler(async (req: Request, res: Response) =>
     familySettlementSuggestions: updatedLedgerData.familySettlementSuggestions,
   });
 });
+
+/**
+ * Rejects malformed or foreign ids BEFORE any database mutation: every participant id must be a
+ * valid ObjectId of an ACTIVE participant of this trip and every family id a valid ObjectId of a
+ * family of this trip.
+ */
+function assertReferencedIdsBelongToTrip(
+  parsed: {
+    payments?: Array<{ participantId: string }>;
+    includedParticipantIds?: string[];
+    customShares?: Array<{ participantId: string }>;
+    weights?: Array<{ participantId: string }>;
+    includedFamilyIds?: string[];
+    familyWeights?: Array<{ familyId: string }>;
+  },
+  participants: Array<{ id: string; isActive: boolean }>,
+  families: Array<{ id: string }>
+): void {
+  const activeParticipantIds = new Set(participants.filter((p) => p.isActive).map((p) => p.id));
+  const familyIds = new Set(families.map((f) => f.id));
+
+  const participantRefs: Array<[string, string]> = [
+    ...(parsed.payments ?? []).map((x): [string, string] => ['payments', x.participantId]),
+    ...(parsed.includedParticipantIds ?? []).map((id): [string, string] => [
+      'includedParticipantIds',
+      id,
+    ]),
+    ...(parsed.customShares ?? []).map((x): [string, string] => ['customShares', x.participantId]),
+    ...(parsed.weights ?? []).map((x): [string, string] => ['weights', x.participantId]),
+  ];
+  for (const [field, id] of participantRefs) {
+    if (!mongoose.isValidObjectId(id)) {
+      throw new AppError(`${field}: "${id}" is not a valid id.`, 400, 'INVALID_ID');
+    }
+    if (!activeParticipantIds.has(id)) {
+      throw new AppError(
+        `${field}: participant "${id}" is not an active participant of this trip.`,
+        400,
+        'INVALID_REFERENCE'
+      );
+    }
+  }
+
+  const familyRefs: Array<[string, string]> = [
+    ...(parsed.includedFamilyIds ?? []).map((id): [string, string] => ['includedFamilyIds', id]),
+    ...(parsed.familyWeights ?? []).map((x): [string, string] => ['familyWeights', x.familyId]),
+  ];
+  for (const [field, id] of familyRefs) {
+    if (!mongoose.isValidObjectId(id)) {
+      throw new AppError(`${field}: "${id}" is not a valid id.`, 400, 'INVALID_ID');
+    }
+    if (!familyIds.has(id)) {
+      throw new AppError(
+        `${field}: family "${id}" does not belong to this trip.`,
+        400,
+        'INVALID_REFERENCE'
+      );
+    }
+  }
+}
 
 export const approveOrConfirmExpense = asyncHandler(async (req: Request, res: Response) => {
   const trip = req.trip!;
