@@ -1,0 +1,41 @@
+# Standard Node.js and Monorepo ignores
+node_modules/
+dist/
+build/
+.turbo/
+.vite/
+coverage/
+playwright-report/
+test-results/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+credentials.json
+
+# Local databases and temporary runtime data
+.data/
+*.db
+*.sqlite
+*.sqlite3
+dump/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
