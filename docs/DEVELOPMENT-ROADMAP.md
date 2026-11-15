@@ -1,7 +1,7 @@
 # TripLedger — Development Roadmap & Engineering Log
 
 ## Current Status
-- **Active Phase:** Phase 0 — Project Planning & Documentation -> Transitioning to Phase 1 — Project Foundation
+- **Active Phase:** Phase 1 Complete -> Transitioning to Phase 2 — Authentication, Users & RBAC
 - **Last Updated:** 2026-11-15
 
 ---
@@ -41,17 +41,17 @@
 - [x] Initialize Git repository, create public GitHub repository `tripledger`, and push initial documentation commit.
 
 ### Phase 1 — Project Foundation & Financial Calculation Engine
-- [ ] Configure root `package.json` workspaces and `tsconfig.base.json`.
-- [ ] Implement `@tripledger/shared`:
-  - [ ] NPR <-> integer paisa currency utilities.
-  - [ ] Equal, Selective, Custom, Weighted, Per-Family, and Fixed Package splitting strategies.
-  - [ ] Multi-payer contribution validator.
-  - [ ] Individual and Family balance calculator.
-  - [ ] Minimum-transfer settlement optimization algorithm & partial settlement handler.
-  - [ ] Automated financial invariant verifier (`verifyLedgerInvariants`).
-  - [ ] Comprehensive Vitest unit test suite covering all 8 mandatory financial invariants.
-- [ ] Initialize `@tripledger/server` foundation (Express, TypeScript, Mongoose models, security middleware, error handling).
-- [ ] Initialize `@tripledger/client` foundation (React, Vite, TypeScript, Tailwind CSS, design system tokens).
+- [x] Configure root `package.json` workspaces and `tsconfig.base.json`.
+- [x] Implement `@tripledger/shared`:
+  - [x] NPR <-> integer paisa currency utilities.
+  - [x] Equal, Selective, Custom, Weighted, Per-Family, and Fixed Package splitting strategies.
+  - [x] Multi-payer contribution validator.
+  - [x] Individual and Family balance calculator.
+  - [x] Minimum-transfer settlement optimization algorithm & partial settlement handler.
+  - [x] Automated financial invariant verifier (`verifyLedgerInvariants`).
+  - [x] Comprehensive Vitest unit test suite covering all 8 mandatory financial invariants.
+- [x] Initialize `@tripledger/server` foundation (Express, TypeScript, Mongoose models, security middleware, error handling).
+- [x] Initialize `@tripledger/client` foundation (React, Vite, TypeScript, Tailwind CSS, design system tokens).
 
 ### Phase 2 — Authentication, Users & RBAC
 - [ ] Implement user registration, login, refresh token rotation, logout, and profile endpoints.

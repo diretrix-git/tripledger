@@ -1,0 +1,36 @@
+{
+  "name": "tripledger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A mobile-first expense management PWA for group trips, friends and family expenses.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/diretrix-git/tripledger.git"
+  },
+  "workspaces": [
+    "packages/*",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "build:shared": "npm --workspace=@tripledger/shared run build",
+    "build:server": "npm --workspace=@tripledger/server run build",
+    "build:client": "npm --workspace=@tripledger/client run build",
+    "build": "npm run build:shared && npm run build:server && npm run build:client",
+    "dev:server": "npm --workspace=@tripledger/server run dev",
+    "dev:client": "npm --workspace=@tripledger/client run dev",
+    "typecheck": "npm --workspaces --if-present run typecheck",
+    "lint": "npm --workspaces --if-present run lint",
+    "test:shared": "npm --workspace=@tripledger/shared run test",
+    "test:server": "npm --workspace=@tripledger/server run test",
+    "test:client": "npm --workspace=@tripledger/client run test",
+    "test": "npm run test:shared && npm run test:server && npm run test:client"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
