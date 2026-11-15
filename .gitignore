@@ -4,6 +4,7 @@ dist/
 build/
 .turbo/
 .vite/
+*.tsbuildinfo
 coverage/
 playwright-report/
 test-results/
