@@ -144,6 +144,12 @@ export const updateExpenseSchema = createExpenseSchema.partial().extend({
 export const approveExpenseSchema = z.object({
   approvalStatus: z.enum(['APPROVED', 'REJECTED']),
   actualAmountPaisa: z.number().int().positive().optional(),
+  /** Optional explicit payer breakdown for the actual amount (must sum to actualAmountPaisa). */
+  payments: z.array(expensePaymentSchema).min(1).optional(),
+  /** Optional explicit custom shares for the actual amount (CUSTOM splits only). */
+  customShares: z.array(customShareSchema).optional(),
+  /** Optional explicit per-person package rate (PACKAGE splits only). */
+  packageRatePerPersonPaisa: z.number().int().positive().optional(),
 });
 
 export const createSettlementSchema = z.object({

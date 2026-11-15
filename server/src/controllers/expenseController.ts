@@ -5,9 +5,11 @@ import {
   calculateExpenseShares,
   createExpenseSchema,
   formatPaisaToNPR,
+  rescaleExpense,
   updateExpenseSchema,
   validateExpensePayments,
   type ExpenseApprovalStatus,
+  type RescaleExpenseResult,
 } from '@tripledger/shared';
 import {
   ExpenseModel,
@@ -106,6 +108,13 @@ export const createExpense = asyncHandler(async (req: Request, res: Response) =>
         ? {
             ratePerUnitPaisa: parsed.packageRatePerPersonPaisa,
             unitCount: computedShares.length,
+          }
+        : undefined,
+    splitConfig:
+      parsed.splitMethod === 'PER_FAMILY'
+        ? {
+            includedFamilyIds: parsed.includedFamilyIds,
+            familyWeights: parsed.familyWeights,
           }
         : undefined,
     splitMethod: parsed.splitMethod,
@@ -329,37 +338,68 @@ export const approveOrConfirmExpense = asyncHandler(async (req: Request, res: Re
     throw new AppError('Expense not found.', 404, 'EXPENSE_NOT_FOUND');
   }
 
-  expense.approvalStatus = parsed.approvalStatus;
-  expense.isEstimated = false;
-  expense.approvedByParticipantId = actor._id;
+  const hasAdjustmentOverrides =
+    parsed.payments !== undefined ||
+    parsed.customShares !== undefined ||
+    parsed.packageRatePerPersonPaisa !== undefined;
 
-  // If organizer supplied an updated actualAmountPaisa when confirming an estimated expense
-  if (parsed.actualAmountPaisa && parsed.actualAmountPaisa !== expense.amountPaisa) {
+  // An actual amount only takes effect on approval. A rejected expense never touches the ledger.
+  const amountChanged =
+    parsed.approvalStatus === 'APPROVED' &&
+    parsed.actualAmountPaisa !== undefined &&
+    parsed.actualAmountPaisa !== expense.amountPaisa;
+
+  if (hasAdjustmentOverrides && !amountChanged) {
+    throw new AppError(
+      'payments, customShares and packageRatePerPersonPaisa may only be supplied together with an actualAmountPaisa that differs from the recorded amount.',
+      400,
+      'INVALID_EXPENSE_ADJUSTMENT'
+    );
+  }
+
+  // Phase 1 — compute and fully validate the adjustment BEFORE any database mutation.
+  let adjustment: RescaleExpenseResult | null = null;
+  const previousAmountPaisa = expense.amountPaisa;
+  if (amountChanged) {
     const currentData = await loadTripLedgerData(trip._id);
-    const existingRecord = currentData.expenses.find(
-      (e) => e.id === expense._id.toString()
-    )!;
-
-    // Scale single payer or primary payer to match actual amount
-    const existingPayments = existingRecord.payments;
-    if (existingPayments.length === 1) {
-      await ExpensePaymentModel.updateOne(
-        { expenseId: expense._id },
-        { $set: { amountPaisa: parsed.actualAmountPaisa } }
+    const existingRecord = currentData.expenses.find((e) => e.id === expense._id.toString())!;
+    try {
+      adjustment = rescaleExpense({
+        expense: existingRecord,
+        newAmountPaisa: parsed.actualAmountPaisa!,
+        participants: currentData.participants,
+        families: currentData.families,
+        overridePayments: parsed.payments,
+        overrideCustomShares: parsed.customShares,
+        overridePackageRatePerPersonPaisa: parsed.packageRatePerPersonPaisa,
+      });
+    } catch (err) {
+      throw new AppError(
+        err instanceof Error ? err.message : 'Unable to adjust expense to the actual amount.',
+        400,
+        'INVALID_EXPENSE_ADJUSTMENT'
       );
     }
+  }
 
-    const recomputedShares = calculateExpenseShares({
-      amountPaisa: parsed.actualAmountPaisa,
-      splitMethod: expense.splitMethod,
-      participants: currentData.participants,
-      families: currentData.families,
-      includedParticipantIds: existingRecord.shares.map((s) => s.participantId),
-    });
+  // Phase 2 — persist.
+  if (adjustment) {
+    await ExpensePaymentModel.deleteMany({ expenseId: expense._id });
+    await ExpensePaymentModel.insertMany(
+      adjustment.payments.map((pay) => ({
+        tripId: trip._id,
+        expenseId: expense._id,
+        participantId: new mongoose.Types.ObjectId(pay.participantId),
+        amountPaisa: pay.amountPaisa,
+        paymentMethod: pay.paymentMethod ?? expense.paymentMethod,
+        paidAt: expense.incurredAt,
+        notes: pay.notes,
+      }))
+    );
 
     await ExpenseShareModel.deleteMany({ expenseId: expense._id });
     await ExpenseShareModel.insertMany(
-      recomputedShares.map((sh) => ({
+      adjustment.shares.map((sh) => ({
         tripId: trip._id,
         expenseId: expense._id,
         participantId: new mongoose.Types.ObjectId(sh.participantId),
@@ -369,8 +409,15 @@ export const approveOrConfirmExpense = asyncHandler(async (req: Request, res: Re
       }))
     );
 
-    expense.amountPaisa = parsed.actualAmountPaisa;
+    expense.amountPaisa = parsed.actualAmountPaisa!;
+    if (adjustment.packageConfig) {
+      expense.packageConfig = adjustment.packageConfig;
+    }
   }
+
+  expense.approvalStatus = parsed.approvalStatus;
+  expense.isEstimated = false;
+  expense.approvedByParticipantId = actor._id;
 
   await expense.save();
 
@@ -383,6 +430,9 @@ export const approveOrConfirmExpense = asyncHandler(async (req: Request, res: Re
     entityType: 'EXPENSE',
     entityId: expense._id,
     summary: `${actor.name} ${parsed.approvalStatus === 'APPROVED' ? 'approved' : 'rejected'} expense "${expense.title}" (${formatPaisaToNPR(expense.amountPaisa)}).`,
+    metadata: adjustment
+      ? { previousAmountPaisa, actualAmountPaisa: expense.amountPaisa }
+      : undefined,
   });
 
   const updatedLedgerData = await loadTripLedgerData(trip._id);

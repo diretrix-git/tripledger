@@ -61,6 +61,14 @@ export interface ExpenseRecord {
     ratePerUnitPaisa: number;
     unitCount: number;
   };
+  /**
+   * Persisted split configuration that cannot be reconstructed from ExpenseShare rows alone
+   * (currently only PER_FAMILY). Used to preserve configuration when an amount is re-scaled.
+   */
+  splitConfig?: {
+    includedFamilyIds?: string[];
+    familyWeights?: Array<{ familyId: string; weight?: number }>;
+  };
   splitMethod: SplitMethod;
   paymentMethod: PaymentMethod;
   approvalStatus: ExpenseApprovalStatus;

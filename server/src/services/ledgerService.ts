@@ -126,6 +126,19 @@ export async function loadTripLedgerData(tripId: string | mongoose.Types.ObjectI
             unitCount: e.packageConfig.unitCount,
           }
         : undefined,
+      splitConfig: e.splitConfig
+        ? {
+            includedFamilyIds: e.splitConfig.includedFamilyIds
+              ? [...e.splitConfig.includedFamilyIds]
+              : undefined,
+            familyWeights: e.splitConfig.familyWeights
+              ? e.splitConfig.familyWeights.map((fw) => ({
+                  familyId: fw.familyId,
+                  weight: fw.weight,
+                }))
+              : undefined,
+          }
+        : undefined,
       splitMethod: e.splitMethod,
       paymentMethod: e.paymentMethod,
       approvalStatus: e.approvalStatus,

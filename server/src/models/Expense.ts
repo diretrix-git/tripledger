@@ -23,6 +23,10 @@ export interface IExpense extends Document {
     ratePerUnitPaisa: number;
     unitCount: number;
   };
+  splitConfig?: {
+    includedFamilyIds?: string[];
+    familyWeights?: Array<{ familyId: string; weight?: number }>;
+  };
   splitMethod: SplitMethod;
   paymentMethod: PaymentMethod;
   approvalStatus: ExpenseApprovalStatus;
@@ -56,6 +60,24 @@ const expenseSchema = new Schema<IExpense>(
     packageConfig: {
       ratePerUnitPaisa: { type: Number },
       unitCount: { type: Number },
+    },
+    splitConfig: {
+      type: new Schema(
+        {
+          includedFamilyIds: { type: [String], default: undefined },
+          familyWeights: {
+            type: [
+              new Schema(
+                { familyId: { type: String, required: true }, weight: { type: Number } },
+                { _id: false }
+              ),
+            ],
+            default: undefined,
+          },
+        },
+        { _id: false }
+      ),
+      default: undefined,
     },
     splitMethod: { type: String, enum: SPLIT_METHODS, required: true },
     paymentMethod: { type: String, enum: PAYMENT_METHODS, default: 'CASH' },
