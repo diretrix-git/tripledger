@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import { env } from './config/env.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { authRouter } from './routes/authRoutes.js';
 import { sendSuccess } from './utils/http.js';
 
 export function createApp(): express.Application {
@@ -39,6 +40,8 @@ export function createApp(): express.Application {
       currency: 'NPR',
     });
   });
+
+  app.use('/api/v1/auth', authRouter);
 
   app.use(errorHandler);
 

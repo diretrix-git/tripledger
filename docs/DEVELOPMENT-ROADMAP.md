@@ -1,7 +1,7 @@
 # TripLedger — Development Roadmap & Engineering Log
 
 ## Current Status
-- **Active Phase:** Phase 1 Complete -> Transitioning to Phase 2 — Authentication, Users & RBAC
+- **Active Phase:** Phase 2 Complete -> Transitioning to Phase 3 — Trip Management & Forgotten Expense Protection
 - **Last Updated:** 2026-11-15
 
 ---
@@ -54,11 +54,11 @@
 - [x] Initialize `@tripledger/client` foundation (React, Vite, TypeScript, Tailwind CSS, design system tokens).
 
 ### Phase 2 — Authentication, Users & RBAC
-- [ ] Implement user registration, login, refresh token rotation, logout, and profile endpoints.
-- [ ] Implement JWT authentication middleware and trip-scoped RBAC authorization (`ORGANIZER`, `CONTRIBUTOR`, `FAMILY_REP`, `PARTICIPANT`).
-- [ ] Support guest participants (`userId: null`) and optional account linking via invite code/email.
-- [ ] Build frontend authentication screens (Login, Register) and protected route guards.
-- [ ] Write Supertest integration tests for Auth and RBAC enforcement.
+- [x] Implement user registration, login, refresh token rotation, logout, and profile endpoints.
+- [x] Implement JWT authentication middleware and trip-scoped RBAC authorization (`ORGANIZER`, `CONTRIBUTOR`, `FAMILY_REP`, `PARTICIPANT`).
+- [x] Support guest participants (`userId: null`) and optional account linking via invite code/email.
+- [x] Build frontend authentication screens (Login, Register) and protected route guards.
+- [x] Write Supertest integration tests for Auth and RBAC enforcement.
 
 ### Phase 3 — Trip Management & Forgotten Expense Protection
 - [ ] Implement Friends Mode and Family Mode trip creation, status lifecycle (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`), and budget tracking.
