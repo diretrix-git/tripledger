@@ -24,7 +24,7 @@ TripLedger supports two distinct operating modes powered by a unified, invariant
 - [x] Phase 0: System Architecture, Database Schema Design, Financial Engine Specification, API Specification, and Development Roadmap.
 - [x] Phase 1: Monorepo Foundation (Frontend + Backend + Shared Domain + Financial Engine Core & Invariant Tests).
 - [x] Phase 2: Authentication, RBAC Authorization & Guest Participant Linking.
-- [ ] Phase 3: Trip Management (Friends & Family Modes) & Forgotten Expense Protection Checklist.
+- [x] Phase 3: Trip Management (Friends & Family Modes) & Forgotten Expense Protection Checklist.
 - [ ] Phase 4: Expense Engine, Multiple Payers & Splitting Strategies.
 - [ ] Phase 5: Family Mode Groups, Packages, Approval Workflow & Dual-Level Balances.
 - [ ] Phase 6: Settlement Optimization Engine, Partial Settlements & Confirmation Workflow.

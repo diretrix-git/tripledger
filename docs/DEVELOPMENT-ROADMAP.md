@@ -1,7 +1,7 @@
 # TripLedger — Development Roadmap & Engineering Log
 
 ## Current Status
-- **Active Phase:** Phase 2 Complete -> Transitioning to Phase 3 — Trip Management & Forgotten Expense Protection
+- **Active Phase:** Phase 3 Complete -> Transitioning to Phase 4 & 5 — Expense Engine, Multiple Payers & Family Mode
 - **Last Updated:** 2026-11-15
 
 ---
@@ -61,11 +61,11 @@
 - [x] Write Supertest integration tests for Auth and RBAC enforcement.
 
 ### Phase 3 — Trip Management & Forgotten Expense Protection
-- [ ] Implement Friends Mode and Family Mode trip creation, status lifecycle (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`), and budget tracking.
-- [ ] Implement guest participant management and invite code joining.
-- [ ] Implement Forgotten Expense Protection checklist (10 trip categories, pending/estimated expense verification, pre-close review).
-- [ ] Build Dashboard, Friends Trips, Family Trips, and Trip Creation UI flows.
-- [ ] Write integration tests for trip lifecycle and participant management.
+- [x] Implement Friends Mode and Family Mode trip creation, status lifecycle (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`), and budget tracking.
+- [x] Implement guest participant management and invite code joining.
+- [x] Implement Forgotten Expense Protection checklist (10 trip categories, pending/estimated expense verification, pre-close review).
+- [x] Build Dashboard, Friends Trips, Family Trips, and Trip Creation API flows.
+- [x] Write integration tests for trip lifecycle and participant management.
 
 ### Phase 4 — Expense Engine & Multiple Payers
 - [ ] Implement expense creation, editing, soft-deletion, and categorization.
