@@ -1,7 +1,7 @@
 # TripLedger — Development Roadmap & Engineering Log
 
 ## Current Status
-- **Active Phase:** Phase 3 Complete -> Transitioning to Phase 4 & 5 — Expense Engine, Multiple Payers & Family Mode
+- **Active Phase:** Phase 4 & 5 Complete -> Transitioning to Phase 6 & 7 — Settlements, Reporting & Exports
 - **Last Updated:** 2026-11-15
 
 ---
@@ -68,19 +68,19 @@
 - [x] Write integration tests for trip lifecycle and participant management.
 
 ### Phase 4 — Expense Engine & Multiple Payers
-- [ ] Implement expense creation, editing, soft-deletion, and categorization.
-- [ ] Support single payer and multiple contributors (`ExpensePayments`) per expense.
-- [ ] Support Equal, Custom, and Selective splitting in Friends Mode.
-- [ ] Support estimated/pending expenses (`isEstimated: true`, `PENDING_CONFIRMATION`) and resolution.
-- [ ] Build Quick-Add Expense drawer, multi-payer editor, split configurator, and expense history feed.
-- [ ] Write integration tests for expense creation, multi-payer validation, editing recalculation, and soft deletion.
+- [x] Implement expense creation, editing, soft-deletion, and categorization.
+- [x] Support single payer and multiple contributors (`ExpensePayments`) per expense.
+- [x] Support Equal, Custom, and Selective splitting in Friends Mode.
+- [x] Support estimated/pending expenses (`isEstimated: true`, `PENDING_CONFIRMATION`) and resolution.
+- [x] Build expense REST endpoints and idempotency verification.
+- [x] Write integration tests for expense creation, multi-payer validation, editing recalculation, and soft deletion.
 
 ### Phase 5 — Family Mode (Groups, Representatives, Packages & Approval Workflow)
-- [ ] Implement Family group CRUD, member assignment (`ADULT`, `CHILD`, `DEPENDENT`), configurable weights, and Representative assignment.
-- [ ] Implement `PER_FAMILY`, `WEIGHTED`, and fixed per-person `PACKAGE` expense splitting.
-- [ ] Implement hybrid family payment workflow (Organizer default payer, Contributor submissions, Organizer approval/rejection).
-- [ ] Build Family Trip Dashboard (Family groups, representatives, package vs. additional expenses, reconciled family + individual balances).
-- [ ] Write integration tests for Family Mode workflows, package expenses, and family/individual balance reconciliation.
+- [x] Implement Family group CRUD, member assignment (`ADULT`, `CHILD`, `DEPENDENT`), configurable weights, and Representative assignment.
+- [x] Implement `PER_FAMILY`, `WEIGHTED`, and fixed per-person `PACKAGE` expense splitting.
+- [x] Implement hybrid family payment workflow (Organizer default payer, Contributor submissions, Organizer approval/rejection).
+- [x] Build Family Mode ledger calculations (package vs. additional expenses, reconciled family + individual balances).
+- [x] Write integration tests for Family Mode workflows, package expenses, and family/individual balance reconciliation.
 
 ### Phase 6 — Settlements Engine & Workflow
 - [ ] Implement Individual and Family-level settlement views and minimum-transfer suggestions.

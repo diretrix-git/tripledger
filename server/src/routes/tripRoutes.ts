@@ -16,6 +16,7 @@ import {
 } from '../controllers/tripController.js';
 import { getDashboardSummary } from '../controllers/dashboardController.js';
 import { requireAuth, requireTripRole } from '../middleware/auth.js';
+import { expenseRouter } from './expenseRoutes.js';
 
 export const dashboardRouter = Router();
 dashboardRouter.get('/summary', requireAuth, getDashboardSummary);
@@ -50,3 +51,6 @@ tripRouter.delete(
 tripRouter.post('/:tripId/families', requireTripRole(['ORGANIZER']), createFamily);
 tripRouter.patch('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']), updateFamily);
 tripRouter.delete('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']), deleteFamily);
+
+// Expenses
+tripRouter.use('/:tripId/expenses', expenseRouter);
