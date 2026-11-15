@@ -1,4 +1,4 @@
-import mongoose from 'mongoose';
+import mongoose, { type ClientSession } from 'mongoose';
 import {
   ActivityLogModel,
   ExpenseModel,
@@ -13,13 +13,21 @@ import {
   calculateFamilySettlements,
   calculateIndividualSettlements,
   calculateTripBalances,
+  type ExpenseApprovalStatus,
+  type ExpenseCategory,
+  type ExpensePaymentInput,
   type ExpenseRecord,
+  type ExpenseShareRecord,
   type FamilyEntity,
   type ParticipantEntity,
+  type PaymentMethod,
   type SettlementRecord,
+  type SplitMethod,
 } from '@tripledger/shared';
+import { runAtomically } from './atomicWrite.js';
 
 export async function logTripActivity(params: {
+  _id?: mongoose.Types.ObjectId;
   tripId: mongoose.Types.ObjectId | string;
   actorUserId?: mongoose.Types.ObjectId | string | null;
   actorParticipantId?: mongoose.Types.ObjectId | string | null;
@@ -29,8 +37,10 @@ export async function logTripActivity(params: {
   entityId: mongoose.Types.ObjectId | string;
   summary: string;
   metadata?: Record<string, unknown>;
+  session?: ClientSession | null;
 }): Promise<void> {
-  await ActivityLogModel.create({
+  const doc = {
+    ...(params._id ? { _id: params._id } : {}),
     tripId: params.tripId,
     actorUserId: params.actorUserId ?? null,
     actorParticipantId: params.actorParticipantId ?? null,
@@ -40,7 +50,305 @@ export async function logTripActivity(params: {
     entityId: params.entityId,
     summary: params.summary,
     metadata: params.metadata ?? {},
+  };
+  await ActivityLogModel.create([doc], params.session ? { session: params.session } : {});
+}
+
+export interface CreateInitialExpenseLedgerParams {
+  tripId: mongoose.Types.ObjectId;
+  actorUserId?: mongoose.Types.ObjectId | string | null;
+  actorParticipantId: mongoose.Types.ObjectId;
+  actorName: string;
+  title: string;
+  description?: string;
+  category: ExpenseCategory;
+  amountPaisa: number;
+  isEstimated: boolean;
+  isPackage: boolean;
+  packageConfig?: { ratePerUnitPaisa: number; unitCount: number };
+  splitConfig?: {
+    includedFamilyIds?: string[];
+    familyWeights?: Array<{ familyId: string; weight?: number }>;
+  };
+  splitMethod: SplitMethod;
+  paymentMethod: PaymentMethod;
+  approvalStatus: ExpenseApprovalStatus;
+  incurredAt: Date;
+  clientMutationId?: string;
+  payments: ExpensePaymentInput[];
+  shares: ExpenseShareRecord[];
+  activitySummary: string;
+}
+
+export function buildExpensePaymentDocs(params: {
+  tripId: mongoose.Types.ObjectId;
+  expenseId: mongoose.Types.ObjectId;
+  payments: ExpensePaymentInput[];
+  defaultPaymentMethod: PaymentMethod;
+  paidAt: Date;
+}) {
+  return params.payments.map((pay) => ({
+    _id: new mongoose.Types.ObjectId(),
+    tripId: params.tripId,
+    expenseId: params.expenseId,
+    participantId: new mongoose.Types.ObjectId(pay.participantId),
+    amountPaisa: pay.amountPaisa,
+    paymentMethod: pay.paymentMethod ?? params.defaultPaymentMethod,
+    paidAt: params.paidAt,
+    notes: pay.notes,
+  }));
+}
+
+export function buildExpenseShareDocs(params: {
+  tripId: mongoose.Types.ObjectId;
+  expenseId: mongoose.Types.ObjectId;
+  shares: ExpenseShareRecord[];
+}) {
+  return params.shares.map((sh) => ({
+    _id: new mongoose.Types.ObjectId(),
+    tripId: params.tripId,
+    expenseId: params.expenseId,
+    participantId: new mongoose.Types.ObjectId(sh.participantId),
+    familyId: sh.familyId ? new mongoose.Types.ObjectId(sh.familyId) : null,
+    sharePaisa: sh.sharePaisa,
+    weightUsed: sh.weightUsed ?? 1,
+  }));
+}
+
+export interface PreviousPaymentSnapshot {
+  _id: mongoose.Types.ObjectId;
+  tripId: mongoose.Types.ObjectId;
+  expenseId: mongoose.Types.ObjectId;
+  participantId: mongoose.Types.ObjectId;
+  amountPaisa: number;
+  paymentMethod: PaymentMethod;
+  paidAt: Date;
+  notes?: string;
+}
+
+export interface PreviousShareSnapshot {
+  _id: mongoose.Types.ObjectId;
+  tripId: mongoose.Types.ObjectId;
+  expenseId: mongoose.Types.ObjectId;
+  participantId: mongoose.Types.ObjectId;
+  familyId?: mongoose.Types.ObjectId | null;
+  sharePaisa: number;
+  weightUsed?: number;
+}
+
+/**
+ * Standalone compensation helper for replaced payments. Always removes rows inserted by this
+ * attempt, and only re-upserts previous rows if this attempt actually reached the delete phase
+ * after winning optimistic concurrency on the parent Expense.
+ */
+export async function rollbackReplacedExpensePayments(
+  insertedIds: mongoose.Types.ObjectId[],
+  previousDocs: PreviousPaymentSnapshot[],
+  shouldRestorePrevious: boolean
+): Promise<void> {
+  if (insertedIds.length > 0) {
+    await ExpensePaymentModel.deleteMany({ _id: { $in: insertedIds } });
+  }
+  if (shouldRestorePrevious && previousDocs.length > 0) {
+    await ExpensePaymentModel.bulkWrite(
+      previousDocs.map((d) => ({
+        updateOne: {
+          filter: { _id: d._id },
+          update: {
+            $set: {
+              tripId: d.tripId,
+              expenseId: d.expenseId,
+              participantId: d.participantId,
+              amountPaisa: d.amountPaisa,
+              paymentMethod: d.paymentMethod,
+              paidAt: d.paidAt,
+              notes: d.notes,
+            },
+          },
+          upsert: true,
+        },
+      }))
+    );
+  }
+}
+
+/**
+ * Standalone compensation helper for replaced shares. Always removes rows inserted by this
+ * attempt, and only re-upserts previous rows if this attempt actually reached the delete phase
+ * after winning optimistic concurrency on the parent Expense.
+ */
+export async function rollbackReplacedExpenseShares(
+  insertedIds: mongoose.Types.ObjectId[],
+  previousDocs: PreviousShareSnapshot[],
+  shouldRestorePrevious: boolean
+): Promise<void> {
+  if (insertedIds.length > 0) {
+    await ExpenseShareModel.deleteMany({ _id: { $in: insertedIds } });
+  }
+  if (shouldRestorePrevious && previousDocs.length > 0) {
+    await ExpenseShareModel.bulkWrite(
+      previousDocs.map((d) => ({
+        updateOne: {
+          filter: { _id: d._id },
+          update: {
+            $set: {
+              tripId: d.tripId,
+              expenseId: d.expenseId,
+              participantId: d.participantId,
+              familyId: d.familyId ?? null,
+              sharePaisa: d.sharePaisa,
+              weightUsed: d.weightUsed ?? 1,
+            },
+          },
+          upsert: true,
+        },
+      }))
+    );
+  }
+}
+
+/**
+ * Atomically persists a newly created expense together with its payment rows, share rows,
+ * optional Forgotten Expense Checklist auto-check, and activity log entry.
+ */
+export async function createInitialExpenseLedger(
+  params: CreateInitialExpenseLedgerParams
+): Promise<{ expenseId: mongoose.Types.ObjectId }> {
+  const expenseId = new mongoose.Types.ObjectId();
+  const activityLogId = new mongoose.Types.ObjectId();
+  const checklistVerifiedAt = new Date();
+
+  const paymentDocs = buildExpensePaymentDocs({
+    tripId: params.tripId,
+    expenseId,
+    payments: params.payments,
+    defaultPaymentMethod: params.paymentMethod,
+    paidAt: params.incurredAt,
   });
+
+  const shareDocs = buildExpenseShareDocs({
+    tripId: params.tripId,
+    expenseId,
+    shares: params.shares,
+  });
+
+  const paymentIds = paymentDocs.map((d) => d._id);
+  const shareIds = shareDocs.map((d) => d._id);
+
+  let expenseCreatedByThisAttempt = false;
+  let checklistModifiedByThisAttempt = false;
+  let activityLoggedByThisAttempt = false;
+
+  await runAtomically(
+    async (session) => {
+      const opts = session ? { session } : {};
+      expenseCreatedByThisAttempt = false;
+      checklistModifiedByThisAttempt = false;
+      activityLoggedByThisAttempt = false;
+
+      await ExpenseModel.create(
+        [
+          {
+            _id: expenseId,
+            tripId: params.tripId,
+            title: params.title,
+            description: params.description,
+            category: params.category,
+            amountPaisa: params.amountPaisa,
+            isEstimated: params.isEstimated,
+            isPackage: params.isPackage,
+            packageConfig: params.packageConfig,
+            splitConfig: params.splitConfig,
+            splitMethod: params.splitMethod,
+            paymentMethod: params.paymentMethod,
+            approvalStatus: params.approvalStatus,
+            incurredAt: params.incurredAt,
+            createdByParticipantId: params.actorParticipantId,
+            approvedByParticipantId:
+              params.approvalStatus === 'APPROVED' ? params.actorParticipantId : null,
+            clientMutationId: params.clientMutationId || undefined,
+            isDeleted: false,
+          },
+        ],
+        opts
+      );
+      expenseCreatedByThisAttempt = true;
+
+      await ExpensePaymentModel.insertMany(paymentDocs, opts);
+      await ExpenseShareModel.insertMany(shareDocs, opts);
+
+      if (!params.isEstimated) {
+        const updatedTrip = await TripModel.findOneAndUpdate(
+          {
+            _id: params.tripId,
+            checklist: { $elemMatch: { category: params.category, checked: false } },
+          },
+          {
+            $set: {
+              'checklist.$.checked': true,
+              'checklist.$.verifiedAt': checklistVerifiedAt,
+            },
+          },
+          { new: true, ...opts }
+        );
+        checklistModifiedByThisAttempt = Boolean(updatedTrip);
+      }
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: params.tripId,
+        actorUserId: params.actorUserId ?? null,
+        actorParticipantId: params.actorParticipantId,
+        actorName: params.actorName,
+        actionType: 'EXPENSE_ADDED',
+        entityType: 'EXPENSE',
+        entityId: expenseId,
+        summary: params.activitySummary,
+        metadata: {
+          amountPaisa: params.amountPaisa,
+          splitMethod: params.splitMethod,
+          approvalStatus: params.approvalStatus,
+        },
+        session,
+      });
+      activityLoggedByThisAttempt = true;
+    },
+    async () => {
+      // Best-effort compensation (standalone non-production fallback only).
+      // Every predicate targets only this attempt's unique _ids / verifiedAt timestamp
+      // so concurrent requests are never affected.
+      await ExpenseShareModel.deleteMany({ _id: { $in: shareIds } });
+      await ExpensePaymentModel.deleteMany({ _id: { $in: paymentIds } });
+      if (expenseCreatedByThisAttempt) {
+        await ExpenseModel.deleteOne({ _id: expenseId });
+      }
+      if (checklistModifiedByThisAttempt) {
+        await TripModel.updateOne(
+          {
+            _id: params.tripId,
+            checklist: {
+              $elemMatch: {
+                category: params.category,
+                checked: true,
+                verifiedAt: checklistVerifiedAt,
+              },
+            },
+          },
+          {
+            $set: {
+              'checklist.$.checked': false,
+              'checklist.$.verifiedAt': null,
+            },
+          }
+        );
+      }
+      if (activityLoggedByThisAttempt) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+    }
+  );
+
+  return { expenseId };
 }
 
 /**
