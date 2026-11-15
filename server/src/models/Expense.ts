@@ -34,6 +34,7 @@ export interface IExpense extends Document {
   createdByParticipantId: mongoose.Types.ObjectId;
   approvedByParticipantId?: mongoose.Types.ObjectId | null;
   clientMutationId?: string;
+  idempotencyHash?: string;
   isDeleted: boolean;
   deletedAt?: Date | null;
   createdAt: Date;
@@ -98,16 +99,25 @@ const expenseSchema = new Schema<IExpense>(
       default: null,
     },
     clientMutationId: { type: String, trim: true },
+    idempotencyHash: { type: String },
     isDeleted: { type: Boolean, default: false },
     deletedAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
 
+export const EXPENSE_MUTATION_ID_INDEX_NAME = 'tripId_1_clientMutationId_partial_unique';
+
 expenseSchema.index({ tripId: 1, isDeleted: 1, incurredAt: -1 });
 expenseSchema.index(
   { tripId: 1, clientMutationId: 1 },
-  { unique: true, sparse: true }
+  {
+    name: EXPENSE_MUTATION_ID_INDEX_NAME,
+    unique: true,
+    // Partial index (unlike compound sparse: true) skips documents when clientMutationId is
+    // omitted, null, or empty even though tripId is always present.
+    partialFilterExpression: { clientMutationId: { $type: 'string', $gt: '' } },
+  }
 );
 
 export const ExpenseModel = mongoose.model<IExpense>('Expense', expenseSchema);

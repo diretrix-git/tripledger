@@ -75,6 +75,7 @@ export interface CreateInitialExpenseLedgerParams {
   approvalStatus: ExpenseApprovalStatus;
   incurredAt: Date;
   clientMutationId?: string;
+  idempotencyHash?: string;
   payments: ExpensePaymentInput[];
   shares: ExpenseShareRecord[];
   activitySummary: string;
@@ -267,6 +268,7 @@ export async function createInitialExpenseLedger(
             approvedByParticipantId:
               params.approvalStatus === 'APPROVED' ? params.actorParticipantId : null,
             clientMutationId: params.clientMutationId || undefined,
+            idempotencyHash: params.idempotencyHash || undefined,
             isDeleted: false,
           },
         ],

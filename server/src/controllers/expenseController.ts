@@ -18,8 +18,17 @@ import {
   ExpenseModel,
   ExpensePaymentModel,
   ExpenseShareModel,
+  ParticipantModel,
 } from '../models/index.js';
 import { runAtomically } from '../services/atomicWrite.js';
+import {
+  computeExpenseIdempotencyHash,
+  isDuplicateKeyError,
+  recoverDuplicateKeyExpenseResponse,
+  resolveExistingIdempotentResponse,
+  throwIdempotencyConflict,
+  type CanonicalExpenseRequestInput,
+} from '../services/expenseIdempotency.js';
 import {
   buildExpensePaymentDocs,
   buildExpenseShareDocs,
@@ -47,33 +56,138 @@ export const createExpense = asyncHandler(async (req: Request, res: Response) =>
   const trip = req.trip!;
   const actor = req.participant!;
 
+  const parsed = createExpenseSchema.parse(req.body);
+  const rawMutationId = parsed.clientMutationId?.trim();
+  const clientMutationId = rawMutationId && rawMutationId.length > 0 ? rawMutationId : undefined;
+
+  let incurredAt: Date;
+  let explicitIncurredAtIso: string | null = null;
+  if (parsed.incurredAt !== undefined && parsed.incurredAt.trim() !== '') {
+    incurredAt = new Date(parsed.incurredAt);
+    if (Number.isNaN(incurredAt.getTime())) {
+      throw new AppError('Invalid incurredAt date format.', 400, 'VALIDATION_ERROR');
+    }
+    explicitIncurredAtIso = incurredAt.toISOString();
+  } else {
+    incurredAt = new Date();
+  }
+
+  // Determine approvalStatus:
+  // - If isEstimated === true -> 'PENDING_CONFIRMATION'
+  // - Else if created by ORGANIZER -> 'APPROVED'
+  // - Else (created by CONTRIBUTOR or FAMILY_REP in Family Mode) -> 'PENDING_APPROVAL' (or APPROVED in Friends Mode)
+  const computeApprovalStatus = (): ExpenseApprovalStatus => {
+    if (parsed.isEstimated) {
+      return 'PENDING_CONFIRMATION';
+    }
+    if (actor.role !== 'ORGANIZER' && trip.mode === 'FAMILY') {
+      return 'PENDING_APPROVAL';
+    }
+    return 'APPROVED';
+  };
+
+  let ledgerDataCache: Awaited<ReturnType<typeof loadTripLedgerData>> | undefined;
+  const getLedgerData = async () => {
+    if (!ledgerDataCache) {
+      ledgerDataCache = await loadTripLedgerData(trip._id);
+    }
+    return ledgerDataCache;
+  };
+
+  const resolveDefaultIncludedParticipantIds = async () => {
+    const activeParticipants = await ParticipantModel.find({
+      tripId: trip._id,
+      isActive: true,
+    })
+      .select('_id')
+      .lean();
+    return activeParticipants.map((p) => p._id.toString());
+  };
+
+  const computeLegacyMatchInput = async () => {
+    const data = await getLedgerData();
+    let legacyShares: ReturnType<typeof calculateExpenseShares>;
+    try {
+      assertReferencedIdsBelongToTrip(parsed, data.participants, data.families);
+      const activeParticipantIds = new Set(
+        data.participants.filter((p) => p.isActive).map((p) => p.id)
+      );
+      validateExpensePayments(parsed.amountPaisa, parsed.payments, activeParticipantIds);
+      legacyShares = calculateExpenseShares({
+        amountPaisa: parsed.amountPaisa,
+        splitMethod: parsed.splitMethod,
+        participants: data.participants,
+        families: data.families,
+        includedParticipantIds: parsed.includedParticipantIds,
+        includedFamilyIds: parsed.includedFamilyIds,
+        customShares: parsed.customShares,
+        weights: parsed.weights,
+        familyWeights: parsed.familyWeights,
+        packageRatePerPersonPaisa: parsed.packageRatePerPersonPaisa,
+      });
+    } catch {
+      // Fail closed with the documented idempotency conflict if a legacy retry cannot be
+      // verified safely (e.g. a participant was deactivated or a reference is no longer valid).
+      throwIdempotencyConflict();
+    }
+    return {
+      approvalStatus: computeApprovalStatus(),
+      computedShares: legacyShares,
+    };
+  };
+
+  let canonicalRequest: CanonicalExpenseRequestInput | undefined;
+  let idempotencyHash: string | undefined;
+  if (clientMutationId) {
+    canonicalRequest = {
+      tripId: trip._id.toString(),
+      actorParticipantId: actor._id.toString(),
+      title: parsed.title,
+      description: parsed.description,
+      category: parsed.category,
+      amountPaisa: parsed.amountPaisa,
+      isEstimated: parsed.isEstimated,
+      isPackage: parsed.isPackage,
+      packageRatePerPersonPaisa: parsed.packageRatePerPersonPaisa,
+      splitMethod: parsed.splitMethod,
+      paymentMethod: parsed.paymentMethod,
+      explicitIncurredAtIso,
+      payments: parsed.payments,
+      includedParticipantIds: parsed.includedParticipantIds,
+      includedFamilyIds: parsed.includedFamilyIds,
+      customShares: parsed.customShares,
+      weights: parsed.weights,
+      familyWeights: parsed.familyWeights,
+    };
+    idempotencyHash = computeExpenseIdempotencyHash(canonicalRequest);
+
+    // Sequential retry fast-path: inspect existing (tripId, clientMutationId) BEFORE mutable
+    // roster/weight validation or closed-trip checks so valid retries stay deduplicated.
+    const existing = await ExpenseModel.findOne({
+      tripId: trip._id,
+      clientMutationId,
+    });
+    if (existing) {
+      const dedupResponse = await resolveExistingIdempotentResponse({
+        tripId: trip._id,
+        existingDoc: existing,
+        expectedHash: idempotencyHash,
+        canonicalRequest,
+        resolveDefaultIncludedParticipantIds,
+        computeLegacyMatchInput,
+      });
+      if (dedupResponse) {
+        sendSuccess(res, dedupResponse);
+        return;
+      }
+    }
+  }
+
   if (trip.status === 'CLOSED') {
     throw new AppError('Cannot add new expenses to a closed trip.', 400, 'TRIP_CLOSED');
   }
 
-  const parsed = createExpenseSchema.parse(req.body);
-
-  // Server-side idempotency check for offline PWA expense queue
-  if (parsed.clientMutationId) {
-    const existing = await ExpenseModel.findOne({
-      tripId: trip._id,
-      clientMutationId: parsed.clientMutationId,
-    });
-    if (existing) {
-      const ledgerData = await loadTripLedgerData(trip._id);
-      const existingRecord = ledgerData.expenses.find(
-        (e) => e.id === existing._id.toString()
-      );
-      sendSuccess(res, {
-        expense: existingRecord,
-        deduplicated: true,
-        ledger: ledgerData.ledger,
-      });
-      return;
-    }
-  }
-
-  const currentData = await loadTripLedgerData(trip._id);
+  const currentData = await getLedgerData();
   // Validate every referenced participant and family ID belongs to this trip BEFORE any computation or DB write.
   assertReferencedIdsBelongToTrip(parsed, currentData.participants, currentData.families);
 
@@ -96,20 +210,10 @@ export const createExpense = asyncHandler(async (req: Request, res: Response) =>
     packageRatePerPersonPaisa: parsed.packageRatePerPersonPaisa,
   });
 
-  // Determine approvalStatus:
-  // - If isEstimated === true -> 'PENDING_CONFIRMATION'
-  // - Else if created by ORGANIZER -> 'APPROVED'
-  // - Else (created by CONTRIBUTOR or FAMILY_REP in Family Mode) -> 'PENDING_APPROVAL' (or APPROVED in Friends Mode)
-  let approvalStatus: ExpenseApprovalStatus = 'APPROVED';
-  if (parsed.isEstimated) {
-    approvalStatus = 'PENDING_CONFIRMATION';
-  } else if (actor.role !== 'ORGANIZER' && trip.mode === 'FAMILY') {
-    approvalStatus = 'PENDING_APPROVAL';
-  }
+  const approvalStatus = computeApprovalStatus();
 
   const isPackage =
     parsed.isPackage || parsed.splitMethod === 'PACKAGE' || parsed.category === 'PACKAGE';
-  const incurredAt = parsed.incurredAt ? new Date(parsed.incurredAt) : new Date();
   const packageConfig =
     isPackage && parsed.packageRatePerPersonPaisa
       ? {
@@ -125,28 +229,55 @@ export const createExpense = asyncHandler(async (req: Request, res: Response) =>
         }
       : undefined;
 
-  const { expenseId: createdExpenseId } = await createInitialExpenseLedger({
-    tripId: trip._id,
-    actorUserId: req.user?.userId,
-    actorParticipantId: actor._id,
-    actorName: actor.name,
-    title: parsed.title,
-    description: parsed.description,
-    category: parsed.category,
-    amountPaisa: parsed.amountPaisa,
-    isEstimated: parsed.isEstimated,
-    isPackage,
-    packageConfig,
-    splitConfig,
-    splitMethod: parsed.splitMethod,
-    paymentMethod: parsed.paymentMethod,
-    approvalStatus,
-    incurredAt,
-    clientMutationId: parsed.clientMutationId || undefined,
-    payments: parsed.payments,
-    shares: computedShares,
-    activitySummary: `${actor.name} recorded ${isPackage ? 'package ' : ''}expense "${parsed.title}" (${formatPaisaToNPR(parsed.amountPaisa)}).`,
-  });
+  let createdExpenseId: mongoose.Types.ObjectId;
+  try {
+    const created = await createInitialExpenseLedger({
+      tripId: trip._id,
+      actorUserId: req.user?.userId,
+      actorParticipantId: actor._id,
+      actorName: actor.name,
+      title: parsed.title,
+      description: parsed.description,
+      category: parsed.category,
+      amountPaisa: parsed.amountPaisa,
+      isEstimated: parsed.isEstimated,
+      isPackage,
+      packageConfig,
+      splitConfig,
+      splitMethod: parsed.splitMethod,
+      paymentMethod: parsed.paymentMethod,
+      approvalStatus,
+      incurredAt,
+      clientMutationId,
+      idempotencyHash,
+      payments: parsed.payments,
+      shares: computedShares,
+      activitySummary: `${actor.name} recorded ${isPackage ? 'package ' : ''}expense "${parsed.title}" (${formatPaisaToNPR(parsed.amountPaisa)}).`,
+    });
+    createdExpenseId = created.expenseId;
+  } catch (err) {
+    // Handle concurrent duplicate (tripId, clientMutationId) E11000 outside any aborted transaction.
+    if (clientMutationId && canonicalRequest && idempotencyHash && isDuplicateKeyError(err)) {
+      const recovered = await recoverDuplicateKeyExpenseResponse({
+        tripId: trip._id,
+        clientMutationId,
+        expectedHash: idempotencyHash,
+        canonicalRequest,
+        resolveDefaultIncludedParticipantIds,
+        computeLegacyMatchInput,
+      });
+      if (recovered) {
+        sendSuccess(res, recovered);
+        return;
+      }
+      throw new AppError(
+        'A concurrent request with the same clientMutationId failed before completion. Please retry.',
+        503,
+        'IDEMPOTENCY_CONCURRENT_RETRY'
+      );
+    }
+    throw err;
+  }
 
   const updatedLedgerData = await loadTripLedgerData(trip._id);
   const createdRecord = updatedLedgerData.expenses.find(
