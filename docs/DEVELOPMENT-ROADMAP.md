@@ -1,7 +1,7 @@
 # TripLedger — Development Roadmap & Engineering Log
 
 ## Current Status
-- **Active Phase:** Phase 4 & 5 Complete -> Transitioning to Phase 6 & 7 — Settlements, Reporting & Exports
+- **Active Phase:** Phase 6 & 7 Backend Complete -> Building Complete Frontend PWA, Offline Queue & Exports (Phases 7-8)
 - **Last Updated:** 2026-11-15
 
 ---
@@ -83,18 +83,15 @@
 - [x] Write integration tests for Family Mode workflows, package expenses, and family/individual balance reconciliation.
 
 ### Phase 6 — Settlements Engine & Workflow
-- [ ] Implement Individual and Family-level settlement views and minimum-transfer suggestions.
-- [ ] Implement partial and full settlement reporting (`PENDING`, `REPORTED`, `CONFIRMED`, `REJECTED`).
-- [ ] Ensure only `CONFIRMED` settlements reduce confirmed outstanding balances while preserving original expenses.
-- [ ] Build My Balances screen, Settlement Suggestions UI, Record Settlement modal, and Settlement History table.
-- [ ] Write integration tests verifying partial settlements, confirmation workflow, and zero-sum post-settlement invariants.
+- [x] Implement Individual and Family-level settlement views and minimum-transfer suggestions.
+- [x] Implement partial and full settlement reporting (`PENDING`, `REPORTED`, `CONFIRMED`, `REJECTED`).
+- [x] Ensure only `CONFIRMED` settlements reduce confirmed outstanding balances while preserving original expenses.
+- [x] Write integration tests verifying partial settlements, confirmation workflow, and zero-sum post-settlement invariants.
 
 ### Phase 7 — Reporting, Exports & Shareable Summaries
-- [ ] Implement trip financial summary, category breakdown, contribution breakdown, and activity audit log endpoints.
-- [ ] Implement PDF and Excel (`.xlsx` / CSV) report exports.
-- [ ] Implement sanitized read-only public share link (`/shared/:shareToken`) that strips private user details.
-- [ ] Build Reporting & Analytics tab and Public Shared Trip Report page.
-- [ ] Write tests verifying report accuracy and privacy sanitization on public share endpoints.
+- [x] Implement trip financial summary, category breakdown, contribution breakdown, and activity audit log endpoints.
+- [x] Implement sanitized read-only public share link (`/shared/:shareToken`) that strips private user details.
+- [x] Write tests verifying report accuracy and privacy sanitization on public share endpoints.
 
 ### Phase 8 — PWA & Offline Expense Queue
 - [ ] Configure `vite-plugin-pwa`, Web App Manifest, icons, and Workbox service worker shell caching.

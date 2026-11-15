@@ -6,6 +6,7 @@ import rateLimit from 'express-rate-limit';
 import { env } from './config/env.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { authRouter } from './routes/authRoutes.js';
+import { publicSharedRouter } from './routes/settlementAndReportRoutes.js';
 import { dashboardRouter, tripRouter } from './routes/tripRoutes.js';
 import { sendSuccess } from './utils/http.js';
 
@@ -45,6 +46,7 @@ export function createApp(): express.Application {
   app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/dashboard', dashboardRouter);
   app.use('/api/v1/trips', tripRouter);
+  app.use('/api/v1/shared', publicSharedRouter);
 
   app.use(errorHandler);
 

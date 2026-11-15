@@ -17,6 +17,11 @@ import {
 import { getDashboardSummary } from '../controllers/dashboardController.js';
 import { requireAuth, requireTripRole } from '../middleware/auth.js';
 import { expenseRouter } from './expenseRoutes.js';
+import {
+  balanceRouter,
+  reportRouter,
+  settlementRouter,
+} from './settlementAndReportRoutes.js';
 
 export const dashboardRouter = Router();
 dashboardRouter.get('/summary', requireAuth, getDashboardSummary);
@@ -54,3 +59,8 @@ tripRouter.delete('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']),
 
 // Expenses
 tripRouter.use('/:tripId/expenses', expenseRouter);
+
+// Balances, Settlements & Reports
+tripRouter.use('/:tripId/balances', balanceRouter);
+tripRouter.use('/:tripId/settlements', settlementRouter);
+tripRouter.use('/:tripId/reports', reportRouter);

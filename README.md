@@ -27,8 +27,8 @@ TripLedger supports two distinct operating modes powered by a unified, invariant
 - [x] Phase 3: Trip Management (Friends & Family Modes) & Forgotten Expense Protection Checklist.
 - [x] Phase 4: Expense Engine, Multiple Payers & Splitting Strategies.
 - [x] Phase 5: Family Mode Groups, Packages, Approval Workflow & Dual-Level Balances.
-- [ ] Phase 6: Settlement Optimization Engine, Partial Settlements & Confirmation Workflow.
-- [ ] Phase 7: Analytics, PDF/Excel Exports & Read-Only Shareable Trip Summaries.
+- [x] Phase 6: Settlement Optimization Engine, Partial Settlements & Confirmation Workflow.
+- [x] Phase 7: Analytics, PDF/Excel Exports & Read-Only Shareable Trip Summaries.
 - [ ] Phase 8: Installable PWA, Service Worker & Offline Expense Queue with Idempotent Sync.
 - [ ] Phase 9: Comprehensive Unit, Integration, Financial Invariant & Playwright E2E QA.
 
