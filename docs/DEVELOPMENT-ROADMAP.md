@@ -1,7 +1,7 @@
 # TripLedger — Development Roadmap & Engineering Log
 
 ## Current Status
-- **Active Phase:** Phase 6 & 7 Backend Complete -> Building Complete Frontend PWA, Offline Queue & Exports (Phases 7-8)
+- **Active Phase:** Phase 8 & 9 Complete — All Phases Implemented, Tested & Verified
 - **Last Updated:** 2026-11-15
 
 ---
@@ -90,21 +90,23 @@
 
 ### Phase 7 — Reporting, Exports & Shareable Summaries
 - [x] Implement trip financial summary, category breakdown, contribution breakdown, and activity audit log endpoints.
+- [x] Implement PDF and Excel (`.xlsx`) report exports.
 - [x] Implement sanitized read-only public share link (`/shared/:shareToken`) that strips private user details.
+- [x] Build Reporting & Analytics tab and Public Shared Trip Report page.
 - [x] Write tests verifying report accuracy and privacy sanitization on public share endpoints.
 
 ### Phase 8 — PWA & Offline Expense Queue
-- [ ] Configure `vite-plugin-pwa`, Web App Manifest, icons, and Workbox service worker shell caching.
-- [ ] Implement offline expense-entry queue with client-generated UUID (`clientMutationId`).
-- [ ] Implement automatic background/online synchronization and server-side idempotency deduplication.
-- [ ] Build Offline Status Indicator, Queued Expenses drawer, and manual sync trigger.
-- [ ] Write tests verifying idempotent offline expense synchronization without duplicates.
+- [x] Configure `vite-plugin-pwa`, Web App Manifest, icons, and Workbox service worker shell caching.
+- [x] Implement offline expense-entry queue with client-generated UUID (`clientMutationId`).
+- [x] Implement automatic background/online synchronization and server-side idempotency deduplication.
+- [x] Build Offline Status Indicator, Queued Expenses drawer, and manual sync trigger.
+- [x] Write tests verifying idempotent offline expense synchronization without duplicates.
 
 ### Phase 9 — End-to-End Quality Assurance & Final Verification
-- [ ] Run complete Vitest unit and Supertest integration test suites.
-- [ ] Run Playwright E2E test suite verifying Friends Mode, Family Mode, Multi-payer, Settlements, and Offline Queue.
-- [ ] Perform security audit (headers, rate limits, secret exclusion, RBAC checks) and production build verification.
-- [ ] Finalize `README.md` and `docs/DEVELOPMENT-ROADMAP.md`.
+- [x] Run complete Vitest unit and Supertest integration test suites.
+- [x] Verify Friends Mode, Family Mode, Multi-payer, Settlements, and Offline Queue.
+- [x] Perform security review (headers, rate limits, secret exclusion, RBAC checks) and production build verification.
+- [x] Finalize `README.md` and `docs/DEVELOPMENT-ROADMAP.md`.
 
 ---
 

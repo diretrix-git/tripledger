@@ -1,0 +1,36 @@
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  phone?: string;
+  defaultCurrency: string;
+}
+
+interface AuthState {
+  user: AuthUser | null;
+  accessToken: string | null;
+  refreshToken: string | null;
+  setAuth: (user: AuthUser, accessToken: string, refreshToken?: string) => void;
+  updateUser: (user: AuthUser) => void;
+  clearAuth: () => void;
+}
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set) => ({
+      user: null,
+      accessToken: null,
+      refreshToken: null,
+      setAuth: (user, accessToken, refreshToken) =>
+        set({ user, accessToken, refreshToken: refreshToken ?? null }),
+      updateUser: (user) => set({ user }),
+      clearAuth: () => set({ user: null, accessToken: null, refreshToken: null }),
+    }),
+    {
+      name: 'tripledger-auth-storage',
+    }
+  )
+);

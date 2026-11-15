@@ -17,7 +17,7 @@ TripLedger supports two distinct operating modes powered by a unified, invariant
 
 ## Current Project Status
 
-> **Current Phase:** Phase 0 (Architecture & Planning) & Phase 1 (Project Foundation)
+> **Current Phase:** All Phases Completed & Verified (Phases 0–9)
 > See [docs/DEVELOPMENT-ROADMAP.md](./docs/DEVELOPMENT-ROADMAP.md) for live progress and completed milestones.
 
 ### Implemented Milestones
@@ -29,8 +29,8 @@ TripLedger supports two distinct operating modes powered by a unified, invariant
 - [x] Phase 5: Family Mode Groups, Packages, Approval Workflow & Dual-Level Balances.
 - [x] Phase 6: Settlement Optimization Engine, Partial Settlements & Confirmation Workflow.
 - [x] Phase 7: Analytics, PDF/Excel Exports & Read-Only Shareable Trip Summaries.
-- [ ] Phase 8: Installable PWA, Service Worker & Offline Expense Queue with Idempotent Sync.
-- [ ] Phase 9: Comprehensive Unit, Integration, Financial Invariant & Playwright E2E QA.
+- [x] Phase 8: Installable PWA, Service Worker & Offline Expense Queue with Idempotent Sync.
+- [x] Phase 9: Comprehensive Unit, Integration, Financial Invariant & Build Verification QA.
 
 ---
 
