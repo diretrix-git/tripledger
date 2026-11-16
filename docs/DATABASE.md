@@ -76,6 +76,8 @@ Represents a Friends Mode or Family Mode trip container.
 - `shareEnabled`: `Boolean` (default: `true`)
 - `checklist`: Array of `{ category: String, label: String, checked: Boolean, notApplicable: Boolean, verifiedAt: Date }` (Forgotten Expense Protection checklist state)
 - `closedAt`: `Date` (optional)
+- `organizerLockVersion`: `Number` (default: `0` — incremented inside serialized organizer-mutation transactions to create a WiredTiger write conflict on `Trip` and prevent snapshot-isolation write skew)
+- `organizerMutationLock`: `{ owner: String | null, expiresAt: Date | null }` (short-TTL MongoDB lease used only when running against non-production standalone MongoDB without replica-set transactions)
 - `createdAt`, `updatedAt`: `Date`
 
 **Indexes:** `{ createdBy: 1, status: 1 }`, `{ inviteCode: 1 }`, `{ shareToken: 1 }`
@@ -231,7 +233,7 @@ Shared fixed-window HTTP rate-limit counter buckets when `RATE_LIMIT_STORE=mongo
 
 ### Guarantee Boundaries
 - **Database-enforced (MongoDB indexes):** uniqueness of `users.email`, `users.emailVerificationTokenHash_partial_unique`, `trips.inviteCode`, `trips.shareToken`, `participants.tripId_1_userId_partial_unique`, and `participantinvites.tokenHash_unique`. Collections do not currently install MongoDB `$jsonSchema` validators.
-- **Application-enforced (`@tripledger/shared` & Mongoose models):** `ParticipantInvite` privileged-role verified-email requirements, expiration checks, SHA-256 hash format checks, immutable policy-field guards on document/query updates, single-use/revocation consistency, and `Trip.defaultInviteRole = 'PARTICIPANT'`. Direct MongoDB shell/driver writes bypass Mongoose validation and hooks.
+- **Application-enforced (`@tripledger/shared` & Mongoose models):** `ParticipantInvite` privileged-role verified-email requirements, expiration checks, SHA-256 hash format checks, immutable policy-field guards on document/query updates, single-use/revocation consistency, `Trip.defaultInviteRole = 'PARTICIPANT'`, and serialized sole-active-linked-organizer enforcement (`role: 'ORGANIZER'`, `isActive: true`, `userId: { $type: 'objectId' }`) via replica-set transactions (with parent `Trip` write-lock serialization) or non-production standalone MongoDB distributed lease + compensating rollback (production fails closed with `503 TRANSACTIONS_UNAVAILABLE` on standalone servers). Direct MongoDB shell/driver writes bypass Mongoose validation and hooks.
 
 ### Registered Migration Commands (`migrateParticipantUserIndex`)
 All migration CLI runs connect with `autoIndex: false` so read-only audits never create indexes and duplicate/malformed audits execute strictly prior to index DDL. Note that when Mongoose `autoIndex` is disabled in production, application startup (`bootstrap`) only runs `ensureRateLimitIndexes()` for `rate_limit_buckets` and does **not** automatically build `users.emailVerificationTokenHash_partial_unique` or `participants.tripId_1_userId_partial_unique`. Operators must explicitly run the migration and audit commands against target `MONGODB_URI` (committing migration code alone does not modify live databases).

@@ -22,6 +22,11 @@ export interface IChecklistItem {
   verifiedAt?: Date | null;
 }
 
+export interface ITripOrganizerLock {
+  owner?: string | null;
+  expiresAt?: Date | null;
+}
+
 export interface ITrip extends Document {
   _id: mongoose.Types.ObjectId;
   name: string;
@@ -42,6 +47,8 @@ export interface ITrip extends Document {
   shareEnabled: boolean;
   checklist: IChecklistItem[];
   closedAt?: Date | null;
+  organizerLockVersion: number;
+  organizerMutationLock?: ITripOrganizerLock;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -89,6 +96,11 @@ const tripSchema = new Schema<ITrip>(
     shareEnabled: { type: Boolean, default: true },
     checklist: { type: [checklistItemSchema], default: [] },
     closedAt: { type: Date, default: null },
+    organizerLockVersion: { type: Number, default: 0 },
+    organizerMutationLock: {
+      owner: { type: String, default: null },
+      expiresAt: { type: Date, default: null },
+    },
   },
   { timestamps: true }
 );

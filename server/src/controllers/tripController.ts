@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-import mongoose from 'mongoose';
+import mongoose, { type ClientSession } from 'mongoose';
 import {
   createFamilySchema,
   createParticipantSchema,
@@ -25,6 +25,11 @@ import {
   type ITrip,
 } from '../models/index.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
+import {
+  countActiveLinkedOrganizers,
+  isActiveLinkedOrganizer,
+  runSerializedTripOrganizerMutation,
+} from '../services/organizerInvariant.js';
 import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
 import { isDuplicateKeyError } from '../utils/mongoErrors.js';
 import { generateInviteCode, generateShareToken } from '../utils/tokens.js';
@@ -370,12 +375,13 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
 
 async function assertValidFamilyInTrip(
   tripId: mongoose.Types.ObjectId,
-  familyId: string
+  familyId: string,
+  session: ClientSession | null = null
 ): Promise<mongoose.Types.ObjectId> {
   if (!mongoose.Types.ObjectId.isValid(familyId)) {
     throw new AppError('Invalid family identifier format.', 400, 'INVALID_ID');
   }
-  const family = await FamilyModel.findOne({ _id: familyId, tripId });
+  const family = await FamilyModel.findOne({ _id: familyId, tripId }).session(session);
   if (!family) {
     throw new AppError(
       'Specified family group does not exist in this trip.',
@@ -384,6 +390,63 @@ async function assertValidFamilyInTrip(
     );
   }
   return family._id;
+}
+
+interface ParticipantUpdateSnapshot {
+  _id: mongoose.Types.ObjectId;
+  name: string;
+  email: string | undefined;
+  phone: string | undefined;
+  role: IParticipant['role'];
+  memberType: IParticipant['memberType'];
+  defaultWeight: number;
+  isActive: boolean;
+  familyId: mongoose.Types.ObjectId | null | undefined;
+}
+
+function buildParticipantUpdateRestoreOp(snapshot: ParticipantUpdateSnapshot) {
+  const $set: Record<string, unknown> = {
+    name: snapshot.name,
+    role: snapshot.role,
+    memberType: snapshot.memberType,
+    defaultWeight: snapshot.defaultWeight,
+    isActive: snapshot.isActive,
+    familyId: snapshot.familyId ?? null,
+  };
+  const $unset: Record<string, 1> = {};
+  if (snapshot.email !== undefined) {
+    $set.email = snapshot.email;
+  } else {
+    $unset.email = 1;
+  }
+  if (snapshot.phone !== undefined) {
+    $set.phone = snapshot.phone;
+  } else {
+    $unset.phone = 1;
+  }
+  return Object.keys($unset).length > 0 ? { $set, $unset } : { $set };
+}
+
+async function assertFreshActiveOrganizerActor(
+  tripId: mongoose.Types.ObjectId,
+  actorParticipantId: mongoose.Types.ObjectId,
+  session: ClientSession | null
+): Promise<void> {
+  const freshActor = await ParticipantModel.findOne({
+    _id: actorParticipantId,
+    tripId,
+  }).session(session);
+
+  if (!freshActor || !freshActor.isActive) {
+    throw new AppError('You do not have access to this trip.', 403, 'FORBIDDEN_TRIP_ACCESS');
+  }
+  if (freshActor.role !== 'ORGANIZER') {
+    throw new AppError(
+      `Insufficient permissions. Required role: ORGANIZER. Your role: ${freshActor.role}.`,
+      403,
+      'INSUFFICIENT_ROLE'
+    );
+  }
 }
 
 async function assertActiveRepresentativeInTrip(
@@ -483,64 +546,125 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
   const { participantId } = req.params;
   const parsed = updateParticipantSchema.parse(req.body);
 
-  const participant = await ParticipantModel.findOne({
-    _id: participantId,
+  if (typeof participantId !== 'string' || !mongoose.Types.ObjectId.isValid(participantId)) {
+    throw new AppError('Invalid participant identifier format.', 400, 'INVALID_ID');
+  }
+
+  const txState: {
+    updatedParticipant?: IParticipant;
+    rollbackSnapshot?: ParticipantUpdateSnapshot;
+  } = {};
+
+  await runSerializedTripOrganizerMutation({
     tripId: trip._id,
-  });
-  if (!participant) {
-    throw new AppError('Participant not found in this trip.', 404, 'PARTICIPANT_NOT_FOUND');
-  }
+    work: async (session) => {
+      txState.updatedParticipant = undefined;
+      txState.rollbackSnapshot = undefined;
 
-  let validatedFamilyId: mongoose.Types.ObjectId | null | undefined;
-  if (parsed.familyId !== undefined) {
-    validatedFamilyId = parsed.familyId
-      ? await assertValidFamilyInTrip(trip._id, parsed.familyId)
-      : null;
-  }
+      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
-  if (parsed.email !== undefined) {
-    const nextEmail = parsed.email || undefined;
-    if (participant.userId && nextEmail !== (participant.email || undefined)) {
-      throw new AppError(
-        'Cannot change email on an already-linked participant record.',
-        409,
-        'PARTICIPANT_EMAIL_IMMUTABLE_WHILE_LINKED'
-      );
-    }
-    participant.email = nextEmail;
-  }
-
-  const nextRole = parsed.role ?? participant.role;
-  const nextIsActive = parsed.isActive ?? participant.isActive;
-  if (participant.role === 'ORGANIZER' && participant.isActive) {
-    if (nextRole !== 'ORGANIZER' || !nextIsActive) {
-      const otherActiveOrganizers = await ParticipantModel.countDocuments({
+      const participant = await ParticipantModel.findOne({
+        _id: participantId,
         tripId: trip._id,
-        role: 'ORGANIZER',
-        _id: { $ne: participant._id },
-        isActive: true,
-      });
-      if (otherActiveOrganizers === 0) {
-        throw new AppError(
-          'Cannot demote or deactivate the sole active organizer of the trip.',
-          400,
-          'SOLE_ORGANIZER'
-        );
+      }).session(session);
+      if (!participant) {
+        throw new AppError('Participant not found in this trip.', 404, 'PARTICIPANT_NOT_FOUND');
       }
-    }
-  }
 
-  if (parsed.name !== undefined) participant.name = parsed.name;
-  if (parsed.phone !== undefined) participant.phone = parsed.phone;
-  if (parsed.role !== undefined) participant.role = parsed.role;
-  if (parsed.memberType !== undefined) participant.memberType = parsed.memberType;
-  if (parsed.defaultWeight !== undefined) participant.defaultWeight = parsed.defaultWeight;
-  if (parsed.isActive !== undefined) participant.isActive = parsed.isActive;
-  if (validatedFamilyId !== undefined) {
-    participant.familyId = validatedFamilyId;
-  }
+      let validatedFamilyId: mongoose.Types.ObjectId | null | undefined;
+      if (parsed.familyId !== undefined) {
+        validatedFamilyId = parsed.familyId
+          ? await assertValidFamilyInTrip(trip._id, parsed.familyId, session)
+          : null;
+      }
 
-  await participant.save();
+      let nextEmail: string | undefined;
+      let hasEmailChange = false;
+      if (parsed.email !== undefined) {
+        nextEmail = parsed.email || undefined;
+        if (participant.userId && nextEmail !== (participant.email || undefined)) {
+          throw new AppError(
+            'Cannot change email on an already-linked participant record.',
+            409,
+            'PARTICIPANT_EMAIL_IMMUTABLE_WHILE_LINKED'
+          );
+        }
+        hasEmailChange = true;
+      }
+
+      const nextRole = parsed.role ?? participant.role;
+      const nextIsActive = parsed.isActive ?? participant.isActive;
+      const wasActiveLinkedOrganizer = isActiveLinkedOrganizer(participant);
+      if (participant.role === 'ORGANIZER' && participant.isActive) {
+        if (nextRole !== 'ORGANIZER' || !nextIsActive) {
+          const otherActiveLinkedOrganizers = await countActiveLinkedOrganizers(trip._id, {
+            excludeParticipantId: participant._id,
+            session,
+          });
+          if (otherActiveLinkedOrganizers === 0) {
+            throw new AppError(
+              'Cannot demote or deactivate the sole active linked organizer of the trip.',
+              400,
+              'SOLE_ORGANIZER'
+            );
+          }
+        }
+      }
+
+      txState.rollbackSnapshot = {
+        _id: participant._id,
+        name: participant.name,
+        email: participant.email,
+        phone: participant.phone,
+        role: participant.role,
+        memberType: participant.memberType,
+        defaultWeight: participant.defaultWeight,
+        isActive: participant.isActive,
+        familyId: participant.familyId,
+      };
+
+      if (hasEmailChange) participant.email = nextEmail;
+      if (parsed.name !== undefined) participant.name = parsed.name;
+      if (parsed.phone !== undefined) participant.phone = parsed.phone;
+      if (parsed.role !== undefined) participant.role = parsed.role;
+      if (parsed.memberType !== undefined) participant.memberType = parsed.memberType;
+      if (parsed.defaultWeight !== undefined) participant.defaultWeight = parsed.defaultWeight;
+      if (parsed.isActive !== undefined) participant.isActive = parsed.isActive;
+      if (validatedFamilyId !== undefined) {
+        participant.familyId = validatedFamilyId;
+      }
+
+      await participant.save(session ? { session } : undefined);
+
+      // Post-write invariant assertion (belt-and-suspenders) inside serialized scope
+      if (wasActiveLinkedOrganizer) {
+        const remainingLinkedOrganizers = await countActiveLinkedOrganizers(trip._id, {
+          session,
+        });
+        if (remainingLinkedOrganizers < 1) {
+          throw new AppError(
+            'Cannot demote or deactivate the sole active linked organizer of the trip.',
+            400,
+            'SOLE_ORGANIZER'
+          );
+        }
+      }
+
+      txState.updatedParticipant = participant;
+    },
+    rollback: async () => {
+      if (!txState.rollbackSnapshot) return;
+      await ParticipantModel.updateOne(
+        { _id: txState.rollbackSnapshot._id },
+        buildParticipantUpdateRestoreOp(txState.rollbackSnapshot)
+      );
+    },
+  });
+
+  if (!txState.updatedParticipant) {
+    throw new AppError('Failed to update participant.', 500, 'INTERNAL_SERVER_ERROR');
+  }
+  const participant = txState.updatedParticipant;
 
   sendSuccess(res, {
     participant: {
@@ -572,51 +696,108 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
 
 export const removeParticipant = asyncHandler(async (req: Request, res: Response) => {
   const trip = req.trip!;
+  const actor = req.participant!;
   const { participantId } = req.params;
 
-  const participant = await ParticipantModel.findOne({
-    _id: participantId,
+  if (typeof participantId !== 'string' || !mongoose.Types.ObjectId.isValid(participantId)) {
+    throw new AppError('Invalid participant identifier format.', 400, 'INVALID_ID');
+  }
+
+  const txState: { deletedSnapshot?: Record<string, unknown> } = {};
+
+  await runSerializedTripOrganizerMutation({
     tripId: trip._id,
+    work: async (session) => {
+      txState.deletedSnapshot = undefined;
+
+      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+
+      const participant = await ParticipantModel.findOne({
+        _id: participantId,
+        tripId: trip._id,
+      }).session(session);
+      if (!participant) {
+        throw new AppError('Participant not found.', 404, 'PARTICIPANT_NOT_FOUND');
+      }
+
+      const wasActiveLinkedOrganizer = isActiveLinkedOrganizer(participant);
+      if (participant.role === 'ORGANIZER') {
+        const otherLinkedOrganizers = await countActiveLinkedOrganizers(trip._id, {
+          excludeParticipantId: participant._id,
+          session,
+        });
+        if (otherLinkedOrganizers === 0) {
+          throw new AppError(
+            'Cannot remove the sole active linked organizer of the trip.',
+            400,
+            'SOLE_ORGANIZER'
+          );
+        }
+      }
+
+      // Check if participant has active financial records inside the serialized snapshot
+      const [hasPayments, hasShares, hasSettlements] = await Promise.all([
+        ExpensePaymentModel.findOne({ tripId: trip._id, participantId: participant._id })
+          .select('_id')
+          .session(session)
+          .lean(),
+        ExpenseShareModel.findOne({ tripId: trip._id, participantId: participant._id })
+          .select('_id')
+          .session(session)
+          .lean(),
+        SettlementModel.findOne({
+          tripId: trip._id,
+          $or: [
+            { fromParticipantId: participant._id },
+            { toParticipantId: participant._id },
+          ],
+          isDeleted: false,
+        })
+          .select('_id')
+          .session(session)
+          .lean(),
+      ]);
+
+      if (hasPayments || hasShares || hasSettlements) {
+        throw new AppError(
+          'Cannot remove a participant who is already included in expenses or settlements.',
+          400,
+          'PARTICIPANT_HAS_FINANCIAL_RECORDS'
+        );
+      }
+
+      txState.deletedSnapshot = participant.toObject() as unknown as Record<string, unknown>;
+
+      await ParticipantModel.deleteOne(
+        { _id: participant._id },
+        session ? { session } : undefined
+      );
+
+      // Post-write invariant assertion (belt-and-suspenders) inside serialized scope
+      if (wasActiveLinkedOrganizer) {
+        const remainingLinkedOrganizers = await countActiveLinkedOrganizers(trip._id, {
+          session,
+        });
+        if (remainingLinkedOrganizers < 1) {
+          throw new AppError(
+            'Cannot remove the sole active linked organizer of the trip.',
+            400,
+            'SOLE_ORGANIZER'
+          );
+        }
+      }
+    },
+    rollback: async () => {
+      if (!txState.deletedSnapshot) return;
+      const { _id, ...rest } = txState.deletedSnapshot;
+      await ParticipantModel.collection.updateOne(
+        { _id: _id as mongoose.Types.ObjectId },
+        { $setOnInsert: rest },
+        { upsert: true }
+      );
+    },
   });
-  if (!participant) {
-    throw new AppError('Participant not found.', 404, 'PARTICIPANT_NOT_FOUND');
-  }
 
-  if (participant.role === 'ORGANIZER') {
-    const otherOrganizers = await ParticipantModel.countDocuments({
-      tripId: trip._id,
-      role: 'ORGANIZER',
-      _id: { $ne: participant._id },
-      isActive: true,
-    });
-    if (otherOrganizers === 0) {
-      throw new AppError('Cannot remove the sole organizer of the trip.', 400, 'SOLE_ORGANIZER');
-    }
-  }
-
-  // Check if participant has active financial records
-  const [hasPayments, hasShares, hasSettlements] = await Promise.all([
-    ExpensePaymentModel.exists({ tripId: trip._id, participantId: participant._id }),
-    ExpenseShareModel.exists({ tripId: trip._id, participantId: participant._id }),
-    SettlementModel.exists({
-      tripId: trip._id,
-      $or: [
-        { fromParticipantId: participant._id },
-        { toParticipantId: participant._id },
-      ],
-      isDeleted: false,
-    }),
-  ]);
-
-  if (hasPayments || hasShares || hasSettlements) {
-    throw new AppError(
-      'Cannot remove a participant who is already included in expenses or settlements.',
-      400,
-      'PARTICIPANT_HAS_FINANCIAL_RECORDS'
-    );
-  }
-
-  await ParticipantModel.deleteOne({ _id: participant._id });
   sendSuccess(res, { removedId: participantId });
 });
 
