@@ -23,6 +23,7 @@ import {
 } from '../services/expenseIdempotency.js';
 import { migrateExpenseMutationIndex } from '../migrations/migrateExpenseMutationIndex.js';
 import { supportsTransactions } from '../services/atomicWrite.js';
+import { clearTestEmailOutbox, getTestEmailOutbox } from '../services/emailService.js';
 
 const TEST_DB_URI = 'mongodb://127.0.0.1:27017/tripledger_test_expense_idempotency';
 
@@ -376,12 +377,18 @@ describe('Task 4: concurrency-safe expense idempotency (FIN/DB)', () => {
     });
     orgToken = regOrg.body.data.accessToken as string;
 
+    clearTestEmailOutbox();
     const regContrib = await request(app).post('/api/v1/auth/register').send({
       name: 'Dipesh Thapa',
       email: 'dipesh.idem@example.com',
       password: 'Password123',
     });
     contribToken = regContrib.body.data.accessToken as string;
+    const contribOutbox = getTestEmailOutbox();
+    const contribVerifyTok = new URL(
+      contribOutbox[contribOutbox.length - 1]!.verificationUrl
+    ).searchParams.get('token')!;
+    await request(app).post('/api/v1/auth/verify-email').send({ token: contribVerifyTok });
 
     const regMember = await request(app).post('/api/v1/auth/register').send({
       name: 'Esha Thapa',
@@ -417,7 +424,7 @@ describe('Task 4: concurrency-safe expense idempotency (FIN/DB)', () => {
       await request(app)
         .post(`/api/v1/trips/${tripId}/participants`)
         .set(auth())
-        .send({ name: 'Bina Sharma', familyId: sharma, role: 'CONTRIBUTOR', memberType: 'ADULT' })
+        .send({ name: 'Bina Sharma', familyId: sharma, role: 'PARTICIPANT', memberType: 'ADULT' })
     ).body.data.participant.id as string;
 
     const dipeshJoin = await request(app)
@@ -1224,12 +1231,19 @@ describe('Task 4: concurrency-safe expense idempotency (FIN/DB)', () => {
     expect(created.body.data.expense.approvalStatus).toBe('PENDING_APPROVAL');
     const expenseId = created.body.data.expense.id as string;
 
-    // Promote Dipesh from CONTRIBUTOR to ORGANIZER
-    const promoteRes = await request(app)
-      .patch(`/api/v1/trips/${fx.tripId}/participants/${dipesh}`)
+    // Promote Dipesh from CONTRIBUTOR to ORGANIZER via verified ParticipantInvite
+    const inviteRes = await request(app)
+      .post(`/api/v1/trips/${fx.tripId}/participants/${dipesh}/invites`)
       .set(auth(orgToken))
-      .send({ role: 'ORGANIZER' });
-    expect(promoteRes.status).toBe(200);
+      .send({ grantedRole: 'ORGANIZER', intendedEmail: 'dipesh.idem@example.com' });
+    expect(inviteRes.status).toBe(201);
+
+    const claimRes = await request(app)
+      .post('/api/v1/trips/invites/claim')
+      .set(auth(contribToken))
+      .send({ token: inviteRes.body.data.rawToken as string });
+    expect(claimRes.status).toBe(200);
+    expect(claimRes.body.data.role).toBe('ORGANIZER');
 
     // Retrying must still return 200 deduplicated: true even though new expenses by ORGANIZER would auto-approve
     const retryPromoted = await post('/expenses', contribPayload, contribToken);

@@ -56,9 +56,11 @@ Base URL: `/api/v1`
 | :--- | :--- | :--- | :--- |
 | `POST` | `/trips` | Authenticated | Create a new trip (`FRIENDS` or `FAMILY` mode) and auto-enroll creator as `ORGANIZER` |
 | `GET` | `/trips` | Authenticated | List trips where the user is a participant (filterable by `mode`, `status`) |
-| `GET` | `/trips/:tripId` | Participant | Get full trip details, participants, families, checklist, and financial summary |
+| `GET` | `/trips/:tripId` | Participant | Get full trip details, participants, families, checklist, and financial summary (`inviteCode` is included only for `ORGANIZER` callers) |
 | `PATCH` | `/trips/:tripId` | Organizer | Update trip metadata, dates, budget, `inviteEnabled`, `inviteExpiresAt`, or status (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`) |
 | `POST` | `/trips/join/:inviteCode` | Authenticated (Rate-Limited) | Join a trip as low-privilege `PARTICIPANT` (`DEFAULT_OPEN_INVITE_ROLE`) via an enabled, unexpired invite code on a non-closed trip. Rejects closed trips (`403 TRIP_CLOSED`), disabled/expired invites, guest-slot claiming (`guestParticipantId`), deactivated participant reactivation, or email matching. |
+| `GET` | `/trips/invites/pending` | Verified Email | List active unexpired email-bound participant invitations matching the authenticated user's verified email address (no raw tokens exposed) |
+| `POST` | `/trips/invites/claim` | Authenticated (Rate-Limited) | Redeem a single-use participant invitation token. Privileged roles (`ORGANIZER`, `FAMILY_REP`) and email-bound invites strictly require verified email ownership matching `intendedEmail` and preserve the sole-linked-organizer and no-reassignment invariants. |
 | `PATCH` | `/trips/:tripId/checklist` | Organizer | Update Forgotten Expense Protection checklist items before closing trip |
 | `POST` | `/trips/:tripId/close` | Organizer | Verify checklist completion, check pending expenses, disable open invite joining (`inviteEnabled: false`), and finalize/close trip |
 
@@ -68,8 +70,11 @@ Base URL: `/api/v1`
 
 | Method | Endpoint | Minimum Role | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/trips/:tripId/participants` | Organizer | Create an unlinked guest participant (`userId: null` always; never auto-links existing accounts by email) |
-| `PATCH` | `/trips/:tripId/participants/:participantId` | Organizer | Update participant details, role, weight, family assignment, or active status (blocks changing email on linked participants and demoting/deactivating the sole active `ORGANIZER`) |
+| `POST` | `/trips/:tripId/participants` | Organizer | Create an unlinked guest participant (`userId: null`, strictly restricted to `role: PARTICIPANT`; never auto-links existing accounts by email) |
+| `GET` | `/trips/:tripId/invites` | Organizer | List redacted participant invitations issued for the trip (never returns `tokenHash` or `rawToken`) |
+| `POST` | `/trips/:tripId/participants/:participantId/invites` | Organizer | Issue a single-use participant claim/promotion invitation (privileged `ORGANIZER`/`FAMILY_REP` requires `intendedEmail` verified on redemption; supersedes prior pending invites on that participant; dispatches email & returns one-time `rawToken`/`claimUrl` only in this creation response) |
+| `POST` | `/trips/:tripId/invites/:inviteId/revoke` | Organizer | Revoke a pending unredeemed participant invitation |
+| `PATCH` | `/trips/:tripId/participants/:participantId` | Organizer | Update participant details, non-privileged roles (`PARTICIPANT` / `CONTRIBUTOR` for linked users), demotions, weight, family assignment, or active status (blocks direct promotion to `ORGANIZER`/`FAMILY_REP`, blocks elevating unlinked guests above `PARTICIPANT`, blocks changing email on linked participants, and preserves sole-linked-organizer invariant) |
 | `DELETE` | `/trips/:tripId/participants/:participantId` | Organizer | Deactivate/remove participant (blocked if participant has active financial records) |
 | `POST` | `/trips/:tripId/families` | Organizer | Create a family group in Family Mode and optionally assign representative |
 | `PATCH` | `/trips/:tripId/families/:familyId` | Organizer | Update family name, representative (`representativeId`), or default weight |

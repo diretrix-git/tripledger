@@ -14,7 +14,7 @@ import {
   activeLinkedOrganizerFilter,
   countActiveLinkedOrganizers,
 } from '../services/organizerInvariant.js';
-import { clearTestEmailOutbox } from '../services/emailService.js';
+import { clearTestEmailOutbox, getTestEmailOutbox } from '../services/emailService.js';
 
 const STANDALONE_TEST_DB_URI = 'mongodb://127.0.0.1:27017/tripledger_test_sole_organizer_invariant';
 
@@ -238,6 +238,42 @@ async function startOrConnectReplicaSet(): Promise<{ cleanup: () => Promise<void
   }
 }
 
+async function verifyLatestOutboxUserEmail(app: ReturnType<typeof createApp>) {
+  const outbox = getTestEmailOutbox();
+  const latest = outbox[outbox.length - 1];
+  if (!latest?.verificationUrl) {
+    throw new Error('Missing verification email in test outbox');
+  }
+  const verifyTok = new URL(latest.verificationUrl).searchParams.get('token')!;
+  const verifyRes = await request(app).post('/api/v1/auth/verify-email').send({ token: verifyTok });
+  expect(verifyRes.status).toBe(200);
+}
+
+async function promoteParticipantToOrganizerViaInvite(params: {
+  app: ReturnType<typeof createApp>;
+  tripId: string;
+  organizerToken: string;
+  participantId: string;
+  targetEmail: string;
+  targetToken: string;
+}) {
+  const inviteRes = await request(params.app)
+    .post(`/api/v1/trips/${params.tripId}/participants/${params.participantId}/invites`)
+    .set('Authorization', `Bearer ${params.organizerToken}`)
+    .send({
+      grantedRole: 'ORGANIZER',
+      intendedEmail: params.targetEmail,
+    });
+  expect(inviteRes.status).toBe(201);
+
+  const claimRes = await request(params.app)
+    .post('/api/v1/trips/invites/claim')
+    .set('Authorization', `Bearer ${params.targetToken}`)
+    .send({ token: inviteRes.body.data.rawToken as string });
+  expect(claimRes.status).toBe(200);
+  expect(claimRes.body.data.role).toBe('ORGANIZER');
+}
+
 async function seedTripWithOrganizers(
   app: ReturnType<typeof createApp>,
   coOrganizerCount = 1,
@@ -251,6 +287,7 @@ async function seedTripWithOrganizers(
   });
   expect(creatorReg.status).toBe(201);
   const creatorToken = creatorReg.body.data.accessToken as string;
+  await verifyLatestOutboxUserEmail(app);
 
   const tripRes = await request(app)
     .post('/api/v1/trips')
@@ -262,16 +299,24 @@ async function seedTripWithOrganizers(
   const inviteCode = tripRes.body.data.trip.inviteCode as string;
   const creatorParticipantId = tripRes.body.data.myParticipant.id as string;
 
-  const coOrganizers: Array<{ userId: string; participantId: string; accessToken: string }> = [];
+  const coOrganizers: Array<{
+    userId: string;
+    email: string;
+    participantId: string;
+    accessToken: string;
+  }> = [];
   for (let i = 0; i < coOrganizerCount; i++) {
+    const coEmail = `coorg.${i}.${Date.now()}.${Math.random().toString(36).slice(2)}@example.com`;
     const coReg = await request(app).post('/api/v1/auth/register').send({
       name: `CoOrg ${i + 1}`,
-      email: `coorg.${i}.${Date.now()}.${Math.random().toString(36).slice(2)}@example.com`,
+      email: coEmail,
       password: 'Password123',
     });
     expect(coReg.status).toBe(201);
     const coToken = coReg.body.data.accessToken as string;
     const coUserId = coReg.body.data.user.id as string;
+
+    await verifyLatestOutboxUserEmail(app);
 
     const joinRes = await request(app)
       .post(`/api/v1/trips/join/${inviteCode}`)
@@ -279,14 +324,18 @@ async function seedTripWithOrganizers(
     expect(joinRes.status).toBe(200);
     const coParticipantId = joinRes.body.data.participantId as string;
 
-    const promoRes = await request(app)
-      .patch(`/api/v1/trips/${tripId}/participants/${coParticipantId}`)
-      .set('Authorization', `Bearer ${creatorToken}`)
-      .send({ role: 'ORGANIZER' });
-    expect(promoRes.status).toBe(200);
+    await promoteParticipantToOrganizerViaInvite({
+      app,
+      tripId,
+      organizerToken: creatorToken,
+      participantId: coParticipantId,
+      targetEmail: coEmail,
+      targetToken: coToken,
+    });
 
     coOrganizers.push({
       userId: coUserId,
+      email: coEmail,
       participantId: coParticipantId,
       accessToken: coToken,
     });
@@ -294,19 +343,31 @@ async function seedTripWithOrganizers(
 
   let guestOrganizerId: string | null = null;
   if (includeUnlinkedGuestOrganizer) {
-    const guestRes = await request(app)
+    // Phase 3 blocks HTTP creation of privileged guests; insert a historical unlinked ORGANIZER row
+    // directly in MongoDB to verify such legacy rows still cannot satisfy the linked-organizer invariant.
+    const blockedHttpGuest = await request(app)
       .post(`/api/v1/trips/${tripId}/participants`)
       .set('Authorization', `Bearer ${creatorToken}`)
       .send({
-        name: 'Guest Unlinked Organizer',
+        name: 'Blocked HTTP Guest Org',
         role: 'ORGANIZER',
         memberType: 'ADULT',
         defaultWeight: 1,
       });
-    expect(guestRes.status).toBe(201);
-    expect(guestRes.body.data.participant.userId).toBeNull();
-    expect(guestRes.body.data.participant.role).toBe('ORGANIZER');
-    guestOrganizerId = guestRes.body.data.participant.id as string;
+    expect(blockedHttpGuest.status).toBe(400);
+
+    const legacyGuest = await ParticipantModel.create({
+      tripId,
+      userId: null,
+      name: 'Guest Unlinked Organizer',
+      role: 'ORGANIZER',
+      memberType: 'ADULT',
+      defaultWeight: 1,
+      isActive: true,
+    });
+    expect(legacyGuest.userId).toBeNull();
+    expect(legacyGuest.role).toBe('ORGANIZER');
+    guestOrganizerId = legacyGuest._id.toString();
   }
 
   return {
@@ -422,11 +483,15 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
       expect(demoteLast.status).toBe(400);
       expect(demoteLast.body.error.code).toBe('SOLE_ORGANIZER');
 
-      // Re-promote CoOrg -> 2 linked organizers, then Lead deactivates CoOrg cleanly, leaving Lead -> Lead cannot remove themselves
-      await request(appInstanceA)
-        .patch(`/api/v1/trips/${fx.tripId}/participants/${co.participantId}`)
-        .set('Authorization', `Bearer ${fx.creatorToken}`)
-        .send({ role: 'ORGANIZER' });
+      // Re-promote CoOrg via verified ParticipantInvite -> 2 linked organizers, then Lead deactivates CoOrg cleanly, leaving Lead -> Lead cannot remove themselves
+      await promoteParticipantToOrganizerViaInvite({
+        app: appInstanceA,
+        tripId: fx.tripId,
+        organizerToken: fx.creatorToken,
+        participantId: co.participantId,
+        targetEmail: co.email,
+        targetToken: co.accessToken,
+      });
       expect(await countActiveLinkedOrganizers(tripObjId)).toBe(2);
 
       // Inactive linked ORGANIZER must NOT satisfy minimum-1 active linked organizer invariant
@@ -685,7 +750,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
       const demoteGuest = await request(appInstanceA)
         .patch(`/api/v1/trips/${fx.tripId}/participants/${fx.guestOrganizerId}`)
         .set('Authorization', `Bearer ${fx.creatorToken}`)
-        .send({ role: 'CONTRIBUTOR' });
+        .send({ role: 'PARTICIPANT' });
       expect(demoteGuest.status).toBe(200);
       expect(tripUpdateSpy).toHaveBeenCalled();
       const firstTripCallOpts = tripUpdateSpy.mock.calls[0]?.[2] as { session?: unknown } | undefined;
@@ -721,12 +786,24 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
       const winnerToken = resA.status === 400 ? fx.creatorToken : co.accessToken;
       const loserParticipantId =
         resA.status === 200 ? fx.creatorParticipantId : co.participantId;
+      const loserToken = resA.status === 200 ? fx.creatorToken : co.accessToken;
+      const loserEmail =
+        resA.status === 200
+          ? (
+              await request(appInstanceA)
+                .get('/api/v1/auth/me')
+                .set('Authorization', `Bearer ${fx.creatorToken}`)
+            ).body.data.user.email
+          : co.email;
 
-      const repromo = await request(appInstanceA)
-        .patch(`/api/v1/trips/${fx.tripId}/participants/${loserParticipantId}`)
-        .set('Authorization', `Bearer ${winnerToken}`)
-        .send({ role: 'ORGANIZER' });
-      expect(repromo.status).toBe(200);
+      await promoteParticipantToOrganizerViaInvite({
+        app: appInstanceA,
+        tripId: fx.tripId,
+        organizerToken: winnerToken,
+        participantId: loserParticipantId,
+        targetEmail: loserEmail,
+        targetToken: loserToken,
+      });
       expect(await countActiveLinkedOrganizers(tripObjId)).toBe(2);
 
       const lockVersionBeforeAbort =

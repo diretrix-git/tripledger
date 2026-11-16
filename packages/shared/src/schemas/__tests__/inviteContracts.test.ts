@@ -211,19 +211,27 @@ describe('Shared security contracts: invite roles, schemas, and policy', () => {
       shareEnabled: false,
     });
 
-    // Offline FAMILY_REP guest placeholders without email still pass createParticipantSchema
+    // Guest participant creation is strictly restricted to PARTICIPANT (Phase 3 policy)
     expect(
       createParticipantSchema.parse({
         name: 'Dipesh Thapa',
-        role: 'FAMILY_REP',
         memberType: 'ADULT',
         familyId: 'fam-1',
       })
     ).toMatchObject({
       name: 'Dipesh Thapa',
-      role: 'FAMILY_REP',
+      role: 'PARTICIPANT',
       memberType: 'ADULT',
     });
+
+    for (const disallowedRole of ['ORGANIZER', 'FAMILY_REP', 'CONTRIBUTOR']) {
+      expect(() =>
+        createParticipantSchema.parse({
+          name: 'Restricted Guest',
+          role: disallowedRole,
+        })
+      ).toThrow();
+    }
 
     // Existing TripSummaryEntity shape remains structurally compatible with frontend expectations
     const legacyTripSummary: TripSummaryEntity = {

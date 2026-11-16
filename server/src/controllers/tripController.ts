@@ -7,6 +7,7 @@ import {
   DEFAULT_OPEN_INVITE_ROLE,
   EXPENSE_CATEGORY_LABELS,
   FORGOTTEN_EXPENSE_CHECKLIST_CATEGORIES,
+  isPrivilegedTripRole,
   joinTripSchema,
   updateChecklistItemSchema,
   updateFamilySchema,
@@ -113,7 +114,7 @@ export const createTrip = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(
     res,
     {
-      trip: formatTripDoc(trip),
+      trip: formatTripDoc(trip, { includeInviteCode: true }),
       myParticipant: {
         id: organizerParticipant._id.toString(),
         role: organizerParticipant.role,
@@ -160,7 +161,7 @@ export const listTrips = asyncHandler(async (req: Request, res: Response) => {
       );
 
       return {
-        ...formatTripDoc(trip),
+        ...formatTripDoc(trip, { includeInviteCode: myMember?.role === 'ORGANIZER' }),
         participantCount: ledgerData.participants.filter((p) => p.isActive).length,
         familyCount: ledgerData.families.length,
         totalApprovedExpensePaisa: ledgerData.ledger.totalApprovedExpensePaisa,
@@ -182,7 +183,7 @@ export const getTripById = asyncHandler(async (req: Request, res: Response) => {
   const ledgerData = await loadTripLedgerData(trip._id);
 
   sendSuccess(res, {
-    trip: formatTripDoc(trip),
+    trip: formatTripDoc(trip, { includeInviteCode: participant.role === 'ORGANIZER' }),
     myParticipant: {
       id: participant._id.toString(),
       name: participant.name,
@@ -258,7 +259,7 @@ export const updateTrip = asyncHandler(async (req: Request, res: Response) => {
     summary: `${participant.name} updated trip settings.`,
   });
 
-  sendSuccess(res, { trip: formatTripDoc(trip) });
+  sendSuccess(res, { trip: formatTripDoc(trip, { includeInviteCode: true }) });
 });
 
 export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Response) => {
@@ -310,7 +311,9 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
       );
     }
     sendSuccess(res, {
-      trip: formatTripDoc(trip),
+      trip: formatTripDoc(trip, {
+        includeInviteCode: existingParticipant.role === 'ORGANIZER',
+      }),
       participantId: existingParticipant._id.toString(),
       alreadyJoined: true,
       role: existingParticipant.role,
@@ -347,7 +350,9 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
           );
         }
         sendSuccess(res, {
-          trip: formatTripDoc(trip),
+          trip: formatTripDoc(trip, {
+            includeInviteCode: concurrent.role === 'ORGANIZER',
+          }),
           participantId: concurrent._id.toString(),
           alreadyJoined: true,
           role: concurrent.role,
@@ -370,7 +375,7 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
   });
 
   sendSuccess(res, {
-    trip: formatTripDoc(trip),
+    trip: formatTripDoc(trip, { includeInviteCode: false }),
     participantId: participant._id.toString(),
     alreadyJoined: false,
     role: participant.role,
@@ -429,11 +434,19 @@ export const addParticipant = asyncHandler(async (req: Request, res: Response) =
   const actor = req.participant!;
   const parsed = createParticipantSchema.parse(req.body);
 
+  if (parsed.role !== DEFAULT_OPEN_INVITE_ROLE) {
+    throw new AppError(
+      'Guest participants can only be created with the PARTICIPANT role; higher roles require verified account membership.',
+      400,
+      'GUEST_ROLE_RESTRICTED'
+    );
+  }
+
   const familyObjectId = parsed.familyId
     ? await assertValidFamilyInTrip(trip._id, parsed.familyId)
     : null;
 
-  // Organizers always create unlinked guest records (userId: null); never auto-link by email.
+  // Organizers always create unlinked guest records (userId: null, role: PARTICIPANT); never auto-link by email.
   const participant = await ParticipantModel.create({
     tripId: trip._id,
     userId: null,
@@ -441,19 +454,11 @@ export const addParticipant = asyncHandler(async (req: Request, res: Response) =
     name: parsed.name,
     email: parsed.email || undefined,
     phone: parsed.phone,
-    role: parsed.role,
+    role: DEFAULT_OPEN_INVITE_ROLE,
     memberType: parsed.memberType,
     defaultWeight: parsed.defaultWeight,
     isActive: true,
   });
-
-  // If added as FAMILY_REP and family has no representative yet, assign automatically
-  if (parsed.familyId && parsed.role === 'FAMILY_REP') {
-    await FamilyModel.findOneAndUpdate(
-      { _id: parsed.familyId, tripId: trip._id },
-      { $set: { representativeId: participant._id } }
-    );
-  }
 
   await logTripActivity({
     tripId: trip._id,
@@ -469,19 +474,7 @@ export const addParticipant = asyncHandler(async (req: Request, res: Response) =
   sendSuccess(
     res,
     {
-      participant: {
-        id: participant._id.toString(),
-        tripId: participant.tripId.toString(),
-        userId: participant.userId ? participant.userId.toString() : null,
-        familyId: participant.familyId ? participant.familyId.toString() : null,
-        name: participant.name,
-        email: participant.email,
-        phone: participant.phone,
-        role: participant.role,
-        memberType: participant.memberType,
-        defaultWeight: participant.defaultWeight,
-        isActive: participant.isActive,
-      },
+      participant: formatParticipantDoc(participant),
     },
     201
   );
@@ -537,6 +530,23 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
           );
         }
         hasEmailChange = true;
+      }
+
+      if (parsed.role !== undefined && parsed.role !== participant.role) {
+        if (isPrivilegedTripRole(parsed.role)) {
+          throw new AppError(
+            'Promoting a participant to ORGANIZER or FAMILY_REP requires a verified email-bound invitation.',
+            400,
+            'PRIVILEGED_ROLE_REQUIRES_INVITE'
+          );
+        }
+        if (!participant.userId && parsed.role !== DEFAULT_OPEN_INVITE_ROLE) {
+          throw new AppError(
+            'Unlinked guest participants are restricted to the PARTICIPANT role.',
+            400,
+            'GUEST_ROLE_RESTRICTED'
+          );
+        }
       }
 
       const nextRole = parsed.role ?? participant.role;
@@ -604,19 +614,7 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
   const participant = txState.updatedParticipant;
 
   sendSuccess(res, {
-    participant: {
-      id: participant._id.toString(),
-      tripId: participant.tripId.toString(),
-      userId: participant.userId ? participant.userId.toString() : null,
-      familyId: participant.familyId ? participant.familyId.toString() : null,
-      name: participant.name,
-      email: participant.email,
-      phone: participant.phone,
-      role: participant.role,
-      memberType: participant.memberType,
-      defaultWeight: participant.defaultWeight,
-      isActive: participant.isActive,
-    },
+    participant: formatParticipantDoc(participant),
   });
 
   await logTripActivity({
@@ -931,7 +929,7 @@ export const closeTrip = asyncHandler(async (req: Request, res: Response) => {
     summary: `${actor.name} finalized and closed the trip "${trip.name}".`,
   });
 
-  sendSuccess(res, { trip: formatTripDoc(trip) });
+  sendSuccess(res, { trip: formatTripDoc(trip, { includeInviteCode: true }) });
 });
 
 export function formatParticipantDoc(participant: IParticipant) {
@@ -954,7 +952,7 @@ export function formatTripDoc(
   trip: ITrip,
   options: { includeInviteCode?: boolean } = {}
 ) {
-  const includeInviteCode = options.includeInviteCode ?? true;
+  const includeInviteCode = options.includeInviteCode ?? false;
   return {
     id: trip._id.toString(),
     name: trip.name,

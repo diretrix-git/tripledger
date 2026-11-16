@@ -51,16 +51,26 @@ describe('Phase 3: Trip Management, Participants, Families & Forgotten Expense P
     expect(trip.mode).toBe('FRIENDS');
     expect(trip.checklist).toHaveLength(FORGOTTEN_EXPENSE_CHECKLIST_CATEGORIES.length);
 
-    // Add two guest participants without accounts
+    // Add a guest participant without account (always restricted to PARTICIPANT role)
     const p1Res = await request(app)
       .post(`/api/v1/trips/${trip.id}/participants`)
       .set('Authorization', `Bearer ${organizerToken}`)
       .send({
         name: 'Bikash Gurung',
-        role: 'CONTRIBUTOR',
+        role: 'PARTICIPANT',
       });
     expect(p1Res.status).toBe(201);
     expect(p1Res.body.data.participant.userId).toBeNull();
+    expect(p1Res.body.data.participant.role).toBe('PARTICIPANT');
+
+    // Guest creation rejects privileged and contributor roles cleanly
+    for (const disallowedRole of ['ORGANIZER', 'FAMILY_REP', 'CONTRIBUTOR']) {
+      const rejectedGuest = await request(app)
+        .post(`/api/v1/trips/${trip.id}/participants`)
+        .set('Authorization', `Bearer ${organizerToken}`)
+        .send({ name: 'Blocked Guest', role: disallowedRole });
+      expect(rejectedGuest.status).toBe(400);
+    }
 
     // Register another user and join via invite code
     const user2Reg = await request(app).post('/api/v1/auth/register').send({
@@ -112,13 +122,13 @@ describe('Phase 3: Trip Management, Participants, Families & Forgotten Expense P
     expect(fam2Res.status).toBe(201);
     const thapaFamilyId = fam2Res.body.data.family.id as string;
 
-    // Add representative and child member to Thapa Family
+    // Add adult and child guest participants to Thapa Family
     const repRes = await request(app)
       .post(`/api/v1/trips/${trip.id}/participants`)
       .set('Authorization', `Bearer ${organizerToken}`)
       .send({
         name: 'Dipesh Thapa',
-        role: 'FAMILY_REP',
+        role: 'PARTICIPANT',
         memberType: 'ADULT',
         familyId: thapaFamilyId,
       });

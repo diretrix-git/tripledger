@@ -93,30 +93,35 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
     await request(app).post('/api/v1/auth/verify-email').send({ token: preVerifiedToken });
     const preVerifiedAccess = preVerifiedReg.body.data.accessToken as string;
 
-    const addPrivOrg = await request(app)
+    // Guest creation rejects privileged roles via HTTP; also verify historical DB guests cannot auto-link
+    const blockedPrivGuest = await request(app)
       .post(`/api/v1/trips/${tripId}/participants`)
       .set('Authorization', `Bearer ${creatorToken}`)
       .send({
-        name: 'Pre-Existing Verified Target',
+        name: 'Blocked Guest Org',
         email: 'already.verified@example.com',
         role: 'ORGANIZER',
       });
-    expect(addPrivOrg.status).toBe(201);
-    expect(addPrivOrg.body.data.participant.userId).toBeNull();
-    const privOrgGuestId = addPrivOrg.body.data.participant.id as string;
+    expect(blockedPrivGuest.status).toBe(400);
 
-    const addRepGuest = await request(app)
-      .post(`/api/v1/trips/${tripId}/participants`)
-      .set('Authorization', `Bearer ${creatorToken}`)
-      .send({
-        name: 'Waiting Family Rep',
-        email: 'rep.victim@example.com',
-        familyId: fam2Id,
-        role: 'FAMILY_REP',
-      });
-    expect(addRepGuest.status).toBe(201);
-    expect(addRepGuest.body.data.participant.userId).toBeNull();
-    const repGuestId = addRepGuest.body.data.participant.id as string;
+    const privOrgGuest = await ParticipantModel.create({
+      tripId,
+      userId: null,
+      name: 'Pre-Existing Verified Target',
+      email: 'already.verified@example.com',
+      role: 'ORGANIZER',
+    });
+    const privOrgGuestId = privOrgGuest._id.toString();
+
+    const repGuest = await ParticipantModel.create({
+      tripId,
+      userId: null,
+      name: 'Waiting Family Rep',
+      email: 'rep.victim@example.com',
+      familyId: fam2Id,
+      role: 'FAMILY_REP',
+    });
+    const repGuestId = repGuest._id.toString();
 
     // 2. Attacker registers with matching email `rep.victim@example.com`, logs in, verifies email, reads dashboard & trips
     clearTestEmailOutbox();
@@ -240,10 +245,24 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       .set('Authorization', `Bearer ${coToken}`);
     const coParticipantId = joinRes.body.data.participantId as string;
 
-    await request(app)
-      .patch(`/api/v1/trips/${tripId}/participants/${coParticipantId}`)
+    // Verify Former CoOrg email and promote to ORGANIZER via verified ParticipantInvite, then deactivate
+    const verifyCoTok = extractVerificationToken(
+      getTestEmailOutbox()[getTestEmailOutbox().length - 1].verificationUrl
+    );
+    await request(app).post('/api/v1/auth/verify-email').send({ token: verifyCoTok });
+
+    const coInviteRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/participants/${coParticipantId}/invites`)
       .set('Authorization', `Bearer ${orgToken}`)
-      .send({ role: 'ORGANIZER' });
+      .send({ grantedRole: 'ORGANIZER', intendedEmail: 'former.coorg@example.com' });
+    expect(coInviteRes.status).toBe(201);
+
+    const coClaimRes = await request(app)
+      .post('/api/v1/trips/invites/claim')
+      .set('Authorization', `Bearer ${coToken}`)
+      .send({ token: coInviteRes.body.data.rawToken as string });
+    expect(coClaimRes.status).toBe(200);
+    expect(coClaimRes.body.data.role).toBe('ORGANIZER');
 
     // Linked participant's email cannot be reassigned to another email
     const changeLinkedEmail = await request(app)
@@ -637,10 +656,27 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       .set('Authorization', `Bearer ${rep2Token}`);
     const rep2ParticipantId = rep2Join.body.data.participantId as string;
 
+    const verifyRep2Tok = extractVerificationToken(
+      getTestEmailOutbox()[getTestEmailOutbox().length - 1].verificationUrl
+    );
+    await request(app).post('/api/v1/auth/verify-email').send({ token: verifyRep2Tok });
+
     await request(app)
       .patch(`/api/v1/trips/${tripAId}/participants/${rep2ParticipantId}`)
       .set('Authorization', `Bearer ${orgToken}`)
-      .send({ role: 'FAMILY_REP', familyId: secondFamilyId });
+      .send({ familyId: secondFamilyId });
+
+    const rep2Invite = await request(app)
+      .post(`/api/v1/trips/${tripAId}/participants/${rep2ParticipantId}/invites`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ grantedRole: 'FAMILY_REP', intendedEmail: 'fam2rep@example.com' });
+    expect(rep2Invite.status).toBe(201);
+    const rep2Claim = await request(app)
+      .post('/api/v1/trips/invites/claim')
+      .set('Authorization', `Bearer ${rep2Token}`)
+      .send({ token: rep2Invite.body.data.rawToken as string });
+    expect(rep2Claim.status).toBe(200);
+    expect(rep2Claim.body.data.role).toBe('FAMILY_REP');
 
     // Cross-trip, nonexistent, malformed, and mismatched toFamilyId rejected cleanly
     const badSettlements = [

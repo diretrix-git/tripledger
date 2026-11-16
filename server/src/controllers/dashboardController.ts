@@ -47,7 +47,7 @@ export const getDashboardSummary = asyncHandler(async (req: Request, res: Respon
       }
 
       return {
-        ...formatTripDoc(trip),
+        ...formatTripDoc(trip, { includeInviteCode: myMember?.role === 'ORGANIZER' }),
         participantCount: ledgerData.participants.filter((p) => p.isActive).length,
         familyCount: ledgerData.families.length,
         totalApprovedExpensePaisa: ledgerData.ledger.totalApprovedExpensePaisa,

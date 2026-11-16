@@ -94,7 +94,7 @@ export const createParticipantSchema = z.object({
   name: z.string().trim().min(1, 'Participant name is required').max(80),
   email: z.string().trim().email().toLowerCase().optional().or(z.literal('')),
   phone: z.string().trim().max(25).optional(),
-  role: z.enum(TRIP_ROLES).default('PARTICIPANT'),
+  role: z.literal('PARTICIPANT').default('PARTICIPANT'),
   memberType: z.enum(MEMBER_TYPES).default('ADULT'),
   familyId: z.string().optional().nullable(),
   defaultWeight: z.number().positive().default(1),
