@@ -30,6 +30,12 @@ import {
 } from './emailService.js';
 import { logTripActivity } from './ledgerService.js';
 import {
+  assertParticipantEligibleForFamilyRepInvite,
+  captureFamilySnapshot,
+  restoreFamilySnapshots,
+  type FamilyUpdateSnapshot,
+} from './familyInvariant.js';
+import {
   assertFreshActiveOrganizerActor,
   buildParticipantUpdateRestoreOp,
   captureParticipantUpdateSnapshot,
@@ -175,6 +181,14 @@ export async function issueParticipantInvite(params: {
             );
           }
         }
+      }
+
+      if (parsed.grantedRole === 'FAMILY_REP') {
+        await assertParticipantEligibleForFamilyRepInvite({
+          trip: liveTrip,
+          participant: targetParticipant,
+          session,
+        });
       }
 
       const now = new Date();
@@ -388,7 +402,10 @@ export async function claimParticipantInviteForUser(params: {
     participant?: IParticipant;
     invite?: IParticipantInvite;
     rollbackSnapshot?: ParticipantUpdateSnapshot;
-  } = {};
+    familySnapshots: FamilyUpdateSnapshot[];
+  } = {
+    familySnapshots: [],
+  };
 
   await runSerializedTripOrganizerMutation({
     tripId: initialInvite.tripId,
@@ -397,6 +414,7 @@ export async function claimParticipantInviteForUser(params: {
       txState.participant = undefined;
       txState.invite = undefined;
       txState.rollbackSnapshot = undefined;
+      txState.familySnapshots = [];
 
       const user = await UserModel.findById(params.userId).session(session);
       if (!user) {
@@ -505,6 +523,7 @@ export async function claimParticipantInviteForUser(params: {
 
       // Policy #8: Preserve the sole-linked-organizer invariant on any role change.
       const wasActiveLinkedOrganizer = isActiveLinkedOrganizer(participant);
+      const wasFamilyRep = participant.role === 'FAMILY_REP';
       if (wasActiveLinkedOrganizer && liveInvite.grantedRole !== 'ORGANIZER') {
         const otherLinkedOrganizers = await countActiveLinkedOrganizers(trip._id, {
           excludeParticipantId: participant._id,
@@ -518,6 +537,16 @@ export async function claimParticipantInviteForUser(params: {
           );
         }
       }
+
+      // Enforce FAMILY_REP eligibility BEFORE marking the single-use invite redeemed.
+      const eligibleFamily =
+        liveInvite.grantedRole === 'FAMILY_REP'
+          ? await assertParticipantEligibleForFamilyRepInvite({
+              trip,
+              participant,
+              session,
+            })
+          : null;
 
       // Atomically mark the invitation used before mutating the participant so replay/concurrent
       // claims fail closed immediately at single-use transition.
@@ -569,12 +598,36 @@ export async function claimParticipantInviteForUser(params: {
         throw err;
       }
 
-      if (claimedInvite.grantedRole === 'FAMILY_REP' && participant.familyId) {
-        await FamilyModel.findOneAndUpdate(
-          { _id: participant.familyId, tripId: trip._id, representativeId: null },
+      if (claimedInvite.grantedRole === 'FAMILY_REP' && eligibleFamily) {
+        if (!eligibleFamily.representativeId) {
+          txState.familySnapshots.push(captureFamilySnapshot(eligibleFamily));
+        }
+        const boundFamily = await FamilyModel.findOneAndUpdate(
+          {
+            _id: eligibleFamily._id,
+            tripId: trip._id,
+            $or: [{ representativeId: null }, { representativeId: participant._id }],
+          },
           { $set: { representativeId: participant._id } },
-          session ? { session } : undefined
+          { new: true, ...(session ? { session } : {}) }
         );
+        if (!boundFamily) {
+          throw new AppError(
+            'This family group already has a designated representative.',
+            409,
+            'FAMILY_ALREADY_HAS_REPRESENTATIVE'
+          );
+        }
+      } else if (wasFamilyRep && !isPrivilegedTripRole(claimedInvite.grantedRole)) {
+        const affectedFamilies = await FamilyModel.find({
+          tripId: trip._id,
+          representativeId: participant._id,
+        }).session(session);
+        for (const fam of affectedFamilies) {
+          txState.familySnapshots.push(captureFamilySnapshot(fam));
+          fam.representativeId = null;
+          await fam.save(session ? { session } : undefined);
+        }
       }
 
       if (wasActiveLinkedOrganizer) {
@@ -595,6 +648,7 @@ export async function claimParticipantInviteForUser(params: {
       txState.invite = claimedInvite;
     },
     rollback: async () => {
+      await restoreFamilySnapshots(txState.familySnapshots);
       if (!txState.rollbackSnapshot) return;
       await ParticipantModel.updateOne(
         { _id: txState.rollbackSnapshot._id },
