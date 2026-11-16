@@ -6,11 +6,12 @@ import { env, parseTrustProxySetting, type RateLimitStoreType } from './config/e
 import { errorHandler } from './middleware/errorHandler.js';
 import { createAuthRouter } from './routes/authRoutes.js';
 import { publicSharedRouter } from './routes/settlementAndReportRoutes.js';
-import { dashboardRouter, tripRouter } from './routes/tripRoutes.js';
+import { createTripRouter, dashboardRouter } from './routes/tripRoutes.js';
 import type { EmailDeliveryService } from './services/emailService.js';
 import {
   createAuthRateLimiters,
   createConfiguredRateLimiter,
+  createTripRateLimiters,
   resolveEffectiveRateLimitConfig,
 } from './services/rateLimitStore.js';
 import { sendSuccess } from './utils/http.js';
@@ -24,6 +25,7 @@ export interface CreateAppOptions {
     register?: number;
     verifyEmail?: number;
     resendVerification?: number;
+    tripJoin?: number;
   };
   emailDeliveryService?: EmailDeliveryService;
 }
@@ -71,6 +73,13 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
     maxOverrides: options.authRateLimitMaxOverrides,
   });
 
+  const tripRateLimiters = createTripRateLimiters({
+    config: env,
+    enabled: effectiveRateLimit.enabled,
+    storeType: effectiveRateLimit.storeType,
+    maxOverride: options.authRateLimitMaxOverrides?.tripJoin,
+  });
+
   app.use(
     '/api/v1/auth',
     createAuthRouter({
@@ -79,7 +88,7 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
     })
   );
   app.use('/api/v1/dashboard', dashboardRouter);
-  app.use('/api/v1/trips', tripRouter);
+  app.use('/api/v1/trips', createTripRouter({ rateLimiters: tripRateLimiters }));
   app.use('/api/v1/shared', publicSharedRouter);
 
   app.use(errorHandler);

@@ -22,45 +22,73 @@ import {
   reportRouter,
   settlementRouter,
 } from './settlementAndReportRoutes.js';
+import {
+  createTripRateLimiters,
+  resolveEffectiveRateLimitConfig,
+  type TripRateLimiters,
+} from '../services/rateLimitStore.js';
 
 export const dashboardRouter = Router();
 dashboardRouter.get('/summary', requireAuth, getDashboardSummary);
 
-export const tripRouter = Router();
+export interface CreateTripRouterOptions {
+  rateLimiters?: TripRateLimiters;
+}
 
-tripRouter.use(requireAuth);
+export function createTripRouter(options: CreateTripRouterOptions = {}): Router {
+  const effective = resolveEffectiveRateLimitConfig();
+  const limiters =
+    options.rateLimiters ??
+    createTripRateLimiters({
+      enabled: effective.enabled,
+      storeType: effective.storeType,
+    });
 
-tripRouter.post('/', createTrip);
-tripRouter.get('/', listTrips);
-tripRouter.post('/join/:inviteCode', joinTripByInviteCode);
+  const router = Router();
 
-tripRouter.get('/:tripId', requireTripRole(), getTripById);
-tripRouter.patch('/:tripId', requireTripRole(['ORGANIZER']), updateTrip);
-tripRouter.patch('/:tripId/checklist', requireTripRole(['ORGANIZER']), updateChecklistItem);
-tripRouter.post('/:tripId/close', requireTripRole(['ORGANIZER']), closeTrip);
+  router.use(requireAuth);
 
-// Participants
-tripRouter.post('/:tripId/participants', requireTripRole(['ORGANIZER']), addParticipant);
-tripRouter.patch(
-  '/:tripId/participants/:participantId',
-  requireTripRole(['ORGANIZER']),
-  updateParticipant
-);
-tripRouter.delete(
-  '/:tripId/participants/:participantId',
-  requireTripRole(['ORGANIZER']),
-  removeParticipant
-);
+  router.post('/', createTrip);
+  router.get('/', listTrips);
+  router.post(
+    '/join/:inviteCode',
+    limiters.joinByIp,
+    limiters.joinByUser,
+    joinTripByInviteCode
+  );
 
-// Families
-tripRouter.post('/:tripId/families', requireTripRole(['ORGANIZER']), createFamily);
-tripRouter.patch('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']), updateFamily);
-tripRouter.delete('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']), deleteFamily);
+  router.get('/:tripId', requireTripRole(), getTripById);
+  router.patch('/:tripId', requireTripRole(['ORGANIZER']), updateTrip);
+  router.patch('/:tripId/checklist', requireTripRole(['ORGANIZER']), updateChecklistItem);
+  router.post('/:tripId/close', requireTripRole(['ORGANIZER']), closeTrip);
 
-// Expenses
-tripRouter.use('/:tripId/expenses', expenseRouter);
+  // Participants
+  router.post('/:tripId/participants', requireTripRole(['ORGANIZER']), addParticipant);
+  router.patch(
+    '/:tripId/participants/:participantId',
+    requireTripRole(['ORGANIZER']),
+    updateParticipant
+  );
+  router.delete(
+    '/:tripId/participants/:participantId',
+    requireTripRole(['ORGANIZER']),
+    removeParticipant
+  );
 
-// Balances, Settlements & Reports
-tripRouter.use('/:tripId/balances', balanceRouter);
-tripRouter.use('/:tripId/settlements', settlementRouter);
-tripRouter.use('/:tripId/reports', reportRouter);
+  // Families
+  router.post('/:tripId/families', requireTripRole(['ORGANIZER']), createFamily);
+  router.patch('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']), updateFamily);
+  router.delete('/:tripId/families/:familyId', requireTripRole(['ORGANIZER']), deleteFamily);
+
+  // Expenses
+  router.use('/:tripId/expenses', expenseRouter);
+
+  // Balances, Settlements & Reports
+  router.use('/:tripId/balances', balanceRouter);
+  router.use('/:tripId/settlements', settlementRouter);
+  router.use('/:tripId/reports', reportRouter);
+
+  return router;
+}
+
+export const tripRouter = createTripRouter();

@@ -715,4 +715,151 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
     expect(validRepConfirm.status).toBe(200);
     expect(validRepConfirm.body.data.settlement.status).toBe('CONFIRMED');
   });
+
+  it('M-02: disables invites on trip closure, blocks joining CLOSED trips, preserves reopening, and enforces strict Mongo join rate limiting', async () => {
+    const orgReg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Close Organizer',
+      email: 'close.org@example.com',
+      password: 'Password123',
+    });
+    const orgToken = orgReg.body.data.accessToken as string;
+
+    const u1Reg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Joiner One',
+      email: 'join1@example.com',
+      password: 'Password123',
+    });
+    const u1Token = u1Reg.body.data.accessToken as string;
+
+    const u2Reg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Joiner Two',
+      email: 'join2@example.com',
+      password: 'Password123',
+    });
+    const u2Token = u2Reg.body.data.accessToken as string;
+
+    const tripRes = await request(app)
+      .post('/api/v1/trips')
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ name: 'Closable Trip', mode: 'FRIENDS' });
+    const tripId = tripRes.body.data.trip.id as string;
+    const inviteCode = tripRes.body.data.trip.inviteCode as string;
+
+    // 1. Blank/whitespace and unknown invite codes share identical 404 TRIP_NOT_FOUND response
+    const blankJoin = await request(app)
+      .post('/api/v1/trips/join/%20%20')
+      .set('Authorization', `Bearer ${u1Token}`);
+    const unknownJoin = await request(app)
+      .post('/api/v1/trips/join/ZZZZ9999')
+      .set('Authorization', `Bearer ${u1Token}`);
+    expect(blankJoin.status).toBe(404);
+    expect(unknownJoin.status).toBe(404);
+    expect(blankJoin.body.error).toEqual(unknownJoin.body.error);
+
+    // 2. Closing trip via POST /close disables open invitations and blocks joining
+    const closeRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/close`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ forceClose: true });
+    expect(closeRes.status).toBe(200);
+    expect(closeRes.body.data.trip.status).toBe('CLOSED');
+    expect(closeRes.body.data.trip.inviteEnabled).toBe(false);
+
+    const joinClosedRes = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set('Authorization', `Bearer ${u1Token}`);
+    expect(joinClosedRes.status).toBe(403);
+    expect(joinClosedRes.body.error.code).toBe('TRIP_CLOSED');
+    expect(JSON.stringify(joinClosedRes.body)).not.toContain('Closable Trip');
+
+    // Concurrent joins on a CLOSED trip all fail with 403 TRIP_CLOSED without enrolling participants
+    const [cj1, cj2] = await Promise.all([
+      request(app).post(`/api/v1/trips/join/${inviteCode}`).set('Authorization', `Bearer ${u1Token}`),
+      request(app).post(`/api/v1/trips/join/${inviteCode}`).set('Authorization', `Bearer ${u2Token}`),
+    ]);
+    expect(cj1.status).toBe(403);
+    expect(cj2.status).toBe(403);
+    expect(await ParticipantModel.countDocuments({ tripId })).toBe(1);
+
+    // Cannot re-enable inviteEnabled while trip stays CLOSED
+    const enableWhileClosed = await request(app)
+      .patch(`/api/v1/trips/${tripId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ inviteEnabled: true });
+    expect(enableWhileClosed.status).toBe(400);
+    expect(enableWhileClosed.body.error.code).toBe('INVITE_NOT_ALLOWED_ON_CLOSED_TRIP');
+
+    // 3. Reopening preserves inviteEnabled: false until organizer explicitly enables it
+    const reopenRes = await request(app)
+      .patch(`/api/v1/trips/${tripId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ status: 'ACTIVE' });
+    expect(reopenRes.status).toBe(200);
+    expect(reopenRes.body.data.trip.status).toBe('ACTIVE');
+    expect(reopenRes.body.data.trip.closedAt).toBeNull();
+    expect(reopenRes.body.data.trip.inviteEnabled).toBe(false);
+
+    const joinAfterReopenBeforeEnable = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set('Authorization', `Bearer ${u1Token}`);
+    expect(joinAfterReopenBeforeEnable.status).toBe(403);
+    expect(joinAfterReopenBeforeEnable.body.error.code).toBe('INVITE_DISABLED');
+
+    // Closing via PATCH /trips/:tripId { status: 'CLOSED' } also disables open invites
+    await request(app)
+      .patch(`/api/v1/trips/${tripId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ inviteEnabled: true });
+    const patchCloseRes = await request(app)
+      .patch(`/api/v1/trips/${tripId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ status: 'CLOSED' });
+    expect(patchCloseRes.status).toBe(200);
+    expect(patchCloseRes.body.data.trip.inviteEnabled).toBe(false);
+
+    // Explicitly reopen with inviteEnabled: true
+    const reopenWithInvites = await request(app)
+      .patch(`/api/v1/trips/${tripId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ status: 'ACTIVE', inviteEnabled: true });
+    expect(reopenWithInvites.status).toBe(200);
+    expect(reopenWithInvites.body.data.trip.inviteEnabled).toBe(true);
+
+    const joinAfterEnable = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set('Authorization', `Bearer ${u1Token}`);
+    expect(joinAfterEnable.status).toBe(200);
+    expect(joinAfterEnable.body.data.role).toBe('PARTICIPANT');
+
+    // 4. Dedicated strict Mongo-backed rate limiter across instances on POST /trips/join/:inviteCode
+    const appA = createApp({
+      enableRateLimitInTest: true,
+      rateLimitStoreOverride: 'mongo',
+      apiRateLimitMaxOverride: 100,
+      authRateLimitMaxOverrides: { tripJoin: 2 },
+    });
+    const appB = createApp({
+      enableRateLimitInTest: true,
+      rateLimitStoreOverride: 'mongo',
+      apiRateLimitMaxOverride: 100,
+      authRateLimitMaxOverrides: { tripJoin: 2 },
+    });
+
+    const rl1 = await request(appA)
+      .post('/api/v1/trips/join/MISS0001')
+      .set('Authorization', `Bearer ${u2Token}`);
+    expect(rl1.status).toBe(404);
+
+    const rl2 = await request(appB)
+      .post('/api/v1/trips/join/MISS0002')
+      .set('Authorization', `Bearer ${u2Token}`);
+    expect(rl2.status).toBe(404);
+
+    // 3rd attempt (even against valid invite code) is blocked uniformly with 429 RATE_LIMITED
+    const rl3 = await request(appA)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set('Authorization', `Bearer ${u2Token}`);
+    expect(rl3.status).toBe(429);
+    expect(rl3.body.error.code).toBe('RATE_LIMITED');
+  });
 });

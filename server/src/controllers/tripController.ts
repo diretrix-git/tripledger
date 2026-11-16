@@ -195,9 +195,19 @@ export const updateTrip = asyncHandler(async (req: Request, res: Response) => {
   const participant = req.participant!;
   const parsed = updateTripSchema.parse(req.body);
 
+  const wasClosed = trip.status === 'CLOSED';
+  const targetStatus = parsed.status ?? trip.status;
+
+  if (targetStatus === 'CLOSED' && parsed.inviteEnabled === true) {
+    throw new AppError(
+      'Open invite-code joining cannot be enabled while a trip is closed.',
+      400,
+      'INVITE_NOT_ALLOWED_ON_CLOSED_TRIP'
+    );
+  }
+
   if (parsed.name !== undefined) trip.name = parsed.name;
   if (parsed.description !== undefined) trip.description = parsed.description;
-  if (parsed.status !== undefined) trip.status = parsed.status;
   if (parsed.budgetPaisa !== undefined) trip.budgetPaisa = parsed.budgetPaisa;
   if (parsed.startDate !== undefined) {
     trip.startDate = parsed.startDate ? new Date(parsed.startDate) : undefined;
@@ -206,7 +216,21 @@ export const updateTrip = asyncHandler(async (req: Request, res: Response) => {
     trip.endDate = parsed.endDate ? new Date(parsed.endDate) : undefined;
   }
   if (parsed.shareEnabled !== undefined) trip.shareEnabled = parsed.shareEnabled;
-  if (parsed.inviteEnabled !== undefined) trip.inviteEnabled = parsed.inviteEnabled;
+
+  if (parsed.status !== undefined) {
+    trip.status = parsed.status;
+    if (parsed.status === 'CLOSED') {
+      trip.closedAt = trip.closedAt ?? new Date();
+      trip.inviteEnabled = false;
+    } else if (wasClosed) {
+      // Clear archival closure timestamp on organizer reopen; keep inviteEnabled under explicit control.
+      trip.closedAt = null;
+    }
+  }
+
+  if (parsed.inviteEnabled !== undefined && targetStatus !== 'CLOSED') {
+    trip.inviteEnabled = parsed.inviteEnabled;
+  }
   if (parsed.inviteExpiresAt !== undefined) {
     trip.inviteExpiresAt =
       parsed.inviteExpiresAt === null ? null : new Date(parsed.inviteExpiresAt);
@@ -237,13 +261,17 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
 
   const rawInviteCode = req.params.inviteCode;
   const inviteCode = typeof rawInviteCode === 'string' ? rawInviteCode.trim().toUpperCase() : '';
-  if (!inviteCode) {
-    throw new AppError('Invite code is required.', 400, 'BAD_REQUEST');
+  const trip = inviteCode ? await TripModel.findOne({ inviteCode }) : null;
+  if (!trip) {
+    throw new AppError('Invalid or unavailable invite code.', 404, 'TRIP_NOT_FOUND');
   }
 
-  const trip = await TripModel.findOne({ inviteCode });
-  if (!trip) {
-    throw new AppError('Invalid invite code. Trip not found.', 404, 'TRIP_NOT_FOUND');
+  if (trip.status === 'CLOSED') {
+    throw new AppError(
+      'This trip is closed and no longer accepting new members.',
+      403,
+      'TRIP_CLOSED'
+    );
   }
 
   if (trip.inviteEnabled === false) {
@@ -771,6 +799,7 @@ export const closeTrip = asyncHandler(async (req: Request, res: Response) => {
 
   trip.status = 'CLOSED';
   trip.closedAt = new Date();
+  trip.inviteEnabled = false;
   await trip.save();
 
   await logTripActivity({

@@ -182,6 +182,43 @@ export interface AuthRateLimiters {
   resendVerification: RateLimitRequestHandler;
 }
 
+export interface TripRateLimiters {
+  joinByUser: RateLimitRequestHandler;
+  joinByIp: RateLimitRequestHandler;
+}
+
+export function createTripRateLimiters(params: {
+  config?: EnvConfig;
+  enabled: boolean;
+  storeType: RateLimitStoreType;
+  maxOverride?: number;
+}): TripRateLimiters {
+  const cfg = params.config ?? env;
+  const windowMs = cfg.AUTH_RATE_LIMIT_WINDOW_MS;
+  const maxPerUser = params.maxOverride ?? cfg.TRIP_JOIN_RATE_LIMIT_MAX;
+
+  return {
+    joinByUser: createConfiguredRateLimiter({
+      prefix: 'trip-join-user:',
+      windowMs,
+      limit: maxPerUser,
+      storeType: params.storeType,
+      enabled: params.enabled,
+      keyGenerator: (req) =>
+        req.user?.userId ? `user:${req.user.userId}` : `ip:${req.ip ?? 'anonymous'}`,
+      message: 'Too many trip join attempts. Please try again later.',
+    }),
+    joinByIp: createConfiguredRateLimiter({
+      prefix: 'trip-join-ip:',
+      windowMs,
+      limit: Math.max(maxPerUser * 2, maxPerUser),
+      storeType: params.storeType,
+      enabled: params.enabled,
+      message: 'Too many trip join attempts from this address. Please try again later.',
+    }),
+  };
+}
+
 export function resolveEffectiveRateLimitConfig(
   config: EnvConfig = env,
   overrides: {

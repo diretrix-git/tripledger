@@ -37,6 +37,7 @@ export interface EnvConfig {
   AUTH_REGISTER_RATE_LIMIT_MAX: number;
   AUTH_VERIFY_EMAIL_RATE_LIMIT_MAX: number;
   AUTH_RESEND_VERIFICATION_RATE_LIMIT_MAX: number;
+  TRIP_JOIN_RATE_LIMIT_MAX: number;
   EMAIL_PROVIDER: EmailDeliveryProvider;
   EMAIL_FROM: string;
   EMAIL_DELIVERY_TIMEOUT_MS: number;
@@ -110,6 +111,7 @@ export function buildEnvConfig(rawEnv: NodeJS.ProcessEnv = process.env): EnvConf
       rawEnv.AUTH_RESEND_VERIFICATION_RATE_LIMIT_MAX,
       5
     ),
+    TRIP_JOIN_RATE_LIMIT_MAX: parsePositiveInt(rawEnv.TRIP_JOIN_RATE_LIMIT_MAX, 10),
     EMAIL_PROVIDER: resolveDefaultEmailProvider(rawEnv.EMAIL_PROVIDER, nodeEnv),
     EMAIL_FROM: (rawEnv.EMAIL_FROM ?? defaultFrom).trim(),
     EMAIL_DELIVERY_TIMEOUT_MS: parsePositiveInt(rawEnv.EMAIL_DELIVERY_TIMEOUT_MS, 10_000),

@@ -58,9 +58,9 @@ Base URL: `/api/v1`
 | `GET` | `/trips` | Authenticated | List trips where the user is a participant (filterable by `mode`, `status`) |
 | `GET` | `/trips/:tripId` | Participant | Get full trip details, participants, families, checklist, and financial summary |
 | `PATCH` | `/trips/:tripId` | Organizer | Update trip metadata, dates, budget, `inviteEnabled`, `inviteExpiresAt`, or status (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`) |
-| `POST` | `/trips/join/:inviteCode` | Authenticated | Join a trip as low-privilege `PARTICIPANT` (`DEFAULT_OPEN_INVITE_ROLE`) via an enabled, unexpired invite code. Strictly rejects guest-slot claiming (`guestParticipantId`), deactivated participant reactivation, or email matching. |
+| `POST` | `/trips/join/:inviteCode` | Authenticated (Rate-Limited) | Join a trip as low-privilege `PARTICIPANT` (`DEFAULT_OPEN_INVITE_ROLE`) via an enabled, unexpired invite code on a non-closed trip. Rejects closed trips (`403 TRIP_CLOSED`), disabled/expired invites, guest-slot claiming (`guestParticipantId`), deactivated participant reactivation, or email matching. |
 | `PATCH` | `/trips/:tripId/checklist` | Organizer | Update Forgotten Expense Protection checklist items before closing trip |
-| `POST` | `/trips/:tripId/close` | Organizer | Verify checklist completion, check pending expenses, and finalize/close trip |
+| `POST` | `/trips/:tripId/close` | Organizer | Verify checklist completion, check pending expenses, disable open invite joining (`inviteEnabled: false`), and finalize/close trip |
 
 ---
 
