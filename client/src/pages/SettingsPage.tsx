@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { CheckCircle2, MailWarning } from 'lucide-react';
 import { apiRequest } from '../api/client.js';
 import { useAuthStore, type AuthUser } from '../stores/authStore.js';
 
@@ -10,6 +11,24 @@ export function SettingsPage(): React.ReactElement {
   const [phone, setPhone] = useState(user?.phone ?? '');
   const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [resending, setResending] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void apiRequest<{ user: AuthUser }>('/auth/me')
+      .then((res) => {
+        if (!active) return;
+        updateUser(res.user);
+        setName(res.user.name);
+        setPhone(res.user.phone ?? '');
+      })
+      .catch(() => {
+        // Keep cached store state if offline
+      });
+    return () => {
+      active = false;
+    };
+  }, [updateUser]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,6 +47,31 @@ export function SettingsPage(): React.ReactElement {
       setSaving(false);
     }
   };
+
+  const handleResendVerification = async () => {
+    setResending(true);
+    setMessage(null);
+    try {
+      const res = await apiRequest<{
+        sent: boolean;
+        alreadyVerified: boolean;
+        emailVerified: boolean;
+      }>('/auth/resend-verification', { method: 'POST' });
+
+      if (res.alreadyVerified && user) {
+        updateUser({ ...user, emailVerified: true });
+        setMessage('Your email address is already verified.');
+      } else {
+        setMessage('Verification email sent. Check your inbox for the verification link.');
+      }
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Failed to send verification email');
+    } finally {
+      setResending(false);
+    }
+  };
+
+  const isVerified = user?.emailVerified === true;
 
   return (
     <div className="max-w-xl space-y-6">
@@ -62,15 +106,43 @@ export function SettingsPage(): React.ReactElement {
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1">
-              Email Address
-            </label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-xs font-semibold text-slate-700">
+                Email Address (Immutable)
+              </label>
+              {isVerified ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-semibold">
+                  <CheckCircle2 className="w-3 h-3" />
+                  Verified
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 text-[11px] font-semibold">
+                  <MailWarning className="w-3 h-3" />
+                  Unverified
+                </span>
+              )}
+            </div>
             <input
               type="email"
               disabled
               value={user?.email ?? ''}
               className="w-full rounded-xl border border-slate-200 bg-slate-100 px-3.5 py-2 text-sm text-slate-500"
             />
+            {!isVerified && (
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <p className="text-[11px] text-slate-500">
+                  Verify your email before accepting email-bound or organizer invitations.
+                </p>
+                <button
+                  type="button"
+                  disabled={resending}
+                  onClick={() => void handleResendVerification()}
+                  className="shrink-0 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-[11px] font-semibold"
+                >
+                  {resending ? 'Sending...' : 'Resend Verification'}
+                </button>
+              </div>
+            )}
           </div>
 
           <div>

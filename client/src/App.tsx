@@ -10,6 +10,7 @@ import { TripDetailPage } from './pages/TripDetailPage.js';
 import { MyBalancesPage } from './pages/MyBalancesPage.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { PublicSharedReportPage } from './pages/PublicSharedReportPage.js';
+import { VerifyEmailPage } from './pages/VerifyEmailPage.js';
 
 function ProtectedRoute({ children }: { children: React.ReactElement }): React.ReactElement {
   const accessToken = useAuthStore((s) => s.accessToken);
@@ -24,6 +25,7 @@ export function App(): React.ReactElement {
     <Routes>
       <Route path="/login" element={<AuthPage mode="login" />} />
       <Route path="/register" element={<AuthPage mode="register" />} />
+      <Route path="/verify-email" element={<VerifyEmailPage />} />
       <Route path="/shared/:shareToken" element={<PublicSharedReportPage />} />
 
       <Route

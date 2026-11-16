@@ -1,14 +1,42 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { formatPaisaToNPR, nprToPaisa } from '@tripledger/shared';
+import { useAuthStore } from '../stores/authStore.js';
 import { useOfflineQueueStore } from '../stores/offlineQueueStore.js';
 
 describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
   beforeEach(() => {
+    useAuthStore.setState({ user: null, accessToken: null, refreshToken: null });
     useOfflineQueueStore.setState({
       isOnline: true,
       isSyncing: false,
       queue: [],
     });
+  });
+
+  it('tracks unverified vs verified user state in authStore accurately', () => {
+    useAuthStore.getState().setAuth(
+      {
+        id: 'u1',
+        name: 'Alice',
+        email: 'alice@example.com',
+        emailVerified: false,
+        emailVerifiedAt: null,
+        defaultCurrency: 'NPR',
+      },
+      'access-1',
+      'refresh-1'
+    );
+    expect(useAuthStore.getState().user?.emailVerified).toBe(false);
+
+    useAuthStore.getState().updateUser({
+      id: 'u1',
+      name: 'Alice',
+      email: 'alice@example.com',
+      emailVerified: true,
+      emailVerifiedAt: '2026-11-16T05:00:00.000Z',
+      defaultCurrency: 'NPR',
+    });
+    expect(useAuthStore.getState().user?.emailVerified).toBe(true);
   });
 
   it('consumes @tripledger/shared paisa formatting accurately', () => {

@@ -5,6 +5,7 @@ import {
   FolderClock,
   LayoutDashboard,
   LogOut,
+  MailWarning,
   Plus,
   RefreshCw,
   Settings,
@@ -153,6 +154,25 @@ export function AppShell(): React.ReactElement {
             </NavLink>
           </div>
         </header>
+
+        {/* Unverified Email Notice Banner */}
+        {user && user.emailVerified === false && (
+          <div className="bg-slate-900 text-slate-100 border-b border-slate-800 px-4 py-2 flex items-center justify-between text-xs gap-2">
+            <div className="flex items-center gap-2">
+              <MailWarning className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                Your email address is unverified. Verify your email to enable verified organizer and
+                email-bound invitations.
+              </span>
+            </div>
+            <NavLink
+              to="/settings"
+              className="shrink-0 font-semibold text-amber-300 hover:text-amber-200 underline"
+            >
+              Verify in Settings
+            </NavLink>
+          </div>
+        )}
 
         {/* Offline Queue Banner if items are waiting */}
         {(!isOnline || queue.length > 0) && (

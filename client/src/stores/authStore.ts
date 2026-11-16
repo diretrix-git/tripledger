@@ -5,6 +5,8 @@ export interface AuthUser {
   id: string;
   name: string;
   email: string;
+  emailVerified?: boolean;
+  emailVerifiedAt?: string | null;
   phone?: string;
   defaultCurrency: string;
 }

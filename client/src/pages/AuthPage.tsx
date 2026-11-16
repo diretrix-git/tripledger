@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { apiRequest } from '../api/client.js';
+import { ApiClientError, apiRequest } from '../api/client.js';
 import { useAuthStore, type AuthUser } from '../stores/authStore.js';
 
 export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactElement {
@@ -38,7 +38,13 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
       setAuth(data.user, data.accessToken, data.refreshToken);
       navigate('/');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Authentication failed');
+      if (err instanceof ApiClientError && err.code === 'EMAIL_DELIVERY_FAILED') {
+        setError(
+          'Your account was created, but sending the verification email failed. Please sign in and resend verification from Settings.'
+        );
+      } else {
+        setError(err instanceof Error ? err.message : 'Authentication failed');
+      }
     } finally {
       setLoading(false);
     }

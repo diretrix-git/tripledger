@@ -861,7 +861,7 @@ export function TripDetailPage(): React.ReactElement {
               <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3 flex items-center gap-1.5">
                   <UserPlus className="w-4 h-4 text-blue-600" />
-                  <span>Add Guest or Linked Participant</span>
+                  <span>Add Guest Participant</span>
                 </h3>
                 <form onSubmit={handleAddParticipant} className="space-y-3">
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -877,7 +877,7 @@ export function TripDetailPage(): React.ReactElement {
                       type="email"
                       value={newParticipantEmail}
                       onChange={(e) => setNewParticipantEmail(e.target.value)}
-                      placeholder="Email (Optional — for account link)"
+                      placeholder="Email (Optional — contact info)"
                       className="rounded-xl border border-slate-300 px-3 py-2 text-xs"
                     />
                   </div>
