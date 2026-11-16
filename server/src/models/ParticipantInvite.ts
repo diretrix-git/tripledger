@@ -89,6 +89,16 @@ function parseDateValue(value: unknown): Date | null {
   return null;
 }
 
+function isValidObjectIdValue(value: unknown): boolean {
+  if (value instanceof mongoose.Types.ObjectId) {
+    return true;
+  }
+  if (typeof value === 'string') {
+    return /^[a-fA-F0-9]{24}$/.test(value);
+  }
+  return false;
+}
+
 /**
  * NOTE ON ENFORCEMENT BOUNDARIES:
  * - Database-enforced (MongoDB indexes): `tokenHash` uniqueness (`tokenHash_unique`).
@@ -224,6 +234,7 @@ const participantInviteSchema = new Schema<IParticipantInvite>(
 function applyInviteDocumentPolicyAndLifecycleChecks(
   doc: {
     grantedRole: TripRole;
+    familyId?: unknown;
     intendedEmail?: string | null;
     requireVerifiedEmail?: boolean;
     expiresAt?: unknown;
@@ -312,6 +323,14 @@ function applyInviteDocumentPolicyAndLifecycleChecks(
   }
   if (usedAtPresent && revokedAtPresent && hasUsedAt && hasRevokedAt) {
     fail('usedAt', 'ParticipantInvite cannot be both used and revoked');
+  }
+
+  if (
+    doc.grantedRole === 'FAMILY_REP' &&
+    (doc.isNew !== false || hasUsedAt) &&
+    (!isPresent('familyId') || !isValidObjectIdValue(doc.familyId))
+  ) {
+    fail('familyId', 'FAMILY_REP invitations must bind to a valid non-null familyId');
   }
 }
 
@@ -509,6 +528,7 @@ participantInviteSchema.pre('insertMany', function (next, docs: unknown[]) {
       }
       const draft = {
         grantedRole: rawDoc.grantedRole as TripRole,
+        familyId: rawDoc.familyId,
         intendedEmail: rawDoc.intendedEmail as string | null | undefined,
         requireVerifiedEmail: rawDoc.requireVerifiedEmail as boolean | undefined,
         expiresAt: rawDoc.expiresAt,

@@ -3,6 +3,7 @@ import { pathToFileURL } from 'url';
 import mongoose from 'mongoose';
 import { DEFAULT_OPEN_INVITE_ROLE, PRIVILEGED_TRIP_ROLES } from '@tripledger/shared';
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
+import { ActivityLogModel } from '../models/ActivityLog.js';
 import {
   PARTICIPANT_TRIP_USER_INDEX_NAME,
   ParticipantModel,
@@ -56,6 +57,12 @@ export interface LegacyInviteDefaultsBackfillReport {
   updatedTripsDefaultRoleCount: number;
 }
 
+export interface LegacyFamilyRepInviteMigrationReport {
+  scannedPendingCount: number;
+  revokedLegacyFamilyRepInvitesCount: number;
+  revokedInviteIds: string[];
+}
+
 export interface HistoricalPrivilegedLinkRiskEntry {
   tripId: string;
   participantId: string;
@@ -70,12 +77,20 @@ export interface ParticipantLinkingRiskAuditReport {
   unlinkedGuestsWithEmailCount: number;
   unlinkedPrivilegedGuestsWithEmailCount: number;
   unlinkedPrivilegedGuestsCount: number;
+  pendingLegacyFamilyRepInvitesMissingFamilyIdCount: number;
   nonCreatorUnverifiedPrivilegedLinks: HistoricalPrivilegedLinkRiskEntry[];
   participantsTripUserPartialIndexPresent: boolean;
   usersVerificationTokenPartialIndexPresent: boolean;
   rateLimitBucketIndexesPresent: boolean;
   participantInvitesIndexesPresent: boolean;
 }
+
+const LEGACY_PENDING_FAMILY_REP_INVITE_FILTER = {
+  grantedRole: 'FAMILY_REP',
+  usedAt: null,
+  revokedAt: null,
+  $or: [{ familyId: null }, { familyId: { $exists: false } }],
+};
 
 interface IndexInfo {
   name?: string;
@@ -579,6 +594,80 @@ export async function backfillInviteSecurityDefaults(
 }
 
 /**
+ * Revokes legacy pending (unredeemed, unrevoked) `FAMILY_REP` invitations that lack a
+ * non-null `familyId` binding so operators can cleanly close ambiguous pre-Phase-3.1 records.
+ * Historical already-used or already-revoked invites are preserved untouched, and intended
+ * family assignments are never guessed.
+ */
+export async function migrateLegacyFamilyRepInvites(
+  db: NonNullable<mongoose.Connection['db']> | undefined = mongoose.connection.db
+): Promise<LegacyFamilyRepInviteMigrationReport> {
+  if (!db) {
+    throw new Error('Database handle is required to migrate legacy FAMILY_REP invites.');
+  }
+
+  const invitesCol = db.collection(ParticipantInviteModel.collection.collectionName);
+  const activityLogsCol = db.collection(ActivityLogModel.collection.collectionName);
+
+  const pendingLegacyInvites = await invitesCol
+    .find<{
+      _id: mongoose.Types.ObjectId;
+      tripId: mongoose.Types.ObjectId;
+      participantId?: mongoose.Types.ObjectId;
+      intendedEmail?: string | null;
+    }>(LEGACY_PENDING_FAMILY_REP_INVITE_FILTER, {
+      projection: { _id: 1, tripId: 1, participantId: 1, intendedEmail: 1 },
+    })
+    .toArray();
+
+  const revokedInviteIds: string[] = [];
+  const now = new Date();
+
+  for (const doc of pendingLegacyInvites) {
+    const updateRes = await invitesCol.updateOne(
+      {
+        _id: doc._id,
+        ...LEGACY_PENDING_FAMILY_REP_INVITE_FILTER,
+      },
+      {
+        $set: {
+          revokedAt: now,
+          updatedAt: now,
+        },
+      }
+    );
+
+    if ((updateRes.modifiedCount ?? 0) === 1) {
+      revokedInviteIds.push(doc._id.toString());
+      await activityLogsCol.insertOne({
+        tripId: doc.tripId,
+        actorUserId: null,
+        actorParticipantId: null,
+        actorName: 'System Migration',
+        actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+        entityType: 'PARTICIPANT_INVITE',
+        entityId: doc._id,
+        summary:
+          'System migration revoked a legacy pending FAMILY_REP invitation missing a familyId binding.',
+        metadata: {
+          reason: 'MISSING_FAMILY_ID_LEGACY_INVITE',
+          grantedRole: 'FAMILY_REP',
+          participantId: doc.participantId ? doc.participantId.toString() : null,
+          intendedEmail: doc.intendedEmail ?? null,
+        },
+        createdAt: now,
+      });
+    }
+  }
+
+  return {
+    scannedPendingCount: pendingLegacyInvites.length,
+    revokedLegacyFamilyRepInvitesCount: revokedInviteIds.length,
+    revokedInviteIds,
+  };
+}
+
+/**
  * Read-only audit helper surfacing historical pre-SEC-01 exposure:
  * counts unverified users, email-labeled guest slots, and any existing non-creator
  * privileged (`ORGANIZER` / `FAMILY_REP`) participants linked to unverified users.
@@ -592,6 +681,7 @@ export async function auditParticipantLinkingRisks(
 
   const usersCol = db.collection('users');
   const participantsCol = db.collection('participants');
+  const invitesCol = db.collection(ParticipantInviteModel.collection.collectionName);
   const unlinkedFilter = {
     $or: [{ userId: null }, { userId: { $type: 'string', $regex: /^\s*$/ } }],
   };
@@ -604,6 +694,7 @@ export async function auditParticipantLinkingRisks(
     unlinkedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsCount,
+    pendingLegacyFamilyRepInvitesMissingFamilyIdCount,
     anomalousLinks,
     participantIndexes,
     userIndexes,
@@ -624,6 +715,7 @@ export async function auditParticipantLinkingRisks(
     participantsCol.countDocuments({
       $and: [unlinkedFilter, { role: { $in: [...PRIVILEGED_TRIP_ROLES] } }],
     }),
+    invitesCol.countDocuments(LEGACY_PENDING_FAMILY_REP_INVITE_FILTER),
     participantsCol
       .aggregate<{
         _id: unknown;
@@ -708,6 +800,7 @@ export async function auditParticipantLinkingRisks(
     unlinkedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsCount,
+    pendingLegacyFamilyRepInvitesMissingFamilyIdCount,
     nonCreatorUnverifiedPrivilegedLinks: anomalousLinks.map((entry) => ({
       tripId: String(entry.tripId),
       participantId: String(entry._id),
@@ -733,6 +826,7 @@ export async function runParticipantMigrationCli(
       indexReport: ParticipantUserIndexMigrationReport;
       userVerificationIndexReport: UserVerificationTokenIndexMigrationReport;
       backfillReport: LegacyInviteDefaultsBackfillReport;
+      legacyInviteMigrationReport: LegacyFamilyRepInviteMigrationReport;
       auditReport: ParticipantLinkingRiskAuditReport;
     }
 > {
@@ -752,11 +846,13 @@ export async function runParticipantMigrationCli(
     await ensureRateLimitIndexes();
     await ensureParticipantInviteIndexes();
     const backfillReport = await backfillInviteSecurityDefaults();
+    const legacyInviteMigrationReport = await migrateLegacyFamilyRepInvites();
     const auditReport = await auditParticipantLinkingRisks();
     console.log('[TripLedger Migration] Participant user index migration complete:', {
       indexReport,
       userVerificationIndexReport,
       backfillReport,
+      legacyInviteMigrationReport,
       auditReport,
     });
     return {
@@ -764,6 +860,7 @@ export async function runParticipantMigrationCli(
       indexReport,
       userVerificationIndexReport,
       backfillReport,
+      legacyInviteMigrationReport,
       auditReport,
     };
   } finally {

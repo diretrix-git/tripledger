@@ -190,6 +190,13 @@ export async function issueParticipantInvite(params: {
           participant: targetParticipant,
           session,
         });
+        if (!eligibleFamily?._id) {
+          throw new AppError(
+            'FAMILY_REP invitation requires a valid non-null familyId.',
+            400,
+            'FAMILY_REQUIRED_FOR_REP'
+          );
+        }
         boundFamilyId = eligibleFamily._id;
       }
 
@@ -373,8 +380,9 @@ export async function listPendingInvitesForVerifiedUser(
     }
     if (
       inv.grantedRole === 'FAMILY_REP' &&
-      inv.familyId &&
-      (!participant.familyId || participant.familyId.toString() !== inv.familyId.toString())
+      (!inv.familyId ||
+        !participant.familyId ||
+        participant.familyId.toString() !== inv.familyId.toString())
     ) {
       continue;
     }
@@ -548,24 +556,27 @@ export async function claimParticipantInviteForUser(params: {
         }
       }
 
-      // Enforce FAMILY_REP eligibility BEFORE marking the single-use invite redeemed.
+      // Enforce FAMILY_REP eligibility (including mandatory familyId binding) BEFORE marking
+      // the single-use invite redeemed.
       const eligibleFamily =
         liveInvite.grantedRole === 'FAMILY_REP'
           ? await assertParticipantEligibleForFamilyRepInvite({
               trip,
               participant,
               session,
+              expectedFamilyId: liveInvite.familyId ?? null,
+              requireExpectedFamilyId: true,
             })
           : null;
 
       if (
         liveInvite.grantedRole === 'FAMILY_REP' &&
-        liveInvite.familyId &&
-        eligibleFamily &&
-        !liveInvite.familyId.equals(eligibleFamily._id)
+        (!liveInvite.familyId ||
+          !eligibleFamily ||
+          !liveInvite.familyId.equals(eligibleFamily._id))
       ) {
         throw new AppError(
-          'This FAMILY_REP invitation was issued for a different family group and is no longer valid.',
+          'This FAMILY_REP invitation was issued without a matching family group binding and is no longer valid.',
           409,
           'INVITE_FAMILY_MISMATCH'
         );

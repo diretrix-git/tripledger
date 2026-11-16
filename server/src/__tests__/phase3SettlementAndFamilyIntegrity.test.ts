@@ -1440,6 +1440,138 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
       expect(await ActivityLogModel.countDocuments({ tripId })).toBe(logsCountBefore);
     }, 30000);
 
+    it('4c. hides and fails closed (409 INVITE_FAMILY_MISMATCH) on legacy FAMILY_REP invites lacking familyId without setting usedAt', async () => {
+      const org = await registerUser(app, { name: 'Legacy Org 4c', email: 'org4c@example.com' });
+      const rep = await registerUser(app, { name: 'Legacy Rep 4c', email: 'rep4c@example.com' });
+      const existingRep = await registerUser(app, {
+        name: 'Existing Rep 4c',
+        email: 'existingrep4c@example.com',
+      });
+
+      const tripRes = await request(app)
+        .post('/api/v1/trips')
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Legacy Family Invite Trip', mode: 'FAMILY', organizerFamilyName: 'Org Fam' });
+      expect(tripRes.status).toBe(201);
+      const tripId = tripRes.body.data.trip.id as string;
+      const orgPartId = tripRes.body.data.myParticipant.id as string;
+
+      const famNoRepRes = await request(app)
+        .post(`/api/v1/trips/${tripId}/families`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'NoRep Family' });
+      const famNoRepId = famNoRepRes.body.data.family.id as string;
+
+      const guestNoRep = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Rep Candidate 4c', familyId: famNoRepId });
+      const guestNoRepId = guestNoRep.body.data.participant.id as string;
+
+      const famWithRepRes = await request(app)
+        .post(`/api/v1/trips/${tripId}/families`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Occupied Family' });
+      const famWithRepId = famWithRepRes.body.data.family.id as string;
+
+      const occupiedGuest = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Occupied Slot', familyId: famWithRepId });
+      const occupiedGuestId = occupiedGuest.body.data.participant.id as string;
+
+      // Occupy famWithRep with existingRep
+      const occupyJoin = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Current Fam Rep', familyId: famWithRepId });
+      const currentRepPartId = occupyJoin.body.data.participant.id as string;
+      const currentRepInv = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants/${currentRepPartId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'FAMILY_REP', intendedEmail: existingRep.email });
+      expect(
+        (
+          await request(app)
+            .post('/api/v1/trips/invites/claim')
+            .set('Authorization', `Bearer ${existingRep.accessToken}`)
+            .send({ token: currentRepInv.body.data.rawToken })
+        ).status
+      ).toBe(200);
+
+      // Insert raw legacy FAMILY_REP invites: one with familyId: null, one with familyId absent
+      const nullFamTok = generateParticipantInviteToken(24);
+      const absentFamTok = generateParticipantInviteToken(24);
+      const now = new Date();
+      const nullInsert = await ParticipantInviteModel.collection.insertOne({
+        tripId: new mongoose.Types.ObjectId(tripId),
+        participantId: new mongoose.Types.ObjectId(guestNoRepId),
+        invitedByUserId: new mongoose.Types.ObjectId(org.userId),
+        invitedByParticipantId: new mongoose.Types.ObjectId(orgPartId),
+        tokenHash: nullFamTok.tokenHash,
+        intendedEmail: rep.email,
+        grantedRole: 'FAMILY_REP',
+        requireVerifiedEmail: true,
+        familyId: null,
+        expiresAt: nullFamTok.expiresAt,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const absentInsert = await ParticipantInviteModel.collection.insertOne({
+        tripId: new mongoose.Types.ObjectId(tripId),
+        participantId: new mongoose.Types.ObjectId(occupiedGuestId),
+        invitedByUserId: new mongoose.Types.ObjectId(org.userId),
+        invitedByParticipantId: new mongoose.Types.ObjectId(orgPartId),
+        tokenHash: absentFamTok.tokenHash,
+        intendedEmail: rep.email,
+        grantedRole: 'FAMILY_REP',
+        requireVerifiedEmail: true,
+        expiresAt: absentFamTok.expiresAt,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Pending invites discovery must exclude both invalid legacy FAMILY_REP invites
+      const pendingRes = await request(app)
+        .get('/api/v1/trips/invites/pending')
+        .set('Authorization', `Bearer ${rep.accessToken}`);
+      expect(pendingRes.status).toBe(200);
+      expect(pendingRes.body.data.invites).toHaveLength(0);
+
+      // Claiming either fails closed with 409 INVITE_FAMILY_MISMATCH without setting usedAt or mutating role
+      const claimNull = await request(app)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: nullFamTok.rawToken });
+      expect(claimNull.status).toBe(409);
+      expect(claimNull.body.error.code).toBe('INVITE_FAMILY_MISMATCH');
+
+      const claimAbsent = await request(app)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: absentFamTok.rawToken });
+      expect(claimAbsent.status).toBe(409);
+      expect(claimAbsent.body.error.code).toBe('INVITE_FAMILY_MISMATCH');
+
+      expect((await ParticipantInviteModel.findById(nullInsert.insertedId))?.usedAt).toBeNull();
+      expect((await ParticipantInviteModel.findById(absentInsert.insertedId))?.usedAt).toBeNull();
+      expect((await ParticipantModel.findById(guestNoRepId))?.role).toBe('PARTICIPANT');
+      expect((await ParticipantModel.findById(guestNoRepId))?.userId).toBeNull();
+      expect((await FamilyModel.findById(famNoRepId))?.representativeId).toBeNull();
+      expect((await FamilyModel.findById(famWithRepId))?.representativeId?.toString()).toBe(
+        currentRepPartId
+      );
+    }, 30000);
+
     it('5b. serializes addParticipant vs deleteFamily in standalone and enforces createSettlement status & live-actor normalization', async () => {
       const org = await registerUser(app, { name: 'Race Org S5', email: 'raceorg.s5@example.com' });
       const rep = await registerUser(app, { name: 'Race Rep S5', email: 'racerep.s5@example.com' });

@@ -232,8 +232,10 @@ export async function assertParticipantEligibleForFamilyRepInvite(params: {
   trip: ITrip;
   participant: IParticipant;
   session: ClientSession | null;
+  expectedFamilyId?: mongoose.Types.ObjectId | null;
+  requireExpectedFamilyId?: boolean;
 }): Promise<IFamily> {
-  const { trip, participant, session } = params;
+  const { trip, participant, session, expectedFamilyId, requireExpectedFamilyId } = params;
 
   if (trip.mode !== 'FAMILY') {
     throw new AppError(
@@ -254,6 +256,19 @@ export async function assertParticipantEligibleForFamilyRepInvite(params: {
       'Participant must belong to a family group before holding or being invited to FAMILY_REP.',
       400,
       'FAMILY_REQUIRED_FOR_REP'
+    );
+  }
+
+  if (
+    requireExpectedFamilyId &&
+    (!expectedFamilyId || !expectedFamilyId.equals(participant.familyId))
+  ) {
+    throw new AppError(
+      !expectedFamilyId
+        ? 'This FAMILY_REP invitation is missing a bound family group and is no longer valid.'
+        : 'This FAMILY_REP invitation was issued for a different family group and is no longer valid.',
+      409,
+      'INVITE_FAMILY_MISMATCH'
     );
   }
 

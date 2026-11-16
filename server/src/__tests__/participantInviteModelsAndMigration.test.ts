@@ -5,6 +5,7 @@ import { connectDatabase, disconnectDatabase } from '../config/database.js';
 import {
   auditParticipantLinkingRisks,
   backfillInviteSecurityDefaults,
+  migrateLegacyFamilyRepInvites,
   migrateParticipantUserIndex,
   runParticipantMigrationCli,
 } from '../migrations/migrateParticipantUserIndex.js';
@@ -469,6 +470,80 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
     ]);
     expect(validOrgInvite.intendedEmail).toBe('org.insertmany@example.com');
     expect(validOrgInvite.requireVerifiedEmail).toBe(true);
+
+    // 2b. FAMILY_REP invites must bind a non-null familyId on create, insertMany, and .save() redemption
+    const boundFamilyId = new mongoose.Types.ObjectId();
+    await expect(
+      ParticipantInviteModel.create({
+        tripId,
+        participantId,
+        invitedByUserId: ownerId,
+        invitedByParticipantId: adminParticipantId,
+        tokenHash: sha256('create-rep-null-family'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'rep-nofam@example.com',
+        familyId: null,
+        expiresAt: future,
+      })
+    ).rejects.toThrow(/familyId/i);
+
+    await expect(
+      ParticipantInviteModel.insertMany([
+        {
+          tripId,
+          participantId,
+          invitedByUserId: ownerId,
+          invitedByParticipantId: adminParticipantId,
+          tokenHash: sha256('insertmany-rep-null-family'),
+          grantedRole: 'FAMILY_REP',
+          intendedEmail: 'rep-insertmany@example.com',
+          familyId: null,
+          expiresAt: future,
+        },
+      ])
+    ).rejects.toThrow(/familyId/i);
+
+    const validRepInvite = await ParticipantInviteModel.create({
+      tripId,
+      participantId,
+      invitedByUserId: ownerId,
+      invitedByParticipantId: adminParticipantId,
+      tokenHash: sha256('create-rep-valid-family'),
+      grantedRole: 'FAMILY_REP',
+      intendedEmail: 'rep-validfam@example.com',
+      familyId: boundFamilyId,
+      expiresAt: future,
+    });
+    expect(validRepInvite.familyId?.toString()).toBe(boundFamilyId.toString());
+
+    // Raw legacy FAMILY_REP doc lacking familyId cannot be redeemed via .save(), while revocation works
+    const legacyRepInsert = await ParticipantInviteModel.collection.insertOne({
+      tripId,
+      participantId,
+      invitedByUserId: ownerId,
+      invitedByParticipantId: adminParticipantId,
+      tokenHash: sha256('legacy-rep-raw-save-check'),
+      grantedRole: 'FAMILY_REP',
+      intendedEmail: 'legacy-save@example.com',
+      requireVerifiedEmail: true,
+      familyId: null,
+      expiresAt: future,
+      usedAt: null,
+      usedByUserId: null,
+      revokedAt: null,
+      revokedByParticipantId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const legacyRepDocForClaim = await ParticipantInviteModel.findById(legacyRepInsert.insertedId);
+    expect(legacyRepDocForClaim).not.toBeNull();
+    legacyRepDocForClaim!.usedAt = new Date();
+    legacyRepDocForClaim!.usedByUserId = new mongoose.Types.ObjectId();
+    await expect(legacyRepDocForClaim!.save()).rejects.toThrow(/familyId/i);
+
+    const legacyRepDocForRevoke = await ParticipantInviteModel.findById(legacyRepInsert.insertedId);
+    legacyRepDocForRevoke!.revokedAt = new Date();
+    await expect(legacyRepDocForRevoke!.save()).resolves.toBeDefined();
 
     // 3. Query update bypass attempts fail closed on ParticipantInvite
     const claimerId = new mongoose.Types.ObjectId();
@@ -1378,5 +1453,153 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
     } finally {
       await connectDatabase(TEST_DB_URI);
     }
+  });
+
+  it('audits and idempotently revokes pending legacy FAMILY_REP invites lacking familyId while preserving used historical invites', async () => {
+    const db = mongoose.connection.db!;
+    await db.dropDatabase();
+
+    const tripId = new mongoose.Types.ObjectId();
+    const familyId = new mongoose.Types.ObjectId();
+    const adminUserId = new mongoose.Types.ObjectId();
+    const adminPartId = new mongoose.Types.ObjectId();
+    const guest1Id = new mongoose.Types.ObjectId();
+    const guest2Id = new mongoose.Types.ObjectId();
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pastUsedAt = new Date(Date.now() - 3600 * 1000);
+
+    const invitesCol = db.collection(ParticipantInviteModel.collection.collectionName);
+    const nullFamInviteId = new mongoose.Types.ObjectId();
+    const absentFamInviteId = new mongoose.Types.ObjectId();
+    const validRepInviteId = new mongoose.Types.ObjectId();
+    const usedHistoricalRepInviteId = new mongoose.Types.ObjectId();
+    const participantInviteId = new mongoose.Types.ObjectId();
+
+    await invitesCol.insertMany([
+      {
+        _id: nullFamInviteId,
+        tripId,
+        participantId: guest1Id,
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mig-legacy-rep-null'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'nullfam@example.com',
+        requireVerifiedEmail: true,
+        familyId: null,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: absentFamInviteId,
+        tripId,
+        participantId: guest2Id,
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mig-legacy-rep-absent'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'absentfam@example.com',
+        requireVerifiedEmail: true,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: validRepInviteId,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mig-valid-rep-bound'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'validfam@example.com',
+        requireVerifiedEmail: true,
+        familyId,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: usedHistoricalRepInviteId,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mig-used-historical-rep'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'usedhistorical@example.com',
+        requireVerifiedEmail: true,
+        familyId: null,
+        expiresAt: future,
+        usedAt: pastUsedAt,
+        usedByUserId: new mongoose.Types.ObjectId(),
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: participantInviteId,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mig-pending-participant'),
+        grantedRole: 'PARTICIPANT',
+        intendedEmail: 'part@example.com',
+        requireVerifiedEmail: true,
+        familyId: null,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+    ]);
+
+    const preAudit = await auditParticipantLinkingRisks(db);
+    expect(preAudit.pendingLegacyFamilyRepInvitesMissingFamilyIdCount).toBe(2);
+
+    const migReport1 = await migrateLegacyFamilyRepInvites(db);
+    expect(migReport1.scannedPendingCount).toBe(2);
+    expect(migReport1.revokedLegacyFamilyRepInvitesCount).toBe(2);
+    expect(migReport1.revokedInviteIds.sort()).toEqual(
+      [nullFamInviteId.toString(), absentFamInviteId.toString()].sort()
+    );
+
+    const postAudit = await auditParticipantLinkingRisks(db);
+    expect(postAudit.pendingLegacyFamilyRepInvitesMissingFamilyIdCount).toBe(0);
+
+    expect((await invitesCol.findOne({ _id: nullFamInviteId }))?.revokedAt).toBeInstanceOf(Date);
+    expect((await invitesCol.findOne({ _id: absentFamInviteId }))?.revokedAt).toBeInstanceOf(Date);
+    expect((await invitesCol.findOne({ _id: validRepInviteId }))?.revokedAt).toBeNull();
+    expect((await invitesCol.findOne({ _id: participantInviteId }))?.revokedAt).toBeNull();
+
+    const historicalDoc = await invitesCol.findOne({ _id: usedHistoricalRepInviteId });
+    expect(historicalDoc?.revokedAt).toBeNull();
+    expect((historicalDoc?.usedAt as Date).getTime()).toBe(pastUsedAt.getTime());
+
+    const migrationLogs = await ActivityLogModel.find({
+      actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+    }).lean();
+    expect(migrationLogs).toHaveLength(2);
+    expect(migrationLogs.map((l) => l.entityId.toString()).sort()).toEqual(
+      [nullFamInviteId.toString(), absentFamInviteId.toString()].sort()
+    );
+
+    // Repeat migration is idempotent (0 revocations, no duplicate ActivityLogs)
+    const migReport2 = await migrateLegacyFamilyRepInvites(db);
+    expect(migReport2.scannedPendingCount).toBe(0);
+    expect(migReport2.revokedLegacyFamilyRepInvitesCount).toBe(0);
+    expect(
+      await ActivityLogModel.countDocuments({
+        actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+      })
+    ).toBe(2);
   });
 });
