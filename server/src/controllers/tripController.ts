@@ -32,7 +32,6 @@ import {
   assertParticipantEligibleAsFamilyRepresentative,
   assertValidFamilyInTrip,
   captureFamilySnapshot,
-  collectParticipantSnapshots,
   restoreFamilySnapshots,
   restoreParticipantSnapshots,
   restoreRevokedInviteRecords,
@@ -563,47 +562,92 @@ export const addParticipant = asyncHandler(async (req: Request, res: Response) =
     );
   }
 
-  let familyObjectId: mongoose.Types.ObjectId | null = null;
-  if (parsed.familyId) {
-    if (trip.mode !== 'FAMILY') {
-      throw new AppError(
-        'Participants can only be assigned to family groups in Family Mode trips.',
-        400,
-        'FAMILY_MODE_ONLY'
+  const participantId = new mongoose.Types.ObjectId();
+  const activityLogId = new mongoose.Types.ObjectId();
+  const txState: {
+    createdParticipant?: IParticipant;
+    loggedActivity: boolean;
+  } = {
+    loggedActivity: false,
+  };
+
+  await runSerializedTripOrganizerMutation({
+    tripId: trip._id,
+    work: async (session) => {
+      txState.createdParticipant = undefined;
+      txState.loggedActivity = false;
+
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const liveTrip = await TripModel.findById(trip._id).session(session);
+      if (!liveTrip) {
+        throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
+      }
+
+      let familyObjectId: mongoose.Types.ObjectId | null = null;
+      if (parsed.familyId) {
+        if (liveTrip.mode !== 'FAMILY') {
+          throw new AppError(
+            'Participants can only be assigned to family groups in Family Mode trips.',
+            400,
+            'FAMILY_MODE_ONLY'
+          );
+        }
+        familyObjectId = (await assertValidFamilyInTrip(trip._id, parsed.familyId, session))._id;
+      }
+
+      // Organizers always create unlinked guest records (userId: null, role: PARTICIPANT); never auto-link by email.
+      const [participant] = await ParticipantModel.create(
+        [
+          {
+            _id: participantId,
+            tripId: trip._id,
+            userId: null,
+            familyId: familyObjectId,
+            name: parsed.name,
+            email: parsed.email || undefined,
+            phone: parsed.phone,
+            role: DEFAULT_OPEN_INVITE_ROLE,
+            memberType: parsed.memberType,
+            defaultWeight: parsed.defaultWeight,
+            isActive: true,
+          },
+        ],
+        session ? { session } : undefined
       );
-    }
-    familyObjectId = (await assertValidFamilyInTrip(trip._id, parsed.familyId))._id;
+      txState.createdParticipant = participant;
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'PARTICIPANT_ADDED',
+        entityType: 'PARTICIPANT',
+        entityId: participant._id,
+        summary: `${freshActor.name} added participant "${participant.name}" (${participant.role}).`,
+        session,
+      });
+      txState.loggedActivity = true;
+    },
+    rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+      if (txState.createdParticipant) {
+        await ParticipantModel.deleteOne({ _id: participantId });
+      }
+    },
+  });
+
+  if (!txState.createdParticipant) {
+    throw new AppError('Failed to add participant.', 500, 'INTERNAL_SERVER_ERROR');
   }
-
-  // Organizers always create unlinked guest records (userId: null, role: PARTICIPANT); never auto-link by email.
-  const participant = await ParticipantModel.create({
-    tripId: trip._id,
-    userId: null,
-    familyId: familyObjectId,
-    name: parsed.name,
-    email: parsed.email || undefined,
-    phone: parsed.phone,
-    role: DEFAULT_OPEN_INVITE_ROLE,
-    memberType: parsed.memberType,
-    defaultWeight: parsed.defaultWeight,
-    isActive: true,
-  });
-
-  await logTripActivity({
-    tripId: trip._id,
-    actorUserId: req.user?.userId,
-    actorParticipantId: actor._id,
-    actorName: actor.name,
-    actionType: 'PARTICIPANT_ADDED',
-    entityType: 'PARTICIPANT',
-    entityId: participant._id,
-    summary: `${actor.name} added participant "${participant.name}" (${participant.role}).`,
-  });
 
   sendSuccess(
     res,
     {
-      participant: formatParticipantDoc(participant),
+      participant: formatParticipantDoc(txState.createdParticipant),
     },
     201
   );
@@ -619,12 +663,15 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
     throw new AppError('Invalid participant identifier format.', 400, 'INVALID_ID');
   }
 
+  const activityLogId = new mongoose.Types.ObjectId();
   const txState: {
     updatedParticipant?: IParticipant;
+    loggedActivity: boolean;
     participantSnapshots: ParticipantUpdateSnapshot[];
     familySnapshots: FamilyUpdateSnapshot[];
     revokedInvites: RevokedInviteRollbackRecord[];
   } = {
+    loggedActivity: false,
     participantSnapshots: [],
     familySnapshots: [],
     revokedInvites: [],
@@ -634,11 +681,12 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
     tripId: trip._id,
     work: async (session) => {
       txState.updatedParticipant = undefined;
+      txState.loggedActivity = false;
       txState.participantSnapshots = [];
       txState.familySnapshots = [];
       txState.revokedInvites = [];
 
-      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
       const [liveTrip, participant] = await Promise.all([
         TripModel.findById(trip._id).session(session),
@@ -839,9 +887,26 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
         }
       }
 
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'PARTICIPANT_UPDATED',
+        entityType: 'PARTICIPANT',
+        entityId: participant._id,
+        summary: `${freshActor.name} updated participant "${participant.name}".`,
+        session,
+      });
+      txState.loggedActivity = true;
+
       txState.updatedParticipant = participant;
     },
     rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
       await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreFamilySnapshots(txState.familySnapshots);
       await restoreParticipantSnapshots(txState.participantSnapshots);
@@ -856,17 +921,6 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
   sendSuccess(res, {
     participant: formatParticipantDoc(participant),
   });
-
-  await logTripActivity({
-    tripId: trip._id,
-    actorUserId: req.user?.userId,
-    actorParticipantId: actor._id,
-    actorName: actor.name,
-    actionType: 'PARTICIPANT_UPDATED',
-    entityType: 'PARTICIPANT',
-    entityId: participant._id,
-    summary: `${actor.name} updated participant "${participant.name}".`,
-  });
 });
 
 export const removeParticipant = asyncHandler(async (req: Request, res: Response) => {
@@ -878,20 +932,30 @@ export const removeParticipant = asyncHandler(async (req: Request, res: Response
     throw new AppError('Invalid participant identifier format.', 400, 'INVALID_ID');
   }
 
+  const activityLogId = new mongoose.Types.ObjectId();
   const txState: {
     deletedSnapshot?: Record<string, unknown>;
+    deletedParticipantStarted: boolean;
+    loggedActivity: boolean;
     familySnapshots: FamilyUpdateSnapshot[];
+    revokedInvites: RevokedInviteRollbackRecord[];
   } = {
+    deletedParticipantStarted: false,
+    loggedActivity: false,
     familySnapshots: [],
+    revokedInvites: [],
   };
 
   await runSerializedTripOrganizerMutation({
     tripId: trip._id,
     work: async (session) => {
       txState.deletedSnapshot = undefined;
+      txState.deletedParticipantStarted = false;
+      txState.loggedActivity = false;
       txState.familySnapshots = [];
+      txState.revokedInvites = [];
 
-      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
       const participant = await ParticipantModel.findOne({
         _id: participantId,
@@ -952,26 +1016,22 @@ export const removeParticipant = asyncHandler(async (req: Request, res: Response
         representativeId: participant._id,
       }).session(session);
       for (const fam of affectedFamilies) {
-        txState.familySnapshots.push(captureFamilySnapshot(fam));
+        const famSnap = captureFamilySnapshot(fam);
+        txState.familySnapshots.push(famSnap);
         fam.representativeId = null;
         await fam.save(session ? { session } : undefined);
+        famSnap.expectedUpdatedAt = fam.updatedAt;
       }
 
       txState.deletedSnapshot = participant.toObject() as unknown as Record<string, unknown>;
+      txState.deletedParticipantStarted = true;
 
       await ParticipantModel.deleteOne(
         { _id: participant._id },
         session ? { session } : undefined
       );
 
-      await revokePendingParticipantInvites({
-        tripId: trip._id,
-        participantIds: [participant._id],
-        actorParticipantId: actor._id,
-        session,
-      });
-
-      // Post-write invariant assertion (belt-and-suspenders) inside serialized scope
+      // Post-write invariant assertion BEFORE finalizing invites/logs
       if (wasActiveLinkedOrganizer) {
         const remainingLinkedOrganizers = await countActiveLinkedOrganizers(trip._id, {
           session,
@@ -984,10 +1044,36 @@ export const removeParticipant = asyncHandler(async (req: Request, res: Response
           );
         }
       }
+
+      const revoked = await revokePendingParticipantInvites({
+        tripId: trip._id,
+        participantIds: [participant._id],
+        actorParticipantId: freshActor._id,
+        session,
+      });
+      if (revoked) txState.revokedInvites.push(revoked);
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'PARTICIPANT_REMOVED',
+        entityType: 'PARTICIPANT',
+        entityId: participant._id,
+        summary: `${freshActor.name} removed participant "${participant.name}".`,
+        session,
+      });
+      txState.loggedActivity = true;
     },
     rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+      await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreFamilySnapshots(txState.familySnapshots);
-      if (!txState.deletedSnapshot) return;
+      if (!txState.deletedParticipantStarted || !txState.deletedSnapshot) return;
       const { _id, ...rest } = txState.deletedSnapshot;
       await ParticipantModel.collection.updateOne(
         { _id: _id as mongoose.Types.ObjectId },
@@ -1005,11 +1091,14 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
   const actor = req.participant!;
   const parsed = createFamilySchema.parse(req.body);
 
+  const activityLogId = new mongoose.Types.ObjectId();
   const txState: {
     createdFamily?: IFamily;
+    loggedActivity: boolean;
     participantSnapshots: ParticipantUpdateSnapshot[];
     revokedInvites: RevokedInviteRollbackRecord[];
   } = {
+    loggedActivity: false,
     participantSnapshots: [],
     revokedInvites: [],
   };
@@ -1018,10 +1107,11 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
     tripId: trip._id,
     work: async (session) => {
       txState.createdFamily = undefined;
+      txState.loggedActivity = false;
       txState.participantSnapshots = [];
       txState.revokedInvites = [];
 
-      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
       const liveTrip = await TripModel.findById(trip._id).session(session);
       if (!liveTrip) {
@@ -1062,18 +1152,31 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
         );
       }
 
-      const [family] = await FamilyModel.create(
-        [
-          {
-            tripId: trip._id,
-            name: parsed.name,
-            representativeId: repParticipant ? repParticipant._id : null,
-            defaultWeight: parsed.defaultWeight,
-            notes: parsed.notes,
-          },
-        ],
-        session ? { session } : undefined
-      );
+      let family: IFamily;
+      try {
+        const [created] = await FamilyModel.create(
+          [
+            {
+              tripId: trip._id,
+              name: parsed.name,
+              representativeId: repParticipant ? repParticipant._id : null,
+              defaultWeight: parsed.defaultWeight,
+              notes: parsed.notes,
+            },
+          ],
+          session ? { session } : undefined
+        );
+        family = created;
+      } catch (err) {
+        if (isDuplicateKeyError(err)) {
+          throw new AppError(
+            'A family group with this name already exists in this trip.',
+            409,
+            'FAMILY_EXISTS'
+          );
+        }
+        throw err;
+      }
       txState.createdFamily = family;
 
       if (repParticipant) {
@@ -1088,15 +1191,32 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
           const revoked = await revokePendingParticipantInvites({
             tripId: trip._id,
             participantIds: [repParticipant._id],
-            actorParticipantId: actor._id,
+            actorParticipantId: freshActor._id,
             grantedRole: 'FAMILY_REP',
             session,
           });
           if (revoked) txState.revokedInvites.push(revoked);
         }
       }
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'FAMILY_CREATED',
+        entityType: 'FAMILY',
+        entityId: family._id,
+        summary: `${freshActor.name} created family group "${family.name}".`,
+        session,
+      });
+      txState.loggedActivity = true;
     },
     rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
       await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreParticipantSnapshots(txState.participantSnapshots);
       if (txState.createdFamily) {
@@ -1109,17 +1229,6 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
     throw new AppError('Failed to create family group.', 500, 'INTERNAL_SERVER_ERROR');
   }
   const family = txState.createdFamily;
-
-  await logTripActivity({
-    tripId: trip._id,
-    actorUserId: req.user?.userId,
-    actorParticipantId: actor._id,
-    actorName: actor.name,
-    actionType: 'FAMILY_CREATED',
-    entityType: 'FAMILY',
-    entityId: family._id,
-    summary: `${actor.name} created family group "${family.name}".`,
-  });
 
   sendSuccess(
     res,
@@ -1147,12 +1256,15 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
     throw new AppError('Invalid family identifier format.', 400, 'INVALID_ID');
   }
 
+  const activityLogId = new mongoose.Types.ObjectId();
   const txState: {
     updatedFamily?: IFamily;
+    loggedActivity: boolean;
     familySnapshots: FamilyUpdateSnapshot[];
     participantSnapshots: ParticipantUpdateSnapshot[];
     revokedInvites: RevokedInviteRollbackRecord[];
   } = {
+    loggedActivity: false,
     familySnapshots: [],
     participantSnapshots: [],
     revokedInvites: [],
@@ -1162,11 +1274,12 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
     tripId: trip._id,
     work: async (session) => {
       txState.updatedFamily = undefined;
+      txState.loggedActivity = false;
       txState.familySnapshots = [];
       txState.participantSnapshots = [];
       txState.revokedInvites = [];
 
-      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
       const [liveTrip, family] = await Promise.all([
         TripModel.findById(trip._id).session(session),
@@ -1186,18 +1299,30 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
         throw new AppError('Family group not found.', 404, 'FAMILY_NOT_FOUND');
       }
 
-      const famSnap = captureFamilySnapshot(family);
-      txState.familySnapshots.push(famSnap);
+      // Check duplicate name BEFORE mutating participants/families or revoking invitations.
+      if (parsed.name !== undefined && parsed.name !== family.name) {
+        const duplicateFamily = await FamilyModel.findOne({
+          _id: { $ne: family._id },
+          tripId: trip._id,
+          name: parsed.name,
+        }).session(session);
+        if (duplicateFamily) {
+          throw new AppError(
+            'A family group with this name already exists in this trip.',
+            409,
+            'FAMILY_EXISTS'
+          );
+        }
+      }
 
-      if (parsed.name !== undefined) family.name = parsed.name;
-      if (parsed.defaultWeight !== undefined) family.defaultWeight = parsed.defaultWeight;
-      if (parsed.notes !== undefined) family.notes = parsed.notes;
+      let newRepParticipant: IParticipant | null = null;
+      let isRepChanging = false;
+      let isRehomingNewRep = false;
+      let newRepObjectId: mongoose.Types.ObjectId | null = null;
+      const previousRepId = family.representativeId ?? null;
 
       if (parsed.representativeId !== undefined) {
-        const previousRepId = family.representativeId ?? null;
         const trimmedRepId = parsed.representativeId?.trim() || null;
-
-        let newRepParticipant: IParticipant | null = null;
         if (trimmedRepId) {
           newRepParticipant = await assertActiveRepresentativeCandidateInTrip(
             trip._id,
@@ -1211,15 +1336,39 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
             session,
           });
         }
-
-        const newRepObjectId = newRepParticipant ? newRepParticipant._id : null;
-        const isRepChanging = !sameObjectId(previousRepId, newRepObjectId);
-        const isRehomingNewRep =
+        newRepObjectId = newRepParticipant ? newRepParticipant._id : null;
+        isRepChanging = !sameObjectId(previousRepId, newRepObjectId);
+        isRehomingNewRep =
           Boolean(newRepParticipant) &&
           !sameObjectId(newRepParticipant!.familyId ?? null, family._id);
+      }
 
+      const famSnap = captureFamilySnapshot(family);
+      txState.familySnapshots.push(famSnap);
+
+      if (parsed.name !== undefined) family.name = parsed.name;
+      if (parsed.defaultWeight !== undefined) family.defaultWeight = parsed.defaultWeight;
+      if (parsed.notes !== undefined) family.notes = parsed.notes;
+
+      const saveFamilyHandlingDuplicate = async () => {
+        try {
+          await family.save(session ? { session } : undefined);
+        } catch (err) {
+          if (isDuplicateKeyError(err)) {
+            throw new AppError(
+              'A family group with this name already exists in this trip.',
+              409,
+              'FAMILY_EXISTS'
+            );
+          }
+          throw err;
+        }
+      };
+
+      const revokeTargets = new Set<string>();
+
+      if (parsed.representativeId !== undefined) {
         if (isRepChanging) {
-          const repIdsToDemote: mongoose.Types.ObjectId[] = [];
           const touchedRepIds = new Set<string>();
 
           if (previousRepId) {
@@ -1236,7 +1385,7 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
                 await prevRep.save(session ? { session } : undefined);
                 prevSnap.expectedUpdatedAt = prevRep.updatedAt;
               }
-              repIdsToDemote.push(prevRep._id);
+              revokeTargets.add(prevRep._id.toString());
             }
           }
 
@@ -1255,12 +1404,10 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
               await extraRep.save(session ? { session } : undefined);
               extraSnap.expectedUpdatedAt = extraRep.updatedAt;
             }
-            repIdsToDemote.push(extraRep._id);
+            revokeTargets.add(extraRep._id.toString());
           }
 
-          // Revoke pending FAMILY_REP invites for replaced members (and existing non-selected candidates).
-          // Also revoke stale pending FAMILY_REP invites if the newly designated representative is being
-          // re-homed from another family, while preserving valid invites issued in this current family.
+          // Collect pending FAMILY_REP invite targets for existing family members (excluding same-family nominee).
           const familyMembers = await ParticipantModel.find({
             tripId: trip._id,
             familyId: family._id,
@@ -1268,35 +1415,18 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
           })
             .select('_id')
             .session(session);
-          const revokeTargets = new Set<string>(repIdsToDemote.map((id) => id.toString()));
           for (const fm of familyMembers) {
             revokeTargets.add(fm._id.toString());
           }
-          if (isRehomingNewRep && newRepObjectId) {
-            revokeTargets.add(newRepObjectId.toString());
-          }
-          const revoked = await revokePendingParticipantInvites({
-            tripId: trip._id,
-            participantIds: Array.from(revokeTargets).map((id) => new mongoose.Types.ObjectId(id)),
-            actorParticipantId: actor._id,
-            grantedRole: 'FAMILY_REP',
-            session,
-          });
-          if (revoked) txState.revokedInvites.push(revoked);
-        } else if (isRehomingNewRep && newRepObjectId) {
-          const revoked = await revokePendingParticipantInvites({
-            tripId: trip._id,
-            participantIds: [newRepObjectId],
-            actorParticipantId: actor._id,
-            grantedRole: 'FAMILY_REP',
-            session,
-          });
-          if (revoked) txState.revokedInvites.push(revoked);
+        }
+
+        if (isRehomingNewRep && newRepObjectId) {
+          revokeTargets.add(newRepObjectId.toString());
         }
 
         // Preserve existing role on newRepParticipant (do NOT auto-grant FAMILY_REP on family PATCH).
         family.representativeId = newRepObjectId;
-        await family.save(session ? { session } : undefined);
+        await saveFamilyHandlingDuplicate();
         famSnap.expectedUpdatedAt = family.updatedAt;
 
         if (newRepParticipant && isRehomingNewRep) {
@@ -1307,13 +1437,41 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
           repSnap.expectedUpdatedAt = newRepParticipant.updatedAt;
         }
       } else {
-        await family.save(session ? { session } : undefined);
+        await saveFamilyHandlingDuplicate();
         famSnap.expectedUpdatedAt = family.updatedAt;
       }
+
+      if (revokeTargets.size > 0) {
+        const revoked = await revokePendingParticipantInvites({
+          tripId: trip._id,
+          participantIds: Array.from(revokeTargets).map((id) => new mongoose.Types.ObjectId(id)),
+          actorParticipantId: freshActor._id,
+          grantedRole: 'FAMILY_REP',
+          session,
+        });
+        if (revoked) txState.revokedInvites.push(revoked);
+      }
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'FAMILY_UPDATED',
+        entityType: 'FAMILY',
+        entityId: family._id,
+        summary: `${freshActor.name} updated family group "${family.name}".`,
+        session,
+      });
+      txState.loggedActivity = true;
 
       txState.updatedFamily = family;
     },
     rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
       await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreParticipantSnapshots(txState.participantSnapshots);
       await restoreFamilySnapshots(txState.familySnapshots);
@@ -1346,20 +1504,30 @@ export const deleteFamily = asyncHandler(async (req: Request, res: Response) => 
     throw new AppError('Invalid family identifier format.', 400, 'INVALID_ID');
   }
 
+  const activityLogId = new mongoose.Types.ObjectId();
   const txState: {
     deletedFamilySnapshot?: Record<string, unknown>;
+    deletedFamilyStarted: boolean;
+    loggedActivity: boolean;
     participantSnapshots: ParticipantUpdateSnapshot[];
+    revokedInvites: RevokedInviteRollbackRecord[];
   } = {
+    deletedFamilyStarted: false,
+    loggedActivity: false,
     participantSnapshots: [],
+    revokedInvites: [],
   };
 
   await runSerializedTripOrganizerMutation({
     tripId: trip._id,
     work: async (session) => {
       txState.deletedFamilySnapshot = undefined;
+      txState.deletedFamilyStarted = false;
+      txState.loggedActivity = false;
       txState.participantSnapshots = [];
+      txState.revokedInvites = [];
 
-      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
       const [liveTrip, family] = await Promise.all([
         TripModel.findById(trip._id).session(session),
@@ -1383,29 +1551,51 @@ export const deleteFamily = asyncHandler(async (req: Request, res: Response) => 
         tripId: trip._id,
         familyId: family._id,
       }).session(session);
-      txState.participantSnapshots = collectParticipantSnapshots(members);
       txState.deletedFamilySnapshot = family.toObject() as unknown as Record<string, unknown>;
 
       for (const member of members) {
+        const snap = captureParticipantUpdateSnapshot(member);
+        txState.participantSnapshots.push(snap);
         member.familyId = null;
         if (member.role === 'FAMILY_REP') {
           member.role = DEFAULT_OPEN_INVITE_ROLE;
         }
         await member.save(session ? { session } : undefined);
+        snap.expectedUpdatedAt = member.updatedAt;
       }
 
-      await revokePendingParticipantInvites({
+      const revoked = await revokePendingParticipantInvites({
         tripId: trip._id,
         participantIds: members.map((m) => m._id),
-        actorParticipantId: actor._id,
+        actorParticipantId: freshActor._id,
         grantedRole: 'FAMILY_REP',
         session,
       });
+      if (revoked) txState.revokedInvites.push(revoked);
 
+      txState.deletedFamilyStarted = true;
       await FamilyModel.deleteOne({ _id: family._id }, session ? { session } : undefined);
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'FAMILY_DELETED',
+        entityType: 'FAMILY',
+        entityId: family._id,
+        summary: `${freshActor.name} deleted family group "${family.name}".`,
+        session,
+      });
+      txState.loggedActivity = true;
     },
     rollback: async () => {
-      if (txState.deletedFamilySnapshot) {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+      await restoreRevokedInviteRecords(txState.revokedInvites);
+      if (txState.deletedFamilyStarted && txState.deletedFamilySnapshot) {
         const { _id, ...rest } = txState.deletedFamilySnapshot;
         await FamilyModel.collection.updateOne(
           { _id: _id as mongoose.Types.ObjectId },
