@@ -172,10 +172,13 @@ export function TripDetailPage(): React.ReactElement {
   } = data;
 
   const isOrganizer = myParticipant.role === 'ORGANIZER';
+  const myParticipantRecord = participants.find((p) => p.id === myParticipant.id);
   const canAddExpense =
     trip.status !== 'CLOSED' &&
     ['ORGANIZER', 'CONTRIBUTOR', 'FAMILY_REP'].includes(myParticipant.role);
 
+  const participantMap = new Map(participants.map((p) => [p.id, p]));
+  const familyMap = new Map(families.map((f) => [f.id, f]));
   const participantNameMap = new Map(participants.map((p) => [p.id, p.name]));
   const familyNameMap = new Map(families.map((f) => [f.id, f.name]));
 
@@ -336,6 +339,7 @@ export function TripDetailPage(): React.ReactElement {
   };
 
   const handlePrefillSuggestion = (s: SettlementSuggestion) => {
+    setSettlementViewMode(s.mode);
     setSettleFromId(s.fromParticipantId);
     setSettleToId(s.toParticipantId);
     setSettleAmountNpr(paisaToNprString(s.amountPaisa));
@@ -611,7 +615,13 @@ export function TripDetailPage(): React.ReactElement {
                   Family-Level Aggregate Balances
                 </h2>
                 <div className="space-y-3">
-                  {ledger.familyBalances.map((fam) => (
+                  {ledger.familyBalances.map((fam) => {
+                    const designatedRepId = familyMap.get(fam.familyId)?.representativeId ?? null;
+                    const designatedRepName = designatedRepId
+                      ? participantNameMap.get(designatedRepId) ?? null
+                      : null;
+
+                    return (
                     <div
                       key={fam.familyId}
                       className="rounded-xl border border-slate-200 p-3.5 bg-slate-50/60"
@@ -622,7 +632,7 @@ export function TripDetailPage(): React.ReactElement {
                             {fam.familyName}
                           </span>
                           <span className="text-xs text-slate-500 ml-2">
-                            Rep: {fam.representativeName ?? 'Unassigned'} • {fam.memberCount} members
+                            Rep: {designatedRepName ?? 'Unassigned'} • {fam.memberCount} members
                           </span>
                         </div>
                         <span
@@ -642,7 +652,8 @@ export function TripDetailPage(): React.ReactElement {
                         <span>Share: {formatPaisaToNPR(fam.totalSharePaisa)}</span>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1243,7 +1254,7 @@ export function TripDetailPage(): React.ReactElement {
                             Representative:{' '}
                             {fam.representativeId
                               ? participantNameMap.get(fam.representativeId) ?? 'Assigned'
-                              : 'Auto-assigned primary adult'}
+                              : 'Not designated'}
                           </div>
                           <div className="text-[11px] text-slate-500 mt-1">
                             Members ({members.length}): {members.map((m) => m.name).join(', ') || 'None'}
@@ -1306,6 +1317,38 @@ export function TripDetailPage(): React.ReactElement {
               Settlements reimburse participants directly and never modify original expense records. Only confirmed settlements reduce outstanding balances.
             </p>
             <form onSubmit={handleRecordSettlement} className="space-y-3">
+              {trip.mode === 'FAMILY' && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Settlement Mode
+                  </label>
+                  <div className="flex rounded-xl bg-slate-100 p-1 text-xs font-semibold">
+                    <button
+                      type="button"
+                      onClick={() => setSettlementViewMode('INDIVIDUAL')}
+                      className={`flex-1 py-1.5 rounded-lg transition-colors ${
+                        settlementViewMode === 'INDIVIDUAL'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Individual
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSettlementViewMode('FAMILY')}
+                      className={`flex-1 py-1.5 rounded-lg transition-colors ${
+                        settlementViewMode === 'FAMILY'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Family
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -1411,9 +1454,34 @@ export function TripDetailPage(): React.ReactElement {
             ) : (
               <div className="space-y-2.5">
                 {settlements.map((s) => {
+                  const isActiveActor = myParticipantRecord
+                    ? myParticipantRecord.isActive === true
+                    : false;
+                  const receiverRecord = participantMap.get(s.toParticipantId);
+                  const designatedFamily =
+                    s.toFamilyId && s.toFamilyId === myParticipant.familyId
+                      ? familyMap.get(s.toFamilyId)
+                      : undefined;
+                  const isDesignatedFamilyRep =
+                    trip.mode === 'FAMILY' &&
+                    s.settlementMode === 'FAMILY' &&
+                    isActiveActor &&
+                    myParticipant.role === 'FAMILY_REP' &&
+                    Boolean(myParticipant.familyId) &&
+                    Boolean(s.toFamilyId) &&
+                    s.toFamilyId === myParticipant.familyId &&
+                    Boolean(designatedFamily && designatedFamily.representativeId === myParticipant.id) &&
+                    Boolean(
+                      receiverRecord &&
+                        receiverRecord.isActive === true &&
+                        receiverRecord.familyId === s.toFamilyId
+                    );
                   const canConfirm =
+                    trip.status !== 'CLOSED' &&
                     s.status === 'REPORTED' &&
-                    (isOrganizer || s.toParticipantId === myParticipant.id);
+                    (isOrganizer ||
+                      (isActiveActor && s.toParticipantId === myParticipant.id) ||
+                      isDesignatedFamilyRep);
 
                   return (
                     <div
@@ -1421,10 +1489,15 @@ export function TripDetailPage(): React.ReactElement {
                       className="p-3 rounded-xl border border-slate-200 flex items-center justify-between text-xs"
                     >
                       <div>
-                        <p className="font-semibold text-slate-900">
-                          {participantNameMap.get(s.fromParticipantId) ?? 'Sender'} →{' '}
-                          {participantNameMap.get(s.toParticipantId) ?? 'Receiver'}
-                        </p>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <p className="font-semibold text-slate-900">
+                            {participantNameMap.get(s.fromParticipantId) ?? 'Sender'} →{' '}
+                            {participantNameMap.get(s.toParticipantId) ?? 'Receiver'}
+                          </p>
+                          <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+                            {s.settlementMode}
+                          </span>
+                        </div>
                         <p className="text-[11px] text-slate-500">
                           {PAYMENT_METHOD_LABELS[s.paymentMethod] ?? s.paymentMethod} •{' '}
                           {new Date(s.settledAt).toLocaleDateString()}
@@ -1453,6 +1526,8 @@ export function TripDetailPage(): React.ReactElement {
                         {canConfirm && (
                           <div className="flex items-center gap-1">
                             <button
+                              type="button"
+                              aria-label={`Confirm settlement ${s.id}`}
                               onClick={() => void handleConfirmSettlement(s.id, 'CONFIRMED')}
                               title="Confirm Receipt"
                               className="p-1.5 rounded bg-emerald-50 hover:bg-emerald-100 text-emerald-700"
@@ -1460,6 +1535,8 @@ export function TripDetailPage(): React.ReactElement {
                               <Check className="w-4 h-4" />
                             </button>
                             <button
+                              type="button"
+                              aria-label={`Reject settlement ${s.id}`}
                               onClick={() => void handleConfirmSettlement(s.id, 'REJECTED')}
                               title="Reject"
                               className="p-1.5 rounded bg-rose-50 hover:bg-rose-100 text-rose-600"
