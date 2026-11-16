@@ -117,8 +117,23 @@ describe('Shared security contracts: invite roles, schemas, and policy', () => {
 
   it('validates invite creation, claim, email verification, joinTrip, and updateTrip schemas', () => {
     const defaultInvite = createParticipantInviteSchema.parse({});
+    expect(defaultInvite.grantedRole).toBe('PARTICIPANT');
     expect(defaultInvite.intendedEmail).toBeUndefined();
     expect(defaultInvite.expiresInHours).toBe(DEFAULT_PARTICIPANT_INVITE_TTL_HOURS);
+
+    const orgInvite = createParticipantInviteSchema.parse({
+      grantedRole: 'ORGANIZER',
+      intendedEmail: '  OrgLeader@Example.COM ',
+    });
+    expect(orgInvite.grantedRole).toBe('ORGANIZER');
+    expect(orgInvite.intendedEmail).toBe('orgleader@example.com');
+
+    expect(() =>
+      createParticipantInviteSchema.parse({ grantedRole: 'ORGANIZER' })
+    ).toThrow(/intendedEmail/i);
+    expect(() =>
+      createParticipantInviteSchema.parse({ grantedRole: 'FAMILY_REP', intendedEmail: '' })
+    ).toThrow(/intendedEmail/i);
 
     const emailInvite = createParticipantInviteSchema.parse({
       intendedEmail: '  Test@Example.COM ',

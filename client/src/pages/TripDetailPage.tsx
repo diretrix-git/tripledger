@@ -364,14 +364,16 @@ export function TripDetailPage(): React.ReactElement {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              onClick={() => copyToClipboard(trip.inviteCode, 'Invite code copied!')}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-mono font-semibold text-slate-700"
-              title="Copy Invite Code"
-            >
-              <Copy className="w-3.5 h-3.5 text-slate-500" />
-              <span>Code: {trip.inviteCode}</span>
-            </button>
+            {isOrganizer && trip.inviteCode && (
+              <button
+                onClick={() => copyToClipboard(trip.inviteCode!, 'Invite code copied!')}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-slate-200 hover:bg-slate-50 text-xs font-mono font-semibold text-slate-700"
+                title="Copy Invite Code"
+              >
+                <Copy className="w-3.5 h-3.5 text-slate-500" />
+                <span>Code: {trip.inviteCode}</span>
+              </button>
+            )}
 
             <button
               onClick={() =>

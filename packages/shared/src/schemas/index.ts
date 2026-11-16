@@ -199,18 +199,37 @@ export const verifyEmailSchema = z.object({
   token: z.string().trim().min(16, 'Verification token is required').max(256),
 });
 
-export const createParticipantInviteSchema = z.object({
-  intendedEmail: optionalNormalizedEmailSchema,
-  expiresInHours: z
-    .number()
-    .int()
-    .min(1, 'Invite expiration must be at least 1 hour')
-    .max(
-      MAX_PARTICIPANT_INVITE_TTL_HOURS,
-      `Invite expiration cannot exceed ${MAX_PARTICIPANT_INVITE_TTL_HOURS} hours`
-    )
-    .default(DEFAULT_PARTICIPANT_INVITE_TTL_HOURS),
-});
+export const createParticipantInviteSchema = z
+  .object({
+    grantedRole: z.enum(TRIP_ROLES).default('PARTICIPANT'),
+    intendedEmail: optionalNormalizedEmailSchema,
+    expiresInHours: z
+      .number()
+      .int()
+      .min(1, 'Invite expiration must be at least 1 hour')
+      .max(
+        MAX_PARTICIPANT_INVITE_TTL_HOURS,
+        `Invite expiration cannot exceed ${MAX_PARTICIPANT_INVITE_TTL_HOURS} hours`
+      )
+      .default(DEFAULT_PARTICIPANT_INVITE_TTL_HOURS),
+  })
+  .superRefine((value, ctx) => {
+    try {
+      resolveParticipantInvitePolicy({
+        role: value.grantedRole,
+        intendedEmail: value.intendedEmail,
+      });
+    } catch (err) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['intendedEmail'],
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Valid intendedEmail is required for privileged invitations.',
+      });
+    }
+  });
 
 export const claimParticipantInviteSchema = z.object({
   token: z.string().trim().min(16, 'Invite token is required').max(256),

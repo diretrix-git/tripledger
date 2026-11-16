@@ -20,7 +20,7 @@ export interface DashboardTripSummary {
   mode: TripMode;
   status: TripStatus;
   budgetPaisa?: number;
-  inviteCode: string;
+  inviteCode?: string;
   participantCount: number;
   familyCount: number;
   totalApprovedExpensePaisa: number;

@@ -163,12 +163,8 @@ export interface TripSummaryEntity {
   budgetPaisa?: number;
   startDate?: string;
   endDate?: string;
-  /**
-   * Required on TripSummaryEntity during Phase 1 for backward compatibility with existing
-   * client callers (`TripDetailPage.tsx`). Phase 3/4 must narrow this to `inviteCode?: string`
-   * when restricting inviteCode visibility to `ORGANIZER` responses alongside UI updates.
-   */
-  inviteCode: string;
+  /** Visible to ORGANIZER responses only; omitted for non-organizer participants. */
+  inviteCode?: string;
   inviteEnabled?: boolean;
   inviteExpiresAt?: string | null;
   inviteCodeRotatedAt?: string | null;
@@ -212,4 +208,14 @@ export interface PendingParticipantInviteEntity {
   intendedEmail: string;
   requireVerifiedEmail: boolean;
   expiresAt: string;
+}
+
+export interface CreateParticipantInviteResponse {
+  invite: ParticipantInviteEntity;
+  rawToken: string;
+  claimUrl: string;
+  emailDelivery: {
+    sent: boolean;
+    provider?: string;
+  };
 }
