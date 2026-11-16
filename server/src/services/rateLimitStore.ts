@@ -13,7 +13,9 @@ import {
   validateRateLimitTopologyConfig,
 } from '../config/env.js';
 import { RateLimitBucketModel } from '../models/index.js';
+import { AppError } from '../utils/http.js';
 import { isDuplicateKeyError } from '../utils/mongoErrors.js';
+import { redactSensitiveText } from '../utils/redact.js';
 
 export class MongoRateLimitStore implements Store {
   public readonly prefix: string;
@@ -61,25 +63,51 @@ export class MongoRateLimitStore implements Store {
         },
         { upsert: true, new: true, lean: true }
       );
-      return {
-        totalHits: doc?.hits ?? 1,
-        resetTime,
-      };
-    } catch (err) {
-      if (isDuplicateKeyError(err)) {
-        const doc = await RateLimitBucketModel.findOneAndUpdate(
-          { key: bucketKey },
-          { $inc: { hits: 1 } },
-          { new: true, lean: true }
-        );
-        if (doc) {
-          return {
-            totalHits: doc.hits,
-            resetTime,
-          };
-        }
+      if (doc) {
+        return {
+          totalHits: doc.hits,
+          resetTime,
+        };
       }
-      throw err;
+      throw new AppError(
+        'Rate-limit storage is temporarily unavailable. Please try again later.',
+        503,
+        'SERVICE_UNAVAILABLE'
+      );
+    } catch (err) {
+      if (err instanceof AppError) {
+        throw err;
+      }
+      if (isDuplicateKeyError(err)) {
+        try {
+          const doc = await RateLimitBucketModel.findOneAndUpdate(
+            { key: bucketKey },
+            { $inc: { hits: 1 } },
+            { new: true, lean: true }
+          );
+          if (doc) {
+            return {
+              totalHits: doc.hits,
+              resetTime,
+            };
+          }
+        } catch (retryErr) {
+          const safeRetryReason = redactSensitiveText(
+            retryErr instanceof Error ? retryErr.message : 'Rate limit retry failure'
+          );
+          console.error('[TripLedger RateLimit] Retry failure:', safeRetryReason);
+        }
+      } else {
+        const safeReason = redactSensitiveText(
+          err instanceof Error ? err.message : 'Rate limit store failure'
+        );
+        console.error('[TripLedger RateLimit] Store failure:', safeReason);
+      }
+      throw new AppError(
+        'Rate-limit storage is temporarily unavailable. Please try again later.',
+        503,
+        'SERVICE_UNAVAILABLE'
+      );
     }
   }
 

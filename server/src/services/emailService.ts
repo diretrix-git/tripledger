@@ -1,12 +1,8 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { type EmailDeliveryProvider } from '@tripledger/shared';
-import {
-  env,
-  validateClientUrl,
-  validateEmailConfig,
-  type EnvConfig,
-} from '../config/env.js';
+import { env, validateClientUrl, validateEmailConfig, type EnvConfig } from '../config/env.js';
 import { AppError } from '../utils/http.js';
+import { redactSensitiveText } from '../utils/redact.js';
 
 export interface VerificationEmailRequest {
   to: string;
@@ -61,15 +57,7 @@ export function buildEmailVerificationUrl(
 }
 
 function redactSecrets(message: string, secrets: readonly string[]): string {
-  let sanitized = message;
-  for (const secret of secrets) {
-    if (secret && secret.length > 0) {
-      sanitized = sanitized.split(secret).join('[REDACTED]');
-      sanitized = sanitized.split(encodeURIComponent(secret)).join('[REDACTED]');
-    }
-  }
-  sanitized = sanitized.replace(/([?&]token=)[^&\s"']+/gi, '$1[REDACTED]');
-  return sanitized;
+  return redactSensitiveText(message, secrets);
 }
 
 function composeVerificationEmailPayload(
