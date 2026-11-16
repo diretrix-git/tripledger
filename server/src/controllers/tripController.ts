@@ -15,6 +15,7 @@ import {
   updateTripSchema,
 } from '@tripledger/shared';
 import {
+  ActivityLogModel,
   ExpenseModel,
   ExpensePaymentModel,
   ExpenseShareModel,
@@ -217,180 +218,333 @@ export const updateTrip = asyncHandler(async (req: Request, res: Response) => {
   const participant = req.participant!;
   const parsed = updateTripSchema.parse(req.body);
 
-  const wasClosed = trip.status === 'CLOSED';
-  const targetStatus = parsed.status ?? trip.status;
+  const activityLogId = new mongoose.Types.ObjectId();
+  const txState: {
+    updatedTrip?: ITrip;
+    writtenUpdatedAt?: Date;
+    loggedActivity: boolean;
+    previousFields?: {
+      name: string;
+      description: string | undefined;
+      budgetPaisa: number | undefined;
+      startDate: Date | undefined;
+      endDate: Date | undefined;
+      shareEnabled: boolean;
+      status: ITrip['status'];
+      closedAt: Date | null;
+      inviteEnabled: boolean;
+      inviteExpiresAt: Date | null;
+    };
+  } = {
+    loggedActivity: false,
+  };
 
-  if (targetStatus === 'CLOSED' && parsed.inviteEnabled === true) {
-    throw new AppError(
-      'Open invite-code joining cannot be enabled while a trip is closed.',
-      400,
-      'INVITE_NOT_ALLOWED_ON_CLOSED_TRIP'
-    );
-  }
-
-  if (parsed.name !== undefined) trip.name = parsed.name;
-  if (parsed.description !== undefined) trip.description = parsed.description;
-  if (parsed.budgetPaisa !== undefined) trip.budgetPaisa = parsed.budgetPaisa;
-  if (parsed.startDate !== undefined) {
-    trip.startDate = parsed.startDate ? new Date(parsed.startDate) : undefined;
-  }
-  if (parsed.endDate !== undefined) {
-    trip.endDate = parsed.endDate ? new Date(parsed.endDate) : undefined;
-  }
-  if (parsed.shareEnabled !== undefined) trip.shareEnabled = parsed.shareEnabled;
-
-  if (parsed.status !== undefined) {
-    trip.status = parsed.status;
-    if (parsed.status === 'CLOSED') {
-      trip.closedAt = trip.closedAt ?? new Date();
-      trip.inviteEnabled = false;
-    } else if (wasClosed) {
-      // Clear archival closure timestamp on organizer reopen; keep inviteEnabled under explicit control.
-      trip.closedAt = null;
-    }
-  }
-
-  if (parsed.inviteEnabled !== undefined && targetStatus !== 'CLOSED') {
-    trip.inviteEnabled = parsed.inviteEnabled;
-  }
-  if (parsed.inviteExpiresAt !== undefined) {
-    trip.inviteExpiresAt =
-      parsed.inviteExpiresAt === null ? null : new Date(parsed.inviteExpiresAt);
-  }
-
-  await trip.save();
-
-  await logTripActivity({
+  await runSerializedTripOrganizerMutation({
     tripId: trip._id,
-    actorUserId: req.user?.userId,
-    actorParticipantId: participant._id,
-    actorName: participant.name,
-    actionType: 'TRIP_UPDATED',
-    entityType: 'TRIP',
-    entityId: trip._id,
-    summary: `${participant.name} updated trip settings.`,
+    work: async (session) => {
+      txState.updatedTrip = undefined;
+      txState.writtenUpdatedAt = undefined;
+      txState.loggedActivity = false;
+      txState.previousFields = undefined;
+
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, participant._id, session);
+      const liveTrip = await TripModel.findById(trip._id).session(session);
+      if (!liveTrip) {
+        throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
+      }
+
+      const wasClosed = liveTrip.status === 'CLOSED';
+      const targetStatus = parsed.status ?? liveTrip.status;
+
+      if (targetStatus === 'CLOSED' && parsed.inviteEnabled === true) {
+        throw new AppError(
+          'Open invite-code joining cannot be enabled while a trip is closed.',
+          400,
+          'INVITE_NOT_ALLOWED_ON_CLOSED_TRIP'
+        );
+      }
+
+      txState.previousFields = {
+        name: liveTrip.name,
+        description: liveTrip.description,
+        budgetPaisa: liveTrip.budgetPaisa,
+        startDate: liveTrip.startDate,
+        endDate: liveTrip.endDate,
+        shareEnabled: liveTrip.shareEnabled,
+        status: liveTrip.status,
+        closedAt: liveTrip.closedAt ?? null,
+        inviteEnabled: liveTrip.inviteEnabled,
+        inviteExpiresAt: liveTrip.inviteExpiresAt ?? null,
+      };
+
+      if (parsed.name !== undefined) liveTrip.name = parsed.name;
+      if (parsed.description !== undefined) liveTrip.description = parsed.description;
+      if (parsed.budgetPaisa !== undefined) liveTrip.budgetPaisa = parsed.budgetPaisa;
+      if (parsed.startDate !== undefined) {
+        liveTrip.startDate = parsed.startDate ? new Date(parsed.startDate) : undefined;
+      }
+      if (parsed.endDate !== undefined) {
+        liveTrip.endDate = parsed.endDate ? new Date(parsed.endDate) : undefined;
+      }
+      if (parsed.shareEnabled !== undefined) liveTrip.shareEnabled = parsed.shareEnabled;
+
+      if (parsed.status !== undefined) {
+        liveTrip.status = parsed.status;
+        if (parsed.status === 'CLOSED') {
+          liveTrip.closedAt = liveTrip.closedAt ?? new Date();
+          liveTrip.inviteEnabled = false;
+        } else if (wasClosed) {
+          // Clear archival closure timestamp on organizer reopen; keep inviteEnabled under explicit control.
+          liveTrip.closedAt = null;
+        }
+      }
+
+      if (parsed.inviteEnabled !== undefined && targetStatus !== 'CLOSED') {
+        liveTrip.inviteEnabled = parsed.inviteEnabled;
+      }
+      if (parsed.inviteExpiresAt !== undefined) {
+        liveTrip.inviteExpiresAt =
+          parsed.inviteExpiresAt === null ? null : new Date(parsed.inviteExpiresAt);
+      }
+
+      await liveTrip.save(session ? { session } : undefined);
+      txState.writtenUpdatedAt = liveTrip.updatedAt;
+      txState.updatedTrip = liveTrip;
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'TRIP_UPDATED',
+        entityType: 'TRIP',
+        entityId: liveTrip._id,
+        summary: `${freshActor.name} updated trip settings.`,
+        session,
+      });
+      txState.loggedActivity = true;
+    },
+    rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+      if (!txState.updatedTrip || !txState.previousFields) return;
+      const prev = txState.previousFields;
+      const $set: Record<string, unknown> = {
+        name: prev.name,
+        shareEnabled: prev.shareEnabled,
+        status: prev.status,
+        closedAt: prev.closedAt,
+        inviteEnabled: prev.inviteEnabled,
+        inviteExpiresAt: prev.inviteExpiresAt,
+      };
+      const $unset: Record<string, 1> = {};
+      if (prev.description !== undefined) $set.description = prev.description;
+      else $unset.description = 1;
+      if (prev.budgetPaisa !== undefined) $set.budgetPaisa = prev.budgetPaisa;
+      else $unset.budgetPaisa = 1;
+      if (prev.startDate !== undefined) $set.startDate = prev.startDate;
+      else $unset.startDate = 1;
+      if (prev.endDate !== undefined) $set.endDate = prev.endDate;
+      else $unset.endDate = 1;
+
+      await TripModel.updateOne(
+        {
+          _id: trip._id,
+          ...(txState.writtenUpdatedAt ? { updatedAt: txState.writtenUpdatedAt } : {}),
+        },
+        Object.keys($unset).length > 0 ? { $set, $unset } : { $set }
+      );
+    },
   });
 
-  sendSuccess(res, { trip: formatTripDoc(trip, { includeInviteCode: true }) });
+  if (!txState.updatedTrip) {
+    throw new AppError('Failed to update trip.', 500, 'INTERNAL_SERVER_ERROR');
+  }
+
+  sendSuccess(res, { trip: formatTripDoc(txState.updatedTrip, { includeInviteCode: true }) });
 });
 
 export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Response) => {
   if (!req.user) {
     throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
   }
+  const authUser = req.user;
 
   joinTripSchema.parse(req.body ?? {});
 
   const rawInviteCode = req.params.inviteCode;
   const inviteCode = typeof rawInviteCode === 'string' ? rawInviteCode.trim().toUpperCase() : '';
-  const trip = inviteCode ? await TripModel.findOne({ inviteCode }) : null;
-  if (!trip) {
+  const initialTrip = inviteCode ? await TripModel.findOne({ inviteCode }) : null;
+  if (!initialTrip) {
     throw new AppError('Invalid or unavailable invite code.', 404, 'TRIP_NOT_FOUND');
   }
 
-  if (trip.status === 'CLOSED') {
-    throw new AppError(
-      'This trip is closed and no longer accepting new members.',
-      403,
-      'TRIP_CLOSED'
-    );
-  }
+  const activityLogId = new mongoose.Types.ObjectId();
+  const txState: {
+    createdParticipantId?: mongoose.Types.ObjectId;
+    loggedActivity: boolean;
+    result?: {
+      trip: ITrip;
+      participantId: string;
+      alreadyJoined: boolean;
+      role: IParticipant['role'];
+      includeInviteCode: boolean;
+    };
+  } = {
+    loggedActivity: false,
+  };
 
-  if (trip.inviteEnabled === false) {
-    throw new AppError(
-      'Open invite-code joining is disabled for this trip.',
-      403,
-      'INVITE_DISABLED'
-    );
-  }
+  await runSerializedTripOrganizerMutation({
+    tripId: initialTrip._id,
+    work: async (session) => {
+      txState.createdParticipantId = undefined;
+      txState.loggedActivity = false;
+      txState.result = undefined;
 
-  if (trip.inviteExpiresAt && trip.inviteExpiresAt.getTime() <= Date.now()) {
-    throw new AppError('This invite code has expired.', 403, 'INVITE_EXPIRED');
-  }
+      const liveTrip = await TripModel.findById(initialTrip._id).session(session);
+      if (!liveTrip) {
+        throw new AppError('Invalid or unavailable invite code.', 404, 'TRIP_NOT_FOUND');
+      }
 
-  // Existing membership check: never reactivate deactivated members via open invite code.
-  const existingParticipant = await ParticipantModel.findOne({
-    tripId: trip._id,
-    userId: req.user.userId,
-  });
+      if (liveTrip.status === 'CLOSED') {
+        throw new AppError(
+          'This trip is closed and no longer accepting new members.',
+          403,
+          'TRIP_CLOSED'
+        );
+      }
 
-  if (existingParticipant) {
-    if (!existingParticipant.isActive) {
-      throw new AppError(
-        'Your membership in this trip has been deactivated by an organizer.',
-        403,
-        'PARTICIPANT_DEACTIVATED'
-      );
-    }
-    sendSuccess(res, {
-      trip: formatTripDoc(trip, {
-        includeInviteCode: existingParticipant.role === 'ORGANIZER',
-      }),
-      participantId: existingParticipant._id.toString(),
-      alreadyJoined: true,
-      role: existingParticipant.role,
-    });
-    return;
-  }
+      if (liveTrip.inviteEnabled === false) {
+        throw new AppError(
+          'Open invite-code joining is disabled for this trip.',
+          403,
+          'INVITE_DISABLED'
+        );
+      }
 
-  // Open invite-code joins ALWAYS enroll a fresh low-privilege PARTICIPANT record and NEVER
-  // auto-link or claim existing guest participant rows by ID or email.
-  let participant: IParticipant;
-  try {
-    participant = await ParticipantModel.create({
-      tripId: trip._id,
-      userId: req.user.userId,
-      name: req.user.name,
-      email: req.user.email,
-      role: DEFAULT_OPEN_INVITE_ROLE,
-      memberType: 'ADULT',
-      defaultWeight: 1,
-      isActive: true,
-    });
-  } catch (err) {
-    if (isDuplicateKeyError(err)) {
-      const concurrent = await ParticipantModel.findOne({
-        tripId: trip._id,
-        userId: req.user.userId,
-      });
-      if (concurrent) {
-        if (!concurrent.isActive) {
+      if (liveTrip.inviteExpiresAt && liveTrip.inviteExpiresAt.getTime() <= Date.now()) {
+        throw new AppError('This invite code has expired.', 403, 'INVITE_EXPIRED');
+      }
+
+      // Existing membership check: never reactivate deactivated members via open invite code.
+      const existingParticipant = await ParticipantModel.findOne({
+        tripId: liveTrip._id,
+        userId: authUser.userId,
+      }).session(session);
+
+      if (existingParticipant) {
+        if (!existingParticipant.isActive) {
           throw new AppError(
             'Your membership in this trip has been deactivated by an organizer.',
             403,
             'PARTICIPANT_DEACTIVATED'
           );
         }
-        sendSuccess(res, {
-          trip: formatTripDoc(trip, {
-            includeInviteCode: concurrent.role === 'ORGANIZER',
-          }),
-          participantId: concurrent._id.toString(),
+        txState.result = {
+          trip: liveTrip,
+          participantId: existingParticipant._id.toString(),
           alreadyJoined: true,
-          role: concurrent.role,
-        });
+          role: existingParticipant.role,
+          includeInviteCode: existingParticipant.role === 'ORGANIZER',
+        };
         return;
       }
-    }
-    throw err;
-  }
 
-  await logTripActivity({
-    tripId: trip._id,
-    actorUserId: req.user.userId,
-    actorParticipantId: participant._id,
-    actorName: req.user.name,
-    actionType: 'PARTICIPANT_JOINED',
-    entityType: 'PARTICIPANT',
-    entityId: participant._id,
-    summary: `${req.user.name} joined the trip via invite code.`,
+      // Open invite-code joins ALWAYS enroll a fresh low-privilege PARTICIPANT record and NEVER
+      // auto-link or claim existing guest participant rows by ID or email.
+      const participantId = new mongoose.Types.ObjectId();
+      let participant: IParticipant;
+      try {
+        const [created] = await ParticipantModel.create(
+          [
+            {
+              _id: participantId,
+              tripId: liveTrip._id,
+              userId: authUser.userId,
+              name: authUser.name,
+              email: authUser.email,
+              role: DEFAULT_OPEN_INVITE_ROLE,
+              memberType: 'ADULT',
+              defaultWeight: 1,
+              isActive: true,
+            },
+          ],
+          session ? { session } : undefined
+        );
+        participant = created;
+      } catch (err) {
+        if (session === null && isDuplicateKeyError(err)) {
+          const concurrent = await ParticipantModel.findOne({
+            tripId: liveTrip._id,
+            userId: authUser.userId,
+          });
+          if (concurrent) {
+            if (!concurrent.isActive) {
+              throw new AppError(
+                'Your membership in this trip has been deactivated by an organizer.',
+                403,
+                'PARTICIPANT_DEACTIVATED'
+              );
+            }
+            txState.result = {
+              trip: liveTrip,
+              participantId: concurrent._id.toString(),
+              alreadyJoined: true,
+              role: concurrent.role,
+              includeInviteCode: concurrent.role === 'ORGANIZER',
+            };
+            return;
+          }
+        }
+        throw err;
+      }
+      txState.createdParticipantId = participant._id;
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: liveTrip._id,
+        actorUserId: authUser.userId,
+        actorParticipantId: participant._id,
+        actorName: authUser.name,
+        actionType: 'PARTICIPANT_JOINED',
+        entityType: 'PARTICIPANT',
+        entityId: participant._id,
+        summary: `${authUser.name} joined the trip via invite code.`,
+        session,
+      });
+      txState.loggedActivity = true;
+
+      txState.result = {
+        trip: liveTrip,
+        participantId: participant._id.toString(),
+        alreadyJoined: false,
+        role: participant.role,
+        includeInviteCode: false,
+      };
+    },
+    rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+      if (txState.createdParticipantId) {
+        await ParticipantModel.deleteOne({ _id: txState.createdParticipantId });
+      }
+    },
   });
 
+  if (!txState.result) {
+    throw new AppError('Failed to join trip.', 500, 'INTERNAL_SERVER_ERROR');
+  }
+
   sendSuccess(res, {
-    trip: formatTripDoc(trip, { includeInviteCode: false }),
-    participantId: participant._id.toString(),
-    alreadyJoined: false,
-    role: participant.role,
+    trip: formatTripDoc(txState.result.trip, {
+      includeInviteCode: txState.result.includeInviteCode,
+    }),
+    participantId: txState.result.participantId,
+    alreadyJoined: txState.result.alreadyJoined,
+    role: txState.result.role,
   });
 });
 
@@ -1203,75 +1357,153 @@ export const deleteFamily = asyncHandler(async (req: Request, res: Response) => 
 
 export const updateChecklistItem = asyncHandler(async (req: Request, res: Response) => {
   const trip = req.trip!;
+  const actor = req.participant!;
   const parsed = updateChecklistItemSchema.parse(req.body);
 
-  const item = trip.checklist.find((c) => c.category === parsed.category);
-  if (!item) {
-    throw new AppError('Checklist category not found.', 404, 'CHECKLIST_ITEM_NOT_FOUND');
-  }
+  let updatedChecklist: ITrip['checklist'] | undefined;
 
-  if (parsed.checked !== undefined) item.checked = parsed.checked;
-  if (parsed.notApplicable !== undefined) item.notApplicable = parsed.notApplicable;
-  item.verifiedAt = item.checked || item.notApplicable ? new Date() : null;
+  await runSerializedTripOrganizerMutation({
+    tripId: trip._id,
+    work: async (session) => {
+      updatedChecklist = undefined;
+      await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const liveTrip = await TripModel.findById(trip._id).session(session);
+      if (!liveTrip) {
+        throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
+      }
 
-  await trip.save();
+      const item = liveTrip.checklist.find((c) => c.category === parsed.category);
+      if (!item) {
+        throw new AppError('Checklist category not found.', 404, 'CHECKLIST_ITEM_NOT_FOUND');
+      }
 
-  sendSuccess(res, { checklist: trip.checklist });
+      if (parsed.checked !== undefined) item.checked = parsed.checked;
+      if (parsed.notApplicable !== undefined) item.notApplicable = parsed.notApplicable;
+      item.verifiedAt = item.checked || item.notApplicable ? new Date() : null;
+
+      await liveTrip.save(session ? { session } : undefined);
+      updatedChecklist = liveTrip.checklist;
+    },
+    rollback: async () => {
+      // Single-document save in transaction or serialized lease requires no separate revert.
+    },
+  });
+
+  sendSuccess(res, { checklist: updatedChecklist ?? trip.checklist });
 });
 
 export const closeTrip = asyncHandler(async (req: Request, res: Response) => {
   const trip = req.trip!;
   const actor = req.participant!;
   const forceClose = req.body?.forceClose === true;
+  const activityLogId = new mongoose.Types.ObjectId();
 
-  // Check if there are any unapproved or estimated pending expenses
-  const pendingExpensesCount = await ExpenseModel.countDocuments({
+  const txState: {
+    closedTrip?: ITrip;
+    writtenUpdatedAt?: Date;
+    loggedActivity: boolean;
+    previousCloseState?: {
+      status: ITrip['status'];
+      closedAt: Date | null;
+      inviteEnabled: boolean;
+    };
+  } = {
+    loggedActivity: false,
+  };
+
+  await runSerializedTripOrganizerMutation({
     tripId: trip._id,
-    isDeleted: false,
-    $or: [
-      { isEstimated: true },
-      { approvalStatus: { $in: ['PENDING_APPROVAL', 'PENDING_CONFIRMATION'] } },
-    ],
+    work: async (session) => {
+      txState.closedTrip = undefined;
+      txState.writtenUpdatedAt = undefined;
+      txState.loggedActivity = false;
+      txState.previousCloseState = undefined;
+
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
+      const liveTrip = await TripModel.findById(trip._id).session(session);
+      if (!liveTrip) {
+        throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
+      }
+
+      // Check if there are any unapproved or estimated pending expenses
+      const pendingExpensesCount = await ExpenseModel.countDocuments({
+        tripId: trip._id,
+        isDeleted: false,
+        $or: [
+          { isEstimated: true },
+          { approvalStatus: { $in: ['PENDING_APPROVAL', 'PENDING_CONFIRMATION'] } },
+        ],
+      }).session(session);
+
+      if (pendingExpensesCount > 0 && !forceClose) {
+        throw new AppError(
+          `There are ${pendingExpensesCount} pending or estimated expenses that require confirmation or approval before closing the trip.`,
+          400,
+          'PENDING_EXPENSES_EXIST',
+          { pendingExpensesCount }
+        );
+      }
+
+      const unverifiedChecklist = liveTrip.checklist.filter(
+        (c) => !c.checked && !c.notApplicable
+      );
+      if (unverifiedChecklist.length > 0 && !forceClose) {
+        throw new AppError(
+          `Please review the Forgotten Expense Protection checklist (${unverifiedChecklist.length} categories remaining) before closing the trip.`,
+          400,
+          'CHECKLIST_INCOMPLETE',
+          { unverifiedCategories: unverifiedChecklist.map((c) => c.label) }
+        );
+      }
+
+      txState.previousCloseState = {
+        status: liveTrip.status,
+        closedAt: liveTrip.closedAt ?? null,
+        inviteEnabled: liveTrip.inviteEnabled,
+      };
+
+      liveTrip.status = 'CLOSED';
+      liveTrip.closedAt = new Date();
+      liveTrip.inviteEnabled = false;
+      await liveTrip.save(session ? { session } : undefined);
+      txState.writtenUpdatedAt = liveTrip.updatedAt;
+      txState.closedTrip = liveTrip;
+
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: req.user?.userId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'TRIP_CLOSED',
+        entityType: 'TRIP',
+        entityId: liveTrip._id,
+        summary: `${freshActor.name} finalized and closed the trip "${liveTrip.name}".`,
+        session,
+      });
+      txState.loggedActivity = true;
+    },
+    rollback: async () => {
+      if (txState.loggedActivity) {
+        await ActivityLogModel.deleteOne({ _id: activityLogId });
+      }
+      if (txState.closedTrip && txState.previousCloseState) {
+        await TripModel.updateOne(
+          {
+            _id: trip._id,
+            ...(txState.writtenUpdatedAt ? { updatedAt: txState.writtenUpdatedAt } : {}),
+          },
+          { $set: txState.previousCloseState }
+        );
+      }
+    },
   });
 
-  if (pendingExpensesCount > 0 && !forceClose) {
-    throw new AppError(
-      `There are ${pendingExpensesCount} pending or estimated expenses that require confirmation or approval before closing the trip.`,
-      400,
-      'PENDING_EXPENSES_EXIST',
-      { pendingExpensesCount }
-    );
+  if (!txState.closedTrip) {
+    throw new AppError('Failed to close trip.', 500, 'INTERNAL_SERVER_ERROR');
   }
 
-  const unverifiedChecklist = trip.checklist.filter(
-    (c) => !c.checked && !c.notApplicable
-  );
-  if (unverifiedChecklist.length > 0 && !forceClose) {
-    throw new AppError(
-      `Please review the Forgotten Expense Protection checklist (${unverifiedChecklist.length} categories remaining) before closing the trip.`,
-      400,
-      'CHECKLIST_INCOMPLETE',
-      { unverifiedCategories: unverifiedChecklist.map((c) => c.label) }
-    );
-  }
-
-  trip.status = 'CLOSED';
-  trip.closedAt = new Date();
-  trip.inviteEnabled = false;
-  await trip.save();
-
-  await logTripActivity({
-    tripId: trip._id,
-    actorUserId: req.user?.userId,
-    actorParticipantId: actor._id,
-    actorName: actor.name,
-    actionType: 'TRIP_CLOSED',
-    entityType: 'TRIP',
-    entityId: trip._id,
-    summary: `${actor.name} finalized and closed the trip "${trip.name}".`,
-  });
-
-  sendSuccess(res, { trip: formatTripDoc(trip, { includeInviteCode: true }) });
+  sendSuccess(res, { trip: formatTripDoc(txState.closedTrip, { includeInviteCode: true }) });
 });
 
 export function formatParticipantDoc(participant: IParticipant) {

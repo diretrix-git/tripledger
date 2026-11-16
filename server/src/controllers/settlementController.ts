@@ -17,7 +17,6 @@ import {
   type ISettlement,
   type ITrip,
 } from '../models/index.js';
-import { runAtomically } from '../services/atomicWrite.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
 import { runSerializedTripOrganizerMutation } from '../services/organizerInvariant.js';
 import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
@@ -42,7 +41,21 @@ async function resolveValidatedSettlementFamilyId(params: {
   }
 
   if (!trimmed) {
-    return params.participant.familyId ?? null;
+    if (!params.participant.familyId) {
+      return null;
+    }
+    const implicitFamily = await FamilyModel.findOne({
+      _id: params.participant.familyId,
+      tripId: params.tripId,
+    }).session(params.session ?? null);
+    if (!implicitFamily) {
+      throw new AppError(
+        'Participant family group no longer exists in this trip.',
+        404,
+        'FAMILY_NOT_FOUND'
+      );
+    }
+    return implicitFamily._id;
   }
   if (!mongoose.Types.ObjectId.isValid(trimmed)) {
     throw new AppError('Invalid family identifier format.', 400, 'INVALID_ID');
@@ -146,23 +159,12 @@ export const listSettlements = asyncHandler(async (req: Request, res: Response) 
 export const createSettlement = asyncHandler(async (req: Request, res: Response) => {
   const trip = req.trip!;
   const actor = req.participant!;
+  const authUserId = req.user?.userId;
+  if (!authUserId) {
+    throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
+  }
+
   const parsed = createSettlementSchema.parse(req.body);
-
-  if (trip.status === 'CLOSED') {
-    throw new AppError(
-      'Cannot record settlements on a closed trip.',
-      403,
-      'TRIP_CLOSED'
-    );
-  }
-
-  if (parsed.settlementMode === 'FAMILY' && trip.mode !== 'FAMILY') {
-    throw new AppError(
-      'Family settlements are only supported on Family Mode trips.',
-      400,
-      'INVALID_SETTLEMENT_MODE'
-    );
-  }
 
   if (
     !mongoose.Types.ObjectId.isValid(parsed.fromParticipantId) ||
@@ -192,21 +194,16 @@ export const createSettlement = asyncHandler(async (req: Request, res: Response)
   let createdSettlement = false;
   let loggedActivity = false;
 
-  await runAtomically(
-    async (session) => {
+  await runSerializedTripOrganizerMutation({
+    tripId: trip._id,
+    work: async (session) => {
       createdSettlement = false;
       loggedActivity = false;
       const opts = session ? { session } : {};
 
-      const liveTrip = await TripModel.findById(trip._id).session(session);
-      if (!liveTrip) {
-        throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
-      }
-      if (liveTrip.status === 'CLOSED') {
-        throw new AppError('Cannot record settlements on a closed trip.', 403, 'TRIP_CLOSED');
-      }
-
-      const [sender, receiver] = await Promise.all([
+      const [liveTrip, liveActor, sender, receiver] = await Promise.all([
+        TripModel.findById(trip._id).session(session),
+        ParticipantModel.findOne({ _id: actor._id, tripId: trip._id }).session(session),
         ParticipantModel.findOne({ _id: parsed.fromParticipantId, tripId: trip._id }).session(
           session
         ),
@@ -214,6 +211,28 @@ export const createSettlement = asyncHandler(async (req: Request, res: Response)
           session
         ),
       ]);
+
+      if (!liveTrip) {
+        throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
+      }
+      if (
+        !liveActor ||
+        !liveActor.isActive ||
+        !(liveActor.userId instanceof mongoose.Types.ObjectId) ||
+        liveActor.userId.toString() !== authUserId
+      ) {
+        throw new AppError('You do not have access to this trip.', 403, 'FORBIDDEN_TRIP_ACCESS');
+      }
+      if (liveTrip.status === 'CLOSED') {
+        throw new AppError('Cannot record settlements on a closed trip.', 403, 'TRIP_CLOSED');
+      }
+      if (parsed.settlementMode === 'FAMILY' && liveTrip.mode !== 'FAMILY') {
+        throw new AppError(
+          'Family settlements are only supported on Family Mode trips.',
+          400,
+          'INVALID_SETTLEMENT_MODE'
+        );
+      }
 
       if (!sender || !receiver) {
         throw new AppError(
@@ -230,12 +249,12 @@ export const createSettlement = asyncHandler(async (req: Request, res: Response)
         );
       }
 
-      // Determine initial status:
-      // If recorded by Organizer or by the Receiver themselves, they can mark it CONFIRMED directly.
-      // Otherwise (e.g. reported by debtor), it is recorded as REPORTED until confirmed.
+      // Determine initial status using LIVE acting participant role/identity (never stale middleware req.participant):
+      // If recorded by active Organizer or by the Receiver themselves, they can mark it CONFIRMED directly.
+      // Otherwise (e.g. reported by debtor or FAMILY_REP), it is normalized to REPORTED until confirmed.
       let status: SettlementStatus = parsed.status ?? 'REPORTED';
       const canConfirmDirectly =
-        actor.role === 'ORGANIZER' || actor._id.equals(receiver._id);
+        liveActor.role === 'ORGANIZER' || liveActor._id.equals(receiver._id);
 
       if (status === 'CONFIRMED' && !canConfirmDirectly) {
         status = 'REPORTED';
@@ -274,8 +293,8 @@ export const createSettlement = asyncHandler(async (req: Request, res: Response)
             status,
             referenceNote: parsed.referenceNote,
             settledAt: parsed.settledAt ? new Date(parsed.settledAt) : now,
-            reportedByParticipantId: actor._id,
-            confirmedByParticipantId: status === 'CONFIRMED' ? actor._id : null,
+            reportedByParticipantId: liveActor._id,
+            confirmedByParticipantId: status === 'CONFIRMED' ? liveActor._id : null,
             confirmedAt: status === 'CONFIRMED' ? now : null,
             isDeleted: false,
           },
@@ -287,26 +306,26 @@ export const createSettlement = asyncHandler(async (req: Request, res: Response)
       await logTripActivity({
         _id: activityLogId,
         tripId: trip._id,
-        actorUserId: req.user?.userId,
-        actorParticipantId: actor._id,
-        actorName: actor.name,
+        actorUserId: authUserId,
+        actorParticipantId: liveActor._id,
+        actorName: liveActor.name,
         actionType: status === 'CONFIRMED' ? 'SETTLEMENT_CONFIRMED' : 'SETTLEMENT_REPORTED',
         entityType: 'SETTLEMENT',
         entityId: settlement._id,
-        summary: `${actor.name} ${status === 'CONFIRMED' ? 'recorded & confirmed' : 'reported'} settlement of ${formatPaisaToNPR(settlement.amountPaisa)} from ${sender.name} to ${receiver.name}.`,
+        summary: `${liveActor.name} ${status === 'CONFIRMED' ? 'recorded & confirmed' : 'reported'} settlement of ${formatPaisaToNPR(settlement.amountPaisa)} from ${sender.name} to ${receiver.name}.`,
         session,
       });
       loggedActivity = true;
     },
-    async () => {
+    rollback: async () => {
       if (loggedActivity) {
         await ActivityLogModel.deleteOne({ _id: activityLogId });
       }
       if (createdSettlement) {
         await SettlementModel.deleteOne({ _id: settlementId });
       }
-    }
-  );
+    },
+  });
 
   const updatedLedgerData = await loadTripLedgerData(trip._id);
   const createdRecord = updatedLedgerData.settlements.find(
@@ -329,6 +348,11 @@ export const updateSettlementStatus = asyncHandler(
   async (req: Request, res: Response) => {
     const trip = req.trip!;
     const actor = req.participant!;
+    const authUserId = req.user?.userId;
+    if (!authUserId) {
+      throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
+    }
+
     const { settlementId } = req.params;
     const parsed = updateSettlementStatusSchema.parse(req.body);
 
@@ -339,6 +363,7 @@ export const updateSettlementStatus = asyncHandler(
     const activityLogId = new mongoose.Types.ObjectId();
     const txState: {
       settlementId?: mongoose.Types.ObjectId;
+      writtenUpdatedAt?: Date;
       previousStatus?: SettlementStatus;
       previousReferenceNote?: string;
       previousConfirmedBy?: mongoose.Types.ObjectId | null;
@@ -356,6 +381,7 @@ export const updateSettlementStatus = asyncHandler(
         txState.modifiedSettlement = false;
         txState.loggedActivity = false;
         txState.settlementId = undefined;
+        txState.writtenUpdatedAt = undefined;
 
         const [liveTrip, liveActor, settlement] = await Promise.all([
           TripModel.findById(trip._id).session(session),
@@ -370,7 +396,12 @@ export const updateSettlementStatus = asyncHandler(
         if (!liveTrip) {
           throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
         }
-        if (!liveActor || !liveActor.isActive) {
+        if (
+          !liveActor ||
+          !liveActor.isActive ||
+          !(liveActor.userId instanceof mongoose.Types.ObjectId) ||
+          liveActor.userId.toString() !== authUserId
+        ) {
           throw new AppError('You do not have access to this trip.', 403, 'FORBIDDEN_TRIP_ACCESS');
         }
         if (!settlement) {
@@ -452,6 +483,7 @@ export const updateSettlementStatus = asyncHandler(
             'INVALID_SETTLEMENT_TRANSITION'
           );
         }
+        txState.writtenUpdatedAt = updatedSettlement.updatedAt;
         txState.modifiedSettlement = true;
 
         await logTripActivity({
@@ -486,7 +518,10 @@ export const updateSettlementStatus = asyncHandler(
             restoreUnset.referenceNote = 1;
           }
           await SettlementModel.updateOne(
-            { _id: txState.settlementId },
+            {
+              _id: txState.settlementId,
+              ...(txState.writtenUpdatedAt ? { updatedAt: txState.writtenUpdatedAt } : {}),
+            },
             Object.keys(restoreUnset).length > 0
               ? { $set: restoreSet, $unset: restoreUnset }
               : { $set: restoreSet }
