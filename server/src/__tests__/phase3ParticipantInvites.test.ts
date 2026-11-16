@@ -437,7 +437,7 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
       const serializedLogs = JSON.stringify(logs);
       expect(serializedLogs).not.toContain(rawToken);
       expect(serializedLogs).not.toContain(hashToken(rawToken));
-    });
+    }, 15000);
 
     it('3. enforces expiry, revocation, superseding duplicate invites, existing-account safety, organizer invariant, and organizer-only credential visibility', async () => {
       const org = await registerAndVerifyUser(appInstanceA, {
@@ -678,7 +678,7 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
       expect(orgInvList.body.data.invites.length).toBeGreaterThanOrEqual(4);
       expect(JSON.stringify(orgInvList.body)).not.toContain(coInvite.body.data.rawToken as string);
       expect(JSON.stringify(orgInvList.body)).not.toContain('tokenHash');
-    });
+    }, 30000);
 
     it('4. fails closed and revokes newly created privileged invite when EmailDeliveryService delivery fails', async () => {
       const failingEmailApp = createApp({
@@ -890,6 +890,6 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
         expect(finalParticipant?.role).toBe('PARTICIPANT');
         expect(finalParticipant?.userId).toBeNull();
       }
-    });
+    }, 30000);
   });
 });

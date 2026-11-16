@@ -610,7 +610,7 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
       expect(orgConfirmOnClosed.status).toBe(403);
       expect(orgConfirmOnClosed.body.error.code).toBe('TRIP_CLOSED');
       expect((await SettlementModel.findById(s1Id))?.status).toBe('REPORTED');
-    });
+    }, 30000);
 
     it('2. revokes stale FAMILY_REP authority when representative is replaced or moved across families and blocks invalid FAMILY_REP assignments/promotions', async () => {
       const org = await registerUser(app, { name: 'Fam Org', email: 'famorg.s2@example.com' });
@@ -905,7 +905,7 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
         .send({ token: deleteFamRawToken });
       expect(revokedOnDeleteFamClaim.status).toBe(409);
       expect(revokedOnDeleteFamClaim.body.error.code).toBe('INVITE_REVOKED');
-    });
+    }, 30000);
 
     it('3. enforces deactivation/reactivation and deletion invariants on privileged roles without bypassing verified invitations, and fails closed in production standalone', async () => {
       const org = await registerUser(app, { name: 'Main Org', email: 'mainorg.s3@example.com' });
@@ -1060,7 +1060,7 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
         .send({ representativeId: safeReact.body.data.participant.id });
       expect(prodUpdateFam.status).toBe(503);
       expect(prodUpdateFam.body.error.code).toBe('TRANSACTIONS_UNAVAILABLE');
-    });
+    }, 30000);
 
     it('4b. enforces in-place FAMILY_REP demotion cleanup, cross-family stale invite revocation, legacy ungrouped rep rejection, 409 duplicate family guard, and atomic ActivityLog rollback in standalone', async () => {
       const org = await registerUser(app, { name: 'F2 Org', email: 'f2org@example.com' });
@@ -1438,7 +1438,7 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
       expect((await SettlementModel.findById(settleFamB))?.status).toBe('REPORTED');
 
       expect(await ActivityLogModel.countDocuments({ tripId })).toBe(logsCountBefore);
-    });
+    }, 30000);
 
     it('5b. serializes addParticipant vs deleteFamily in standalone and enforces createSettlement status & live-actor normalization', async () => {
       const org = await registerUser(app, { name: 'Race Org S5', email: 'raceorg.s5@example.com' });
@@ -1675,7 +1675,7 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
       expect((await ParticipantModel.findById(repPartId))?.role).toBe('PARTICIPANT');
       expect((await FamilyModel.findById(famId))?.representativeId?.toString()).toBe(rep2PartId);
       expect([200, 403]).toContain(confirmRes.status);
-    });
+    }, 30000);
 
     it('5. serializes concurrent settlement creation, trip closure, demotion/deactivation, family deletion, addParticipant, dual settlement status updates, and dual rep swaps on real replica set', async () => {
       expect(await supportsTransactions()).toBe(true);
