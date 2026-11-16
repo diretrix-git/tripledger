@@ -1,14 +1,23 @@
 import type { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import {
+  EMAIL_VERIFICATION_TTL_MINUTES,
   loginUserSchema,
   registerUserSchema,
   updateProfileSchema,
+  verifyEmailSchema,
+  type AuthUserEntity,
 } from '@tripledger/shared';
 import { env } from '../config/env.js';
-import { ParticipantModel, UserModel } from '../models/index.js';
-import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
+import { ParticipantModel, UserModel, type IUser } from '../models/index.js';
 import {
+  defaultEmailDeliveryService,
+  type EmailDeliveryService,
+} from '../services/emailService.js';
+import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
+import { isDuplicateKeyError } from '../utils/mongoErrors.js';
+import {
+  generateEmailVerificationToken,
   hashToken,
   signAccessToken,
   signRefreshToken,
@@ -16,6 +25,8 @@ import {
 } from '../utils/tokens.js';
 
 const REFRESH_COOKIE_NAME = 'tripledger_refresh_token';
+const DUMMY_BCRYPT_HASH =
+  '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
 
 function setRefreshCookie(res: Response, refreshToken: string): void {
   res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
@@ -27,210 +38,371 @@ function setRefreshCookie(res: Response, refreshToken: string): void {
   });
 }
 
-export const register = asyncHandler(async (req: Request, res: Response) => {
-  const parsed = registerUserSchema.parse(req.body);
-
-  const existing = await UserModel.findOne({ email: parsed.email });
-  if (existing) {
-    throw new AppError('An account with this email already exists.', 409, 'EMAIL_EXISTS');
-  }
-
-  const passwordHash = await bcrypt.hash(parsed.password, env.BCRYPT_SALT_ROUNDS);
-  const user = await UserModel.create({
-    name: parsed.name,
-    email: parsed.email,
-    passwordHash,
-    phone: parsed.phone,
-    defaultCurrency: 'NPR',
-  });
-
-  // Automatically link any existing guest participant records that share this email
-  await ParticipantModel.updateMany(
-    { email: parsed.email, userId: null },
-    { $set: { userId: user._id } }
-  );
-
-  const accessToken = signAccessToken({
-    userId: user._id.toString(),
-    email: user.email,
+export function formatAuthUser(user: IUser): AuthUserEntity {
+  return {
+    id: user._id.toString(),
     name: user.name,
+    email: user.email,
+    emailVerified: Boolean(user.emailVerified),
+    emailVerifiedAt: user.emailVerifiedAt ? user.emailVerifiedAt.toISOString() : null,
+    phone: user.phone,
+    defaultCurrency: user.defaultCurrency,
+  };
+}
+
+export function createAuthHandlers(
+  emailDelivery: EmailDeliveryService = defaultEmailDeliveryService
+) {
+  const register = asyncHandler(async (req: Request, res: Response) => {
+    const parsed = registerUserSchema.parse(req.body);
+
+    const existing = await UserModel.findOne({ email: parsed.email });
+    if (existing) {
+      throw new AppError('An account with this email already exists.', 409, 'EMAIL_EXISTS');
+    }
+
+    const passwordHash = await bcrypt.hash(parsed.password, env.BCRYPT_SALT_ROUNDS);
+    const { rawToken, tokenHash, expiresAt } = generateEmailVerificationToken();
+
+    let user: IUser;
+    try {
+      user = await UserModel.create({
+        name: parsed.name,
+        email: parsed.email,
+        emailVerified: false,
+        emailVerifiedAt: null,
+        emailVerificationTokenHash: tokenHash,
+        emailVerificationExpiresAt: expiresAt,
+        passwordHash,
+        phone: parsed.phone,
+        defaultCurrency: 'NPR',
+      });
+    } catch (err) {
+      if (isDuplicateKeyError(err)) {
+        throw new AppError('An account with this email already exists.', 409, 'EMAIL_EXISTS');
+      }
+      throw err;
+    }
+
+    // Automatically link any existing guest participant records that share this email (removed in Commit 3)
+    await ParticipantModel.updateMany(
+      { email: parsed.email, userId: null },
+      { $set: { userId: user._id } }
+    );
+
+    // On delivery failure, preserve the created unverified user and its hashed, expiring token so
+    // the user can still log in and call resend-verification to recover once delivery recovers.
+    await emailDelivery.sendVerificationEmail({
+      to: user.email,
+      recipientName: user.name,
+      rawToken,
+      expiresInMinutes: EMAIL_VERIFICATION_TTL_MINUTES,
+    });
+
+    const accessToken = signAccessToken({
+      userId: user._id.toString(),
+      email: user.email,
+      name: user.name,
+    });
+    const refreshToken = signRefreshToken({ userId: user._id.toString() });
+
+    user.refreshTokenHash = hashToken(refreshToken);
+    await user.save();
+
+    setRefreshCookie(res, refreshToken);
+
+    sendSuccess(
+      res,
+      {
+        accessToken,
+        refreshToken,
+        user: formatAuthUser(user),
+      },
+      201
+    );
   });
-  const refreshToken = signRefreshToken({ userId: user._id.toString() });
 
-  user.refreshTokenHash = hashToken(refreshToken);
-  await user.save();
+  const login = asyncHandler(async (req: Request, res: Response) => {
+    const parsed = loginUserSchema.parse(req.body);
 
-  setRefreshCookie(res, refreshToken);
+    const user = await UserModel.findOne({ email: parsed.email }).select('+passwordHash');
+    if (!user) {
+      await bcrypt.compare(parsed.password, DUMMY_BCRYPT_HASH);
+      throw new AppError('Invalid email or password.', 401, 'INVALID_CREDENTIALS');
+    }
 
-  sendSuccess(
-    res,
-    {
+    const isValid = await bcrypt.compare(parsed.password, user.passwordHash);
+    if (!isValid) {
+      throw new AppError('Invalid email or password.', 401, 'INVALID_CREDENTIALS');
+    }
+
+    // Link any unlinked guest participant records with matching email (removed in Commit 3)
+    await ParticipantModel.updateMany(
+      { email: user.email, userId: null },
+      { $set: { userId: user._id } }
+    );
+
+    const accessToken = signAccessToken({
+      userId: user._id.toString(),
+      email: user.email,
+      name: user.name,
+    });
+    const refreshToken = signRefreshToken({ userId: user._id.toString() });
+
+    user.refreshTokenHash = hashToken(refreshToken);
+    await user.save();
+
+    setRefreshCookie(res, refreshToken);
+
+    sendSuccess(res, {
       accessToken,
       refreshToken,
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        defaultCurrency: user.defaultCurrency,
-      },
-    },
-    201
-  );
-});
-
-export const login = asyncHandler(async (req: Request, res: Response) => {
-  const parsed = loginUserSchema.parse(req.body);
-
-  const user = await UserModel.findOne({ email: parsed.email }).select('+passwordHash');
-  if (!user) {
-    throw new AppError('Invalid email or password.', 401, 'INVALID_CREDENTIALS');
-  }
-
-  const isValid = await bcrypt.compare(parsed.password, user.passwordHash);
-  if (!isValid) {
-    throw new AppError('Invalid email or password.', 401, 'INVALID_CREDENTIALS');
-  }
-
-  // Link any unlinked guest participant records with matching email
-  await ParticipantModel.updateMany(
-    { email: user.email, userId: null },
-    { $set: { userId: user._id } }
-  );
-
-  const accessToken = signAccessToken({
-    userId: user._id.toString(),
-    email: user.email,
-    name: user.name,
-  });
-  const refreshToken = signRefreshToken({ userId: user._id.toString() });
-
-  user.refreshTokenHash = hashToken(refreshToken);
-  await user.save();
-
-  setRefreshCookie(res, refreshToken);
-
-  sendSuccess(res, {
-    accessToken,
-    refreshToken,
-    user: {
-      id: user._id.toString(),
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      defaultCurrency: user.defaultCurrency,
-    },
-  });
-});
-
-export const refresh = asyncHandler(async (req: Request, res: Response) => {
-  const rawToken =
-    (req.cookies?.[REFRESH_COOKIE_NAME] as string | undefined) ??
-    (req.body?.refreshToken as string | undefined);
-
-  if (!rawToken) {
-    throw new AppError('Refresh token missing.', 401, 'REFRESH_TOKEN_MISSING');
-  }
-
-  let payload: { userId: string };
-  try {
-    payload = verifyRefreshToken(rawToken);
-  } catch {
-    throw new AppError('Invalid or expired refresh token.', 401, 'INVALID_REFRESH_TOKEN');
-  }
-
-  const user = await UserModel.findById(payload.userId).select('+refreshTokenHash');
-  if (!user || !user.refreshTokenHash || user.refreshTokenHash !== hashToken(rawToken)) {
-    throw new AppError('Refresh token has been revoked.', 401, 'REVOKED_REFRESH_TOKEN');
-  }
-
-  const newAccessToken = signAccessToken({
-    userId: user._id.toString(),
-    email: user.email,
-    name: user.name,
-  });
-  const newRefreshToken = signRefreshToken({ userId: user._id.toString() });
-
-  user.refreshTokenHash = hashToken(newRefreshToken);
-  await user.save();
-
-  setRefreshCookie(res, newRefreshToken);
-
-  sendSuccess(res, {
-    accessToken: newAccessToken,
-    refreshToken: newRefreshToken,
-    user: {
-      id: user._id.toString(),
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      defaultCurrency: user.defaultCurrency,
-    },
-  });
-});
-
-export const logout = asyncHandler(async (req: Request, res: Response) => {
-  if (req.user) {
-    await UserModel.findByIdAndUpdate(req.user.userId, {
-      $set: { refreshTokenHash: null },
+      user: formatAuthUser(user),
     });
-  }
-  res.clearCookie(REFRESH_COOKIE_NAME, { path: '/api/v1/auth' });
-  sendSuccess(res, { loggedOut: true });
-});
-
-export const getMe = asyncHandler(async (req: Request, res: Response) => {
-  if (!req.user) {
-    throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
-  }
-
-  const user = await UserModel.findById(req.user.userId);
-  if (!user) {
-    throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
-  }
-
-  sendSuccess(res, {
-    user: {
-      id: user._id.toString(),
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      defaultCurrency: user.defaultCurrency,
-      createdAt: user.createdAt,
-    },
   });
-});
 
-export const updateMe = asyncHandler(async (req: Request, res: Response) => {
-  if (!req.user) {
-    throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
-  }
+  const verifyEmail = asyncHandler(async (req: Request, res: Response) => {
+    const parsed = verifyEmailSchema.parse(req.body);
+    const tokenHash = hashToken(parsed.token);
+    const now = new Date();
 
-  const parsed = updateProfileSchema.parse(req.body);
-  const user = await UserModel.findById(req.user.userId);
-  if (!user) {
-    throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
-  }
-
-  if (parsed.name !== undefined) user.name = parsed.name;
-  if (parsed.phone !== undefined) user.phone = parsed.phone;
-  await user.save();
-
-  // Keep linked participant names synchronized
-  if (parsed.name !== undefined) {
-    await ParticipantModel.updateMany(
-      { userId: user._id },
-      { $set: { name: parsed.name } }
+    const verifiedUser = await UserModel.findOneAndUpdate(
+      {
+        emailVerificationTokenHash: tokenHash,
+        emailVerificationExpiresAt: { $gt: now },
+      },
+      {
+        $set: {
+          emailVerified: true,
+          emailVerifiedAt: now,
+          emailVerificationTokenHash: null,
+          emailVerificationExpiresAt: null,
+        },
+      },
+      { new: true }
     );
-  }
 
-  sendSuccess(res, {
-    user: {
-      id: user._id.toString(),
-      name: user.name,
-      email: user.email,
-      phone: user.phone,
-      defaultCurrency: user.defaultCurrency,
-    },
+    if (!verifiedUser) {
+      throw new AppError(
+        'Verification token is invalid or has expired.',
+        400,
+        'INVALID_OR_EXPIRED_VERIFICATION_TOKEN'
+      );
+    }
+
+    sendSuccess(res, {
+      verified: true,
+      emailVerified: true,
+      emailVerifiedAt: verifiedUser.emailVerifiedAt
+        ? verifiedUser.emailVerifiedAt.toISOString()
+        : now.toISOString(),
+    });
   });
-});
+
+  const resendVerification = asyncHandler(async (req: Request, res: Response) => {
+    if (!req.user) {
+      throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
+    }
+
+    const user = await UserModel.findById(req.user.userId).select(
+      '+emailVerificationTokenHash +emailVerificationExpiresAt'
+    );
+    if (!user) {
+      throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
+    }
+
+    if (user.emailVerified === true) {
+      sendSuccess(res, {
+        sent: false,
+        alreadyVerified: true,
+        emailVerified: true,
+      });
+      return;
+    }
+
+    const prevHash = user.emailVerificationTokenHash ?? null;
+    const prevExpiresAt = user.emailVerificationExpiresAt ?? null;
+    const { rawToken, tokenHash, expiresAt } = generateEmailVerificationToken();
+
+    const swapped = await UserModel.findOneAndUpdate(
+      {
+        _id: user._id,
+        emailVerified: false,
+        emailVerificationTokenHash: prevHash,
+      },
+      {
+        $set: {
+          emailVerificationTokenHash: tokenHash,
+          emailVerificationExpiresAt: expiresAt,
+        },
+      },
+      { new: true }
+    );
+
+    if (!swapped) {
+      const latest = await UserModel.findById(user._id);
+      if (latest?.emailVerified === true) {
+        sendSuccess(res, {
+          sent: false,
+          alreadyVerified: true,
+          emailVerified: true,
+        });
+        return;
+      }
+      throw new AppError(
+        'Verification request conflicted with a concurrent update. Please try again.',
+        409,
+        'VERIFICATION_STATE_CONFLICT'
+      );
+    }
+
+    try {
+      await emailDelivery.sendVerificationEmail({
+        to: user.email,
+        recipientName: user.name,
+        rawToken,
+        expiresInMinutes: EMAIL_VERIFICATION_TTL_MINUTES,
+      });
+    } catch (err) {
+      await UserModel.updateOne(
+        {
+          _id: user._id,
+          emailVerified: false,
+          emailVerificationTokenHash: tokenHash,
+        },
+        {
+          $set: {
+            emailVerificationTokenHash: prevHash,
+            emailVerificationExpiresAt: prevExpiresAt,
+          },
+        }
+      );
+      throw err;
+    }
+
+    sendSuccess(res, {
+      sent: true,
+      alreadyVerified: false,
+      emailVerified: false,
+    });
+  });
+
+  const refresh = asyncHandler(async (req: Request, res: Response) => {
+    const rawToken =
+      (req.cookies?.[REFRESH_COOKIE_NAME] as string | undefined) ??
+      (req.body?.refreshToken as string | undefined);
+
+    if (!rawToken) {
+      throw new AppError('Refresh token missing.', 401, 'REFRESH_TOKEN_MISSING');
+    }
+
+    let payload: { userId: string };
+    try {
+      payload = verifyRefreshToken(rawToken);
+    } catch {
+      throw new AppError('Invalid or expired refresh token.', 401, 'INVALID_REFRESH_TOKEN');
+    }
+
+    const user = await UserModel.findById(payload.userId).select('+refreshTokenHash');
+    if (!user || !user.refreshTokenHash || user.refreshTokenHash !== hashToken(rawToken)) {
+      throw new AppError('Refresh token has been revoked.', 401, 'REVOKED_REFRESH_TOKEN');
+    }
+
+    const newAccessToken = signAccessToken({
+      userId: user._id.toString(),
+      email: user.email,
+      name: user.name,
+    });
+    const newRefreshToken = signRefreshToken({ userId: user._id.toString() });
+
+    user.refreshTokenHash = hashToken(newRefreshToken);
+    await user.save();
+
+    setRefreshCookie(res, newRefreshToken);
+
+    sendSuccess(res, {
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
+      user: formatAuthUser(user),
+    });
+  });
+
+  const logout = asyncHandler(async (req: Request, res: Response) => {
+    if (req.user) {
+      await UserModel.findByIdAndUpdate(req.user.userId, {
+        $set: { refreshTokenHash: null },
+      });
+    }
+    res.clearCookie(REFRESH_COOKIE_NAME, { path: '/api/v1/auth' });
+    sendSuccess(res, { loggedOut: true });
+  });
+
+  const getMe = asyncHandler(async (req: Request, res: Response) => {
+    if (!req.user) {
+      throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
+    }
+
+    const user = await UserModel.findById(req.user.userId);
+    if (!user) {
+      throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
+    }
+
+    sendSuccess(res, {
+      user: {
+        ...formatAuthUser(user),
+        createdAt: user.createdAt,
+      },
+    });
+  });
+
+  const updateMe = asyncHandler(async (req: Request, res: Response) => {
+    if (!req.user) {
+      throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
+    }
+
+    const parsed = updateProfileSchema.parse(req.body);
+    const user = await UserModel.findById(req.user.userId);
+    if (!user) {
+      throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
+    }
+
+    if (parsed.name !== undefined) user.name = parsed.name;
+    if (parsed.phone !== undefined) user.phone = parsed.phone;
+    await user.save();
+
+    // Keep linked participant names synchronized
+    if (parsed.name !== undefined) {
+      await ParticipantModel.updateMany(
+        { userId: user._id },
+        { $set: { name: parsed.name } }
+      );
+    }
+
+    sendSuccess(res, {
+      user: formatAuthUser(user),
+    });
+  });
+
+  return {
+    register,
+    login,
+    verifyEmail,
+    resendVerification,
+    refresh,
+    logout,
+    getMe,
+    updateMe,
+  };
+}
+
+const defaultHandlers = createAuthHandlers();
+export const {
+  register,
+  login,
+  verifyEmail,
+  resendVerification,
+  refresh,
+  logout,
+  getMe,
+  updateMe,
+} = defaultHandlers;

@@ -8,3 +8,4 @@ export * from './ExpensePayment.js';
 export * from './ExpenseShare.js';
 export * from './Settlement.js';
 export * from './ActivityLog.js';
+export * from './RateLimitBucket.js';

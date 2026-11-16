@@ -1,6 +1,12 @@
 import type { NextFunction, Request, Response } from 'express';
 import type { TripRole } from '@tripledger/shared';
-import { ParticipantModel, TripModel, type IParticipant, type ITrip } from '../models/index.js';
+import {
+  ParticipantModel,
+  TripModel,
+  UserModel,
+  type IParticipant,
+  type ITrip,
+} from '../models/index.js';
 import { AppError } from '../utils/http.js';
 import { verifyAccessToken, type AccessTokenPayload } from '../utils/tokens.js';
 
@@ -8,6 +14,7 @@ declare global {
   namespace Express {
     interface Request {
       user?: AccessTokenPayload;
+      verifiedUser?: { userId: string; email: string; emailVerified: true };
       trip?: ITrip;
       participant?: IParticipant;
     }
@@ -28,6 +35,43 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction): v
     next();
   } catch {
     next(new AppError('Invalid or expired access token.', 401, 'TOKEN_EXPIRED'));
+  }
+}
+
+/**
+ * Verifies against the live database record that the authenticated user exists and has a verified
+ * email address. Never trusts any email-verification claim embedded in a stateless JWT.
+ */
+export async function requireVerifiedEmail(
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): Promise<void> {
+  try {
+    if (!req.user) {
+      throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
+    }
+
+    const user = await UserModel.findById(req.user.userId).select('email emailVerified');
+    if (!user) {
+      throw new AppError('User account not found.', 401, 'UNAUTHORIZED');
+    }
+    if (user.emailVerified !== true) {
+      throw new AppError(
+        'Please verify your email address before performing this action.',
+        403,
+        'EMAIL_NOT_VERIFIED'
+      );
+    }
+
+    req.verifiedUser = {
+      userId: user._id.toString(),
+      email: user.email,
+      emailVerified: true,
+    };
+    next();
+  } catch (err) {
+    next(err);
   }
 }
 

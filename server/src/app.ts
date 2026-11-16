@@ -2,17 +2,40 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
-import rateLimit from 'express-rate-limit';
-import { env } from './config/env.js';
+import { env, parseTrustProxySetting, type RateLimitStoreType } from './config/env.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { authRouter } from './routes/authRoutes.js';
+import { createAuthRouter } from './routes/authRoutes.js';
 import { publicSharedRouter } from './routes/settlementAndReportRoutes.js';
 import { dashboardRouter, tripRouter } from './routes/tripRoutes.js';
+import type { EmailDeliveryService } from './services/emailService.js';
+import {
+  createAuthRateLimiters,
+  createConfiguredRateLimiter,
+  resolveEffectiveRateLimitConfig,
+} from './services/rateLimitStore.js';
 import { sendSuccess } from './utils/http.js';
 
-export function createApp(): express.Application {
-  const app = express();
+export interface CreateAppOptions {
+  enableRateLimitInTest?: boolean;
+  rateLimitStoreOverride?: RateLimitStoreType;
+  apiRateLimitMaxOverride?: number;
+  authRateLimitMaxOverrides?: {
+    login?: number;
+    register?: number;
+    verifyEmail?: number;
+    resendVerification?: number;
+  };
+  emailDeliveryService?: EmailDeliveryService;
+}
 
+export function createApp(options: CreateAppOptions = {}): express.Application {
+  const app = express();
+  const effectiveRateLimit = resolveEffectiveRateLimitConfig(env, {
+    enableInTest: options.enableRateLimitInTest,
+    storeTypeOverride: options.rateLimitStoreOverride,
+  });
+
+  app.set('trust proxy', parseTrustProxySetting(env.TRUST_PROXY, env.NODE_ENV));
   app.use(helmet());
   app.use(
     cors({
@@ -23,18 +46,7 @@ export function createApp(): express.Application {
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
 
-  if (env.NODE_ENV !== 'test') {
-    app.use(
-      '/api',
-      rateLimit({
-        windowMs: env.RATE_LIMIT_WINDOW_MS,
-        max: env.RATE_LIMIT_MAX_REQUESTS,
-        standardHeaders: true,
-        legacyHeaders: false,
-      })
-    );
-  }
-
+  // Health probe remains independent of database-backed rate-limit storage.
   app.get('/api/v1/health', (_req, res) => {
     sendSuccess(res, {
       service: 'TripLedger API',
@@ -43,7 +55,29 @@ export function createApp(): express.Application {
     });
   });
 
-  app.use('/api/v1/auth', authRouter);
+  const apiLimiter = createConfiguredRateLimiter({
+    prefix: 'api-global:',
+    windowMs: env.RATE_LIMIT_WINDOW_MS,
+    limit: options.apiRateLimitMaxOverride ?? env.RATE_LIMIT_MAX_REQUESTS,
+    storeType: effectiveRateLimit.storeType,
+    enabled: effectiveRateLimit.enabled,
+  });
+  app.use('/api', apiLimiter);
+
+  const authRateLimiters = createAuthRateLimiters({
+    config: env,
+    enabled: effectiveRateLimit.enabled,
+    storeType: effectiveRateLimit.storeType,
+    maxOverrides: options.authRateLimitMaxOverrides,
+  });
+
+  app.use(
+    '/api/v1/auth',
+    createAuthRouter({
+      emailDeliveryService: options.emailDeliveryService,
+      rateLimiters: authRateLimiters,
+    })
+  );
   app.use('/api/v1/dashboard', dashboardRouter);
   app.use('/api/v1/trips', tripRouter);
   app.use('/api/v1/shared', publicSharedRouter);

@@ -12,6 +12,7 @@ import {
   createParticipantSchema,
   joinTripSchema,
   resolveParticipantInvitePolicy,
+  updateProfileSchema,
   updateTripSchema,
   verifyEmailSchema,
 } from '../index.js';
@@ -143,6 +144,15 @@ describe('Shared security contracts: invite roles, schemas, and policy', () => {
       'verify-token-12345678'
     );
     expect(() => verifyEmailSchema.parse({ token: 'tiny' })).toThrow();
+
+    // Profile updates forbid changing account email
+    expect(updateProfileSchema.parse({ name: 'New Name', phone: '9841000000' })).toEqual({
+      name: 'New Name',
+      phone: '9841000000',
+    });
+    expect(() =>
+      updateProfileSchema.parse({ name: 'New Name', email: 'other@example.com' })
+    ).toThrow();
 
     expect(joinTripSchema.parse({})).toEqual({});
     expect(() => joinTripSchema.parse({ guestParticipantId: '507f1f77bcf86cd799439011' })).toThrow();

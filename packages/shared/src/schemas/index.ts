@@ -33,10 +33,12 @@ export const loginUserSchema = z.object({
   password: z.string().min(1, 'Password is required'),
 });
 
-export const updateProfileSchema = z.object({
-  name: z.string().trim().min(2).max(80).optional(),
-  phone: z.string().trim().max(25).optional(),
-});
+export const updateProfileSchema = z
+  .object({
+    name: z.string().trim().min(2).max(80).optional(),
+    phone: z.string().trim().max(25).optional(),
+  })
+  .strict();
 
 export const createTripSchema = z.object({
   name: z.string().trim().min(2, 'Trip name is required').max(120),
