@@ -1,20 +1,27 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { CheckCircle2, MailCheck, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, MailCheck, XCircle } from 'lucide-react';
 import { apiRequest } from '../api/client.js';
 import { useAuthStore } from '../stores/authStore.js';
 
 export function VerifyEmailPage(): React.ReactElement {
-  const [searchParams] = useSearchParams();
-  const initialToken = searchParams.get('token')?.trim() ?? '';
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialTokenRef = useRef(searchParams.get('token')?.trim() ?? '');
+  const initialToken = initialTokenRef.current;
   const user = useAuthStore((s) => s.user);
   const updateUser = useAuthStore((s) => s.updateUser);
 
-  const [manualToken, setManualToken] = useState(initialToken);
+  const [manualToken, setManualToken] = useState('');
   const [status, setStatus] = useState<'idle' | 'submitting' | 'verified' | 'error'>(
     initialToken ? 'submitting' : 'idle'
   );
   const [message, setMessage] = useState<string | null>(null);
+  const [sessionMismatchNotice, setSessionMismatchNotice] = useState<string | null>(null);
+  const [resending, setResending] = useState(false);
+  const [resendNotice, setResendNotice] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
   const autoSubmittedRef = useRef(false);
 
   const submitVerification = async (tokenValue: string) => {
@@ -27,9 +34,11 @@ export function VerifyEmailPage(): React.ReactElement {
 
     setStatus('submitting');
     setMessage(null);
+    setSessionMismatchNotice(null);
     try {
       const res = await apiRequest<{
         verified: boolean;
+        userId: string;
         emailVerified: boolean;
         emailVerifiedAt: string;
       }>('/auth/verify-email', {
@@ -38,12 +47,16 @@ export function VerifyEmailPage(): React.ReactElement {
       });
 
       const currentUser = useAuthStore.getState().user;
-      if (currentUser) {
+      if (currentUser && res.userId && currentUser.id === res.userId) {
         updateUser({
           ...currentUser,
           emailVerified: res.emailVerified,
           emailVerifiedAt: res.emailVerifiedAt,
         });
+      } else if (currentUser && currentUser.id !== res.userId) {
+        setSessionMismatchNotice(
+          'This link verified a different TripLedger account. Your currently signed-in account was left unchanged.'
+        );
       }
       setStatus('verified');
       setMessage('Your email address has been verified.');
@@ -56,15 +69,61 @@ export function VerifyEmailPage(): React.ReactElement {
   };
 
   useEffect(() => {
+    if (searchParams.has('token')) {
+      const nextParams = new URLSearchParams(searchParams);
+      nextParams.delete('token');
+      setSearchParams(nextParams, { replace: true });
+    }
+    if (typeof window !== 'undefined' && window.location.search.includes('token=')) {
+      const cleanUrl = new URL(window.location.href);
+      cleanUrl.searchParams.delete('token');
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`
+      );
+    }
+
     if (initialToken && !autoSubmittedRef.current) {
       autoSubmittedRef.current = true;
       void submitVerification(initialToken);
     }
-  }, [initialToken]);
+  }, [initialToken, searchParams, setSearchParams]);
 
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     void submitVerification(manualToken);
+  };
+
+  const handleResendVerification = async () => {
+    setResending(true);
+    setResendNotice(null);
+    try {
+      const res = await apiRequest<{
+        sent: boolean;
+        alreadyVerified: boolean;
+        emailVerified: boolean;
+      }>('/auth/resend-verification', { method: 'POST' });
+
+      const currentUser = useAuthStore.getState().user;
+      if (res.alreadyVerified && currentUser) {
+        updateUser({ ...currentUser, emailVerified: true });
+        setStatus('verified');
+        setMessage('Your email address is already verified.');
+      } else {
+        setResendNotice({
+          type: 'success',
+          text: 'A new verification email has been sent. Check your inbox for the latest link.',
+        });
+      }
+    } catch (err) {
+      setResendNotice({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to send verification email.',
+      });
+    } finally {
+      setResending(false);
+    }
   };
 
   return (
@@ -96,6 +155,19 @@ export function VerifyEmailPage(): React.ReactElement {
           </div>
         )}
 
+        {sessionMismatchNotice && (
+          <div
+            role="status"
+            className="rounded-xl bg-amber-50 border border-amber-200 p-4 flex items-start gap-2.5 text-xs text-amber-900"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold">Signed-in session unchanged</p>
+              <p className="mt-0.5">{sessionMismatchNotice}</p>
+            </div>
+          </div>
+        )}
+
         {status === 'error' && message && (
           <div
             role="alert"
@@ -109,29 +181,54 @@ export function VerifyEmailPage(): React.ReactElement {
           </div>
         )}
 
-        {status !== 'verified' && !initialToken && (
-          <form onSubmit={handleManualSubmit} className="space-y-3">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Verification Token
-              </label>
-              <input
-                type="text"
-                required
-                value={manualToken}
-                onChange={(e) => setManualToken(e.target.value)}
-                placeholder="Paste your email verification token"
-                className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-mono"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={status === 'submitting'}
-              className="w-full rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-semibold py-2.5 px-4 text-xs"
-            >
-              Verify Email
-            </button>
-          </form>
+        {resendNotice && (
+          <div
+            role={resendNotice.type === 'error' ? 'alert' : 'status'}
+            className={`rounded-xl p-3 text-xs font-medium border ${
+              resendNotice.type === 'error'
+                ? 'bg-rose-50 border-rose-200 text-rose-800'
+                : 'bg-blue-50 border-blue-200 text-blue-800'
+            }`}
+          >
+            {resendNotice.text}
+          </div>
+        )}
+
+        {status !== 'verified' && status !== 'submitting' && (
+          <div className="space-y-3">
+            <form onSubmit={handleManualSubmit} className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Verification Token
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={manualToken}
+                  onChange={(e) => setManualToken(e.target.value)}
+                  placeholder="Paste your email verification token"
+                  className="w-full rounded-xl border border-slate-300 px-3.5 py-2 text-xs font-mono"
+                />
+              </div>
+              <button
+                type="submit"
+                className="w-full rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 px-4 text-xs"
+              >
+                Verify Email
+              </button>
+            </form>
+
+            {user && user.emailVerified === false && (
+              <button
+                type="button"
+                disabled={resending}
+                onClick={() => void handleResendVerification()}
+                className="w-full rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-semibold py-2.5 px-4 text-xs"
+              >
+                {resending ? 'Sending verification email...' : 'Resend Verification Email'}
+              </button>
+            )}
+          </div>
         )}
 
         <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">

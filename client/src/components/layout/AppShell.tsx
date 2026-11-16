@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import {
   Compass,
@@ -16,16 +16,42 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { formatPaisaToNPR } from '@tripledger/shared';
-import { useAuthStore } from '../../stores/authStore.js';
+import { useAuthStore, type AuthUser } from '../../stores/authStore.js';
 import { useOfflineSync } from '../../hooks/useOfflineSync.js';
 import { apiRequest } from '../../api/client.js';
 
 export function AppShell(): React.ReactElement {
   const user = useAuthStore((s) => s.user);
+  const accessToken = useAuthStore((s) => s.accessToken);
+  const updateUser = useAuthStore((s) => s.updateUser);
   const clearAuth = useAuthStore((s) => s.clearAuth);
   const navigate = useNavigate();
   const { isOnline, isSyncing, queue, flushOfflineQueue } = useOfflineSync();
   const [showQueueDrawer, setShowQueueDrawer] = useState(false);
+
+  useEffect(() => {
+    if (!accessToken) return;
+    let active = true;
+
+    const syncAuthProfile = () => {
+      void apiRequest<{ user: AuthUser }>('/auth/me')
+        .then((res) => {
+          if (active) {
+            updateUser(res.user);
+          }
+        })
+        .catch(() => {
+          // Keep cached state if offline; expired sessions are cleared in apiRequest.
+        });
+    };
+
+    syncAuthProfile();
+    window.addEventListener('focus', syncAuthProfile);
+    return () => {
+      active = false;
+      window.removeEventListener('focus', syncAuthProfile);
+    };
+  }, [accessToken, updateUser]);
 
   const handleLogout = async () => {
     try {

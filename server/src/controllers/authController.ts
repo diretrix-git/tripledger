@@ -225,6 +225,7 @@ export function createAuthHandlers(
 
     sendSuccess(res, {
       verified: true,
+      userId: verifiedUser._id.toString(),
       emailVerified: true,
       emailVerifiedAt: verifiedUser.emailVerifiedAt
         ? verifiedUser.emailVerifiedAt.toISOString()

@@ -9,7 +9,10 @@ export function SettingsPage(): React.ReactElement {
 
   const [name, setName] = useState(user?.name ?? '');
   const [phone, setPhone] = useState(user?.phone ?? '');
-  const [message, setMessage] = useState<string | null>(null);
+  const [statusBanner, setStatusBanner] = useState<{
+    type: 'info' | 'error';
+    text: string;
+  } | null>(null);
   const [saving, setSaving] = useState(false);
   const [resending, setResending] = useState(false);
 
@@ -33,16 +36,19 @@ export function SettingsPage(): React.ReactElement {
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaving(true);
-    setMessage(null);
+    setStatusBanner(null);
     try {
       const res = await apiRequest<{ user: AuthUser }>('/auth/me', {
         method: 'PATCH',
         body: JSON.stringify({ name, phone }),
       });
       updateUser(res.user);
-      setMessage('Profile updated successfully.');
+      setStatusBanner({ type: 'info', text: 'Profile updated successfully.' });
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Failed to update profile');
+      setStatusBanner({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to update profile',
+      });
     } finally {
       setSaving(false);
     }
@@ -50,7 +56,7 @@ export function SettingsPage(): React.ReactElement {
 
   const handleResendVerification = async () => {
     setResending(true);
-    setMessage(null);
+    setStatusBanner(null);
     try {
       const res = await apiRequest<{
         sent: boolean;
@@ -60,12 +66,18 @@ export function SettingsPage(): React.ReactElement {
 
       if (res.alreadyVerified && user) {
         updateUser({ ...user, emailVerified: true });
-        setMessage('Your email address is already verified.');
+        setStatusBanner({ type: 'info', text: 'Your email address is already verified.' });
       } else {
-        setMessage('Verification email sent. Check your inbox for the verification link.');
+        setStatusBanner({
+          type: 'info',
+          text: 'Verification email sent. Check your inbox for the verification link.',
+        });
       }
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Failed to send verification email');
+      setStatusBanner({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to send verification email',
+      });
     } finally {
       setResending(false);
     }
@@ -86,9 +98,16 @@ export function SettingsPage(): React.ReactElement {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
         <form onSubmit={handleSave} className="space-y-4">
-          {message && (
-            <div className="p-3 rounded-xl bg-blue-50 text-blue-800 text-xs font-medium">
-              {message}
+          {statusBanner && (
+            <div
+              role={statusBanner.type === 'error' ? 'alert' : 'status'}
+              className={`p-3 rounded-xl text-xs font-medium border ${
+                statusBanner.type === 'error'
+                  ? 'bg-rose-50 border-rose-200 text-rose-800'
+                  : 'bg-blue-50 border-blue-200 text-blue-800'
+              }`}
+            >
+              {statusBanner.text}
             </div>
           )}
 

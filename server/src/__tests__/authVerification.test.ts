@@ -128,6 +128,7 @@ describe('Phase 2 Commit 2: Email verification lifecycle, live DB checks & multi
     const winner = v1.status === 200 ? v1 : v2;
     const loser = v1.status === 200 ? v2 : v1;
     expect(winner.body.data.verified).toBe(true);
+    expect(winner.body.data.userId).toBe(regRes.body.data.user.id);
     expect(winner.body.data.emailVerified).toBe(true);
     expect(winner.body.data.accessToken).toBeUndefined();
     expect(loser.body.error.code).toBe('INVALID_OR_EXPIRED_VERIFICATION_TOKEN');
