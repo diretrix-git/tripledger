@@ -402,6 +402,7 @@ describe('Task 4: concurrency-safe expense idempotency (FIN/DB)', () => {
       .set(auth())
       .send({ name: 'Mustang Jeep Trip', mode: 'FAMILY', organizerFamilyName: 'Sharma Family' });
     const tripId = tripRes.body.data.trip.id as string;
+    const inviteCode = tripRes.body.data.trip.inviteCode as string;
     const sharma = tripRes.body.data.families[0].id as string;
     const aarav = tripRes.body.data.myParticipant.id as string;
 
@@ -419,31 +420,23 @@ describe('Task 4: concurrency-safe expense idempotency (FIN/DB)', () => {
         .send({ name: 'Bina Sharma', familyId: sharma, role: 'CONTRIBUTOR', memberType: 'ADULT' })
     ).body.data.participant.id as string;
 
-    const dipesh = (
-      await request(app)
-        .post(`/api/v1/trips/${tripId}/participants`)
-        .set(auth())
-        .send({
-          name: 'Dipesh Thapa',
-          email: 'dipesh.idem@example.com',
-          familyId: thapa,
-          role: 'CONTRIBUTOR',
-          memberType: 'ADULT',
-        })
-    ).body.data.participant.id as string;
+    const dipeshJoin = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set(auth(contribToken));
+    const dipesh = dipeshJoin.body.data.participantId as string;
+    await request(app)
+      .patch(`/api/v1/trips/${tripId}/participants/${dipesh}`)
+      .set(auth())
+      .send({ familyId: thapa, role: 'CONTRIBUTOR', memberType: 'ADULT' });
 
-    const esha = (
-      await request(app)
-        .post(`/api/v1/trips/${tripId}/participants`)
-        .set(auth())
-        .send({
-          name: 'Esha Thapa',
-          email: 'esha.idem@example.com',
-          familyId: thapa,
-          role: 'PARTICIPANT',
-          memberType: 'ADULT',
-        })
-    ).body.data.participant.id as string;
+    const eshaJoin = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set(auth(memberToken));
+    const esha = eshaJoin.body.data.participantId as string;
+    await request(app)
+      .patch(`/api/v1/trips/${tripId}/participants/${esha}`)
+      .set(auth())
+      .send({ familyId: thapa, role: 'PARTICIPANT', memberType: 'ADULT' });
 
     const otherTripRes = await request(app)
       .post('/api/v1/trips')

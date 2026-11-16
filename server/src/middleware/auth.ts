@@ -96,28 +96,11 @@ export function requireTripRole(allowedRoles?: TripRole[]) {
         throw new AppError('Trip not found.', 404, 'TRIP_NOT_FOUND');
       }
 
-      let participant = await ParticipantModel.findOne({
+      const participant = await ParticipantModel.findOne({
         tripId: trip._id,
         userId: req.user.userId,
         isActive: true,
       });
-
-      // Auto-link guest participant by matching email if not linked yet
-      if (!participant && req.user.email) {
-        const matchingGuest = await ParticipantModel.findOne({
-          tripId: trip._id,
-          email: req.user.email.toLowerCase(),
-          userId: null,
-          isActive: true,
-        });
-        if (matchingGuest) {
-          matchingGuest.userId = trip.createdBy.equals(req.user.userId)
-            ? matchingGuest.userId
-            : (req.user.userId as unknown as typeof matchingGuest.userId);
-          await matchingGuest.save();
-          participant = matchingGuest;
-        }
-      }
 
       if (!participant) {
         throw new AppError(

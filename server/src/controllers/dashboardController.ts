@@ -13,12 +13,6 @@ export const getDashboardSummary = asyncHandler(async (req: Request, res: Respon
     throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
   }
 
-  // Ensure any guest participants matching user's email are linked
-  await ParticipantModel.updateMany(
-    { email: req.user.email.toLowerCase(), userId: null, isActive: true },
-    { $set: { userId: req.user.userId } }
-  );
-
   const memberships = await ParticipantModel.find({
     userId: req.user.userId,
     isActive: true,

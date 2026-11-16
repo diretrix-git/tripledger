@@ -55,6 +55,7 @@ describe('Phase 4 & 5: Expense Engine, Multiple Payers, Family Mode, Packages & 
       });
     expect(tripRes.status).toBe(201);
     const tripId = tripRes.body.data.trip.id as string;
+    const inviteCode = tripRes.body.data.trip.inviteCode as string;
     const sharmaFamilyId = tripRes.body.data.families[0].id as string;
     const aaravParticipantId = tripRes.body.data.myParticipant.id as string;
 
@@ -70,7 +71,7 @@ describe('Phase 4 & 5: Expense Engine, Multiple Payers, Family Mode, Packages & 
       });
     const binaParticipantId = binaRes.body.data.participant.id as string;
 
-    // 3. Create Thapa Family & add Dipesh (linked user) + Esha
+    // 3. Create Thapa Family, have Dipesh join via open invite code, and organizer assigns family & CONTRIBUTOR role
     const thapaFamRes = await request(app)
       .post(`/api/v1/trips/${tripId}/families`)
       .set('Authorization', `Bearer ${orgToken}`)
@@ -79,17 +80,20 @@ describe('Phase 4 & 5: Expense Engine, Multiple Payers, Family Mode, Packages & 
       });
     const thapaFamilyId = thapaFamRes.body.data.family.id as string;
 
-    const dipeshRes = await request(app)
-      .post(`/api/v1/trips/${tripId}/participants`)
+    const dipeshJoinRes = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set('Authorization', `Bearer ${contributorToken}`);
+    expect(dipeshJoinRes.status).toBe(200);
+    const dipeshParticipantId = dipeshJoinRes.body.data.participantId as string;
+
+    await request(app)
+      .patch(`/api/v1/trips/${tripId}/participants/${dipeshParticipantId}`)
       .set('Authorization', `Bearer ${orgToken}`)
       .send({
-        name: 'Dipesh Thapa',
-        email: 'dipesh@example.com',
         familyId: thapaFamilyId,
         role: 'CONTRIBUTOR',
         memberType: 'ADULT',
       });
-    const dipeshParticipantId = dipeshRes.body.data.participant.id as string;
 
     const eshaRes = await request(app)
       .post(`/api/v1/trips/${tripId}/participants`)

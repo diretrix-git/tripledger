@@ -56,20 +56,24 @@ describe('Phase 6 & 7: Settlements Workflow, Partial Settlements, Reports & Sani
         budgetPaisa: 5000000,
       });
     const tripId = tripRes.body.data.trip.id as string;
+    const inviteCode = tripRes.body.data.trip.inviteCode as string;
     const shareToken = tripRes.body.data.trip.shareToken as string;
     const sagarId = tripRes.body.data.myParticipant.id as string;
 
-    // 2. Add Prashant as participant (linked by email)
-    const pRes = await request(app)
-      .post(`/api/v1/trips/${tripId}/participants`)
+    // 2. Prashant joins via invite code and organizer grants CONTRIBUTOR role
+    const joinRes = await request(app)
+      .post(`/api/v1/trips/join/${inviteCode}`)
+      .set('Authorization', `Bearer ${debtorToken}`);
+    expect(joinRes.status).toBe(200);
+    const prashantId = joinRes.body.data.participantId as string;
+
+    await request(app)
+      .patch(`/api/v1/trips/${tripId}/participants/${prashantId}`)
       .set('Authorization', `Bearer ${orgToken}`)
       .send({
-        name: 'Prashant Friend',
-        email: 'prashant@example.com',
         phone: '9841088888',
         role: 'CONTRIBUTOR',
       });
-    const prashantId = pRes.body.data.participant.id as string;
 
     // 3. Record Expense: Tea House Accommodation NPR 6,000 (600,000 paisa) paid by Sagar, split EQUAL (300,000 each)
     const expRes = await request(app)

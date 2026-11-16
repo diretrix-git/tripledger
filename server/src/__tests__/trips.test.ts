@@ -75,12 +75,14 @@ describe('Phase 3: Trip Management, Participants, Families & Forgotten Expense P
       .set('Authorization', `Bearer ${user2Token}`);
     expect(joinRes.status).toBe(200);
     expect(joinRes.body.data.alreadyJoined).toBe(false);
+    expect(joinRes.body.data.role).toBe('PARTICIPANT');
 
     // Fetch trip details as joined participant
     const detailRes = await request(app)
       .get(`/api/v1/trips/${trip.id}`)
       .set('Authorization', `Bearer ${user2Token}`);
     expect(detailRes.status).toBe(200);
+    expect(detailRes.body.data.myParticipant.role).toBe('PARTICIPANT');
     expect(detailRes.body.data.participants).toHaveLength(3);
   });
 

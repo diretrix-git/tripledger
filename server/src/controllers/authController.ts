@@ -84,12 +84,6 @@ export function createAuthHandlers(
       throw err;
     }
 
-    // Automatically link any existing guest participant records that share this email (removed in Commit 3)
-    await ParticipantModel.updateMany(
-      { email: parsed.email, userId: null },
-      { $set: { userId: user._id } }
-    );
-
     // On delivery failure, preserve the created unverified user and its hashed, expiring token so
     // the user can still log in and call resend-verification to recover once delivery recovers.
     await emailDelivery.sendVerificationEmail({
@@ -135,12 +129,6 @@ export function createAuthHandlers(
     if (!isValid) {
       throw new AppError('Invalid email or password.', 401, 'INVALID_CREDENTIALS');
     }
-
-    // Link any unlinked guest participant records with matching email (removed in Commit 3)
-    await ParticipantModel.updateMany(
-      { email: user.email, userId: null },
-      { $set: { userId: user._id } }
-    );
 
     const accessToken = signAccessToken({
       userId: user._id.toString(),

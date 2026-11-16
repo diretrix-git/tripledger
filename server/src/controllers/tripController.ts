@@ -4,8 +4,10 @@ import {
   createFamilySchema,
   createParticipantSchema,
   createTripSchema,
+  DEFAULT_OPEN_INVITE_ROLE,
   EXPENSE_CATEGORY_LABELS,
   FORGOTTEN_EXPENSE_CHECKLIST_CATEGORIES,
+  joinTripSchema,
   updateChecklistItemSchema,
   updateFamilySchema,
   updateParticipantSchema,
@@ -19,11 +21,12 @@ import {
   ParticipantModel,
   SettlementModel,
   TripModel,
-  UserModel,
+  type IParticipant,
   type ITrip,
 } from '../models/index.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
 import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
+import { isDuplicateKeyError } from '../utils/mongoErrors.js';
 import { generateInviteCode, generateShareToken } from '../utils/tokens.js';
 
 export const createTrip = asyncHandler(async (req: Request, res: Response) => {
@@ -120,12 +123,6 @@ export const listTrips = asyncHandler(async (req: Request, res: Response) => {
 
   const { mode, status } = req.query;
 
-  // Auto-link any guest participant slots matching user's email
-  await ParticipantModel.updateMany(
-    { email: req.user.email.toLowerCase(), userId: null, isActive: true },
-    { $set: { userId: req.user.userId } }
-  );
-
   const myMemberships = await ParticipantModel.find({
     userId: req.user.userId,
     isActive: true,
@@ -209,6 +206,11 @@ export const updateTrip = asyncHandler(async (req: Request, res: Response) => {
     trip.endDate = parsed.endDate ? new Date(parsed.endDate) : undefined;
   }
   if (parsed.shareEnabled !== undefined) trip.shareEnabled = parsed.shareEnabled;
+  if (parsed.inviteEnabled !== undefined) trip.inviteEnabled = parsed.inviteEnabled;
+  if (parsed.inviteExpiresAt !== undefined) {
+    trip.inviteExpiresAt =
+      parsed.inviteExpiresAt === null ? null : new Date(parsed.inviteExpiresAt);
+  }
 
   await trip.save();
 
@@ -231,6 +233,8 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
     throw new AppError('Authentication required.', 401, 'UNAUTHORIZED');
   }
 
+  joinTripSchema.parse(req.body ?? {});
+
   const rawInviteCode = req.params.inviteCode;
   const inviteCode = typeof rawInviteCode === 'string' ? rawInviteCode.trim().toUpperCase() : '';
   if (!inviteCode) {
@@ -242,65 +246,79 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
     throw new AppError('Invalid invite code. Trip not found.', 404, 'TRIP_NOT_FOUND');
   }
 
-  // Check if user is already a participant
-  let participant = await ParticipantModel.findOne({
+  if (trip.inviteEnabled === false) {
+    throw new AppError(
+      'Open invite-code joining is disabled for this trip.',
+      403,
+      'INVITE_DISABLED'
+    );
+  }
+
+  if (trip.inviteExpiresAt && trip.inviteExpiresAt.getTime() <= Date.now()) {
+    throw new AppError('This invite code has expired.', 403, 'INVITE_EXPIRED');
+  }
+
+  // Existing membership check: never reactivate deactivated members via open invite code.
+  const existingParticipant = await ParticipantModel.findOne({
     tripId: trip._id,
     userId: req.user.userId,
   });
 
-  if (participant) {
-    if (!participant.isActive) {
-      participant.isActive = true;
-      await participant.save();
+  if (existingParticipant) {
+    if (!existingParticipant.isActive) {
+      throw new AppError(
+        'Your membership in this trip has been deactivated by an organizer.',
+        403,
+        'PARTICIPANT_DEACTIVATED'
+      );
     }
     sendSuccess(res, {
       trip: formatTripDoc(trip),
-      participantId: participant._id.toString(),
+      participantId: existingParticipant._id.toString(),
       alreadyJoined: true,
+      role: existingParticipant.role,
     });
     return;
   }
 
-  // Check if there is an unlinked guest participant with matching email or requested guestParticipantId
-  const requestedGuestId = req.body?.guestParticipantId as string | undefined;
-  if (requestedGuestId) {
-    const guestSlot = await ParticipantModel.findOne({
-      _id: requestedGuestId,
-      tripId: trip._id,
-      userId: null,
-    });
-    if (guestSlot) {
-      guestSlot.userId = new mongoose.Types.ObjectId(req.user.userId);
-      guestSlot.email = req.user.email;
-      await guestSlot.save();
-      participant = guestSlot;
-    }
-  }
-
-  if (!participant) {
-    const emailMatch = await ParticipantModel.findOne({
-      tripId: trip._id,
-      email: req.user.email.toLowerCase(),
-      userId: null,
-    });
-    if (emailMatch) {
-      emailMatch.userId = new mongoose.Types.ObjectId(req.user.userId);
-      await emailMatch.save();
-      participant = emailMatch;
-    }
-  }
-
-  if (!participant) {
+  // Open invite-code joins ALWAYS enroll a fresh low-privilege PARTICIPANT record and NEVER
+  // auto-link or claim existing guest participant rows by ID or email.
+  let participant: IParticipant;
+  try {
     participant = await ParticipantModel.create({
       tripId: trip._id,
       userId: req.user.userId,
       name: req.user.name,
       email: req.user.email,
-      role: 'CONTRIBUTOR',
+      role: DEFAULT_OPEN_INVITE_ROLE,
       memberType: 'ADULT',
       defaultWeight: 1,
       isActive: true,
     });
+  } catch (err) {
+    if (isDuplicateKeyError(err)) {
+      const concurrent = await ParticipantModel.findOne({
+        tripId: trip._id,
+        userId: req.user.userId,
+      });
+      if (concurrent) {
+        if (!concurrent.isActive) {
+          throw new AppError(
+            'Your membership in this trip has been deactivated by an organizer.',
+            403,
+            'PARTICIPANT_DEACTIVATED'
+          );
+        }
+        sendSuccess(res, {
+          trip: formatTripDoc(trip),
+          participantId: concurrent._id.toString(),
+          alreadyJoined: true,
+          role: concurrent.role,
+        });
+        return;
+      }
+    }
+    throw err;
   }
 
   await logTripActivity({
@@ -318,6 +336,7 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
     trip: formatTripDoc(trip),
     participantId: participant._id.toString(),
     alreadyJoined: false,
+    role: participant.role,
   });
 });
 
@@ -336,17 +355,10 @@ export const addParticipant = asyncHandler(async (req: Request, res: Response) =
     }
   }
 
-  let linkedUserId: mongoose.Types.ObjectId | null = null;
-  if (parsed.email) {
-    const existingUser = await UserModel.findOne({ email: parsed.email.toLowerCase() });
-    if (existingUser) {
-      linkedUserId = existingUser._id;
-    }
-  }
-
+  // Organizers always create unlinked guest records (userId: null); never auto-link by email.
   const participant = await ParticipantModel.create({
     tripId: trip._id,
-    userId: linkedUserId,
+    userId: null,
     familyId: parsed.familyId ? new mongoose.Types.ObjectId(parsed.familyId) : null,
     name: parsed.name,
     email: parsed.email || undefined,
@@ -411,8 +423,53 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
     throw new AppError('Participant not found in this trip.', 404, 'PARTICIPANT_NOT_FOUND');
   }
 
+  if (parsed.familyId) {
+    const family = await FamilyModel.findOne({
+      _id: parsed.familyId,
+      tripId: trip._id,
+    });
+    if (!family) {
+      throw new AppError(
+        'Specified family group does not exist in this trip.',
+        404,
+        'FAMILY_NOT_FOUND'
+      );
+    }
+  }
+
+  if (parsed.email !== undefined) {
+    const nextEmail = parsed.email || undefined;
+    if (participant.userId && nextEmail !== (participant.email || undefined)) {
+      throw new AppError(
+        'Cannot change email on an already-linked participant record.',
+        409,
+        'PARTICIPANT_EMAIL_IMMUTABLE_WHILE_LINKED'
+      );
+    }
+    participant.email = nextEmail;
+  }
+
+  const nextRole = parsed.role ?? participant.role;
+  const nextIsActive = parsed.isActive ?? participant.isActive;
+  if (participant.role === 'ORGANIZER' && participant.isActive) {
+    if (nextRole !== 'ORGANIZER' || !nextIsActive) {
+      const otherActiveOrganizers = await ParticipantModel.countDocuments({
+        tripId: trip._id,
+        role: 'ORGANIZER',
+        _id: { $ne: participant._id },
+        isActive: true,
+      });
+      if (otherActiveOrganizers === 0) {
+        throw new AppError(
+          'Cannot demote or deactivate the sole active organizer of the trip.',
+          400,
+          'SOLE_ORGANIZER'
+        );
+      }
+    }
+  }
+
   if (parsed.name !== undefined) participant.name = parsed.name;
-  if (parsed.email !== undefined) participant.email = parsed.email || undefined;
   if (parsed.phone !== undefined) participant.phone = parsed.phone;
   if (parsed.role !== undefined) participant.role = parsed.role;
   if (parsed.memberType !== undefined) participant.memberType = parsed.memberType;
@@ -705,6 +762,12 @@ export function formatTripDoc(trip: ITrip) {
     endDate: trip.endDate ? trip.endDate.toISOString() : undefined,
     createdBy: trip.createdBy.toString(),
     inviteCode: trip.inviteCode,
+    inviteEnabled: trip.inviteEnabled !== false,
+    inviteExpiresAt: trip.inviteExpiresAt ? trip.inviteExpiresAt.toISOString() : null,
+    inviteCodeRotatedAt: trip.inviteCodeRotatedAt
+      ? trip.inviteCodeRotatedAt.toISOString()
+      : null,
+    defaultInviteRole: trip.defaultInviteRole ?? DEFAULT_OPEN_INVITE_ROLE,
     shareToken: trip.shareToken,
     shareEnabled: trip.shareEnabled,
     checklist: trip.checklist,

@@ -100,7 +100,7 @@ describe('Phase 2: Authentication, Token Rotation, Guest Linking & RBAC', () => 
     expect(reuseOldRefresh.status).toBe(401);
   });
 
-  it('auto-links existing guest participant records when a user registers with matching email and enforces RBAC', async () => {
+  it('never auto-links guest participant records on register, login, or read paths and enforces strict RBAC', async () => {
     // 1. Register Organizer
     const orgRes = await request(app).post('/api/v1/auth/register').send({
       name: 'Organizer User',
@@ -110,7 +110,7 @@ describe('Phase 2: Authentication, Token Rotation, Guest Linking & RBAC', () => 
     const orgId = orgRes.body.data.user.id as string;
     const orgToken = orgRes.body.data.accessToken as string;
 
-    // 2. Create a Trip and a Guest Participant with email "guest@example.com" and role PARTICIPANT
+    // 2. Create a Trip and unlinked guest participants (including a privileged ORGANIZER slot)
     const trip = await TripModel.create({
       name: 'Pokhara Trip',
       mode: 'FRIENDS',
@@ -132,25 +132,46 @@ describe('Phase 2: Authentication, Token Rotation, Guest Linking & RBAC', () => 
       userId: null,
       name: 'Ramesh Guest',
       email: 'guest@example.com',
-      role: 'PARTICIPANT',
+      role: 'ORGANIZER',
     });
 
     expect(guestParticipant.userId).toBeNull();
 
-    // 3. Register Ramesh with email "guest@example.com"
+    // 3. Register & log in with matching email "guest@example.com" -> MUST NOT claim guestParticipant
     const guestReg = await request(app).post('/api/v1/auth/register').send({
       name: 'Ramesh Guest',
       email: 'guest@example.com',
       password: 'Password123',
     });
+    expect(guestReg.status).toBe(201);
     const guestToken = guestReg.body.data.accessToken as string;
-    const guestUserId = guestReg.body.data.user.id as string;
 
-    // Verify Guest Participant record is now linked to Ramesh's new userId
-    const updatedGuest = await ParticipantModel.findById(guestParticipant._id);
-    expect(updatedGuest?.userId?.toString()).toBe(guestUserId);
+    await request(app).post('/api/v1/auth/login').send({
+      email: 'guest@example.com',
+      password: 'Password123',
+    });
+    await request(app).get('/api/v1/dashboard/summary').set('Authorization', `Bearer ${guestToken}`);
+    await request(app).get('/api/v1/trips').set('Authorization', `Bearer ${guestToken}`);
 
-    // 4. Verify RBAC: Organizer is allowed on organizer-only endpoint, Participant is rejected with 403
+    const stillGuest = await ParticipantModel.findById(guestParticipant._id);
+    expect(stillGuest?.userId).toBeNull();
+
+    // Attacker is denied trip access with 403 (middleware must NOT link or grant ORGANIZER)
+    const unlinkedCheck = await request(app)
+      .post(`/api/v1/test-rbac/${trip._id.toString()}/organizer-only`)
+      .set('Authorization', `Bearer ${guestToken}`);
+    expect(unlinkedCheck.status).toBe(403);
+    expect(unlinkedCheck.body.error.code).toBe('FORBIDDEN_TRIP_ACCESS');
+    expect((await ParticipantModel.findById(guestParticipant._id))?.userId).toBeNull();
+
+    // 4. Open invite-code join assigns PARTICIPANT (not guest ORGANIZER slot) and enforces RBAC (403 INSUFFICIENT_ROLE)
+    const joinRes = await request(app)
+      .post(`/api/v1/trips/join/${trip.inviteCode}`)
+      .set('Authorization', `Bearer ${guestToken}`);
+    expect(joinRes.status).toBe(200);
+    expect(joinRes.body.data.role).toBe('PARTICIPANT');
+    expect((await ParticipantModel.findById(guestParticipant._id))?.userId).toBeNull();
+
     const orgCheck = await request(app)
       .post(`/api/v1/test-rbac/${trip._id.toString()}/organizer-only`)
       .set('Authorization', `Bearer ${orgToken}`);
