@@ -74,11 +74,11 @@ Base URL: `/api/v1`
 | `GET` | `/trips/:tripId/invites` | Organizer | List redacted participant invitations issued for the trip (never returns `tokenHash` or `rawToken`) |
 | `POST` | `/trips/:tripId/participants/:participantId/invites` | Organizer | Issue a single-use participant claim/promotion invitation (privileged `ORGANIZER`/`FAMILY_REP` requires `intendedEmail` verified on redemption; supersedes prior pending invites on that participant; dispatches email & returns one-time `rawToken`/`claimUrl` only in this creation response) |
 | `POST` | `/trips/:tripId/invites/:inviteId/revoke` | Organizer | Revoke a pending unredeemed participant invitation |
-| `PATCH` | `/trips/:tripId/participants/:participantId` | Organizer | Update participant details, non-privileged roles (`PARTICIPANT` / `CONTRIBUTOR` for linked users), demotions, weight, family assignment, or active status (blocks direct promotion to `ORGANIZER`/`FAMILY_REP`, blocks elevating unlinked guests above `PARTICIPANT`, blocks changing email on linked participants, and preserves sole-linked-organizer invariant) |
-| `DELETE` | `/trips/:tripId/participants/:participantId` | Organizer | Deactivate/remove participant (blocked if participant has active financial records) |
-| `POST` | `/trips/:tripId/families` | Organizer | Create a family group in Family Mode and optionally assign representative |
-| `PATCH` | `/trips/:tripId/families/:familyId` | Organizer | Update family name, representative (`representativeId`), or default weight |
-| `DELETE` | `/trips/:tripId/families/:familyId` | Organizer | Remove an empty family group |
+| `PATCH` | `/trips/:tripId/participants/:participantId` | Organizer | Update participant details, non-privileged roles (`PARTICIPANT` / `CONTRIBUTOR` for linked users), demotions, weight, family assignment, or active status (blocks direct promotion to `ORGANIZER`/`FAMILY_REP`, blocks elevating unlinked guests above `PARTICIPANT`, blocks reactivating privileged roles directly, clears/demotes replaced/moved/deactivated `FAMILY_REP` authority & pending invites, blocks changing email on linked participants, and preserves sole-linked-organizer invariant) |
+| `DELETE` | `/trips/:tripId/participants/:participantId` | Organizer | Remove participant (blocked if participant has active financial records; clears any `Family.representativeId` references and revokes pending invites) |
+| `POST` | `/trips/:tripId/families` | Organizer | Create a family group in `FAMILY` Mode trips only and optionally designate an active representative (does not auto-promote `FAMILY_REP` role) |
+| `PATCH` | `/trips/:tripId/families/:familyId` | Organizer | Update family name, designated representative (`representativeId` — demoting replaced `FAMILY_REP` roles and revoking stale pending `FAMILY_REP` invites without auto-promoting the new representative), or default weight |
+| `DELETE` | `/trips/:tripId/families/:familyId` | Organizer | Remove a family group, unassign members, demote `FAMILY_REP` members to `PARTICIPANT`, and revoke pending `FAMILY_REP` invites |
 
 ---
 
@@ -101,8 +101,8 @@ Base URL: `/api/v1`
 | :--- | :--- | :--- | :--- |
 | `GET` | `/trips/:tripId/balances` | Participant | Compute real-time ledger: individual balances, family balances, and optimized settlement suggestions (both Individual & Family views) |
 | `GET` | `/trips/:tripId/settlements` | Participant | List all recorded settlements (`PENDING`, `REPORTED`, `CONFIRMED`, `REJECTED`) |
-| `POST` | `/trips/:tripId/settlements` | Participant | Record a full or partial settlement reimbursement |
-| `PATCH` | `/trips/:tripId/settlements/:settlementId/status` | Organizer / Receiver | Confirm or reject a reported settlement |
+| `POST` | `/trips/:tripId/settlements` | Participant | Record a full or partial settlement reimbursement on an open trip (`REPORTED` or directly `CONFIRMED` by Organizer/Receiver; `FAMILY` settlements restricted to `FAMILY` mode) |
+| `PATCH` | `/trips/:tripId/settlements/:settlementId/status` | Organizer / Receiver / Designated Family Rep | Confirm or reject a `REPORTED` settlement on an open trip (`409 INVALID_SETTLEMENT_TRANSITION` if already `CONFIRMED`/`REJECTED`; `FAMILY_REP` requires `FAMILY` mode, verified active account linkage, `toFamily.representativeId === actor`, and active receiver in `toFamily`) |
 
 ---
 
