@@ -26,9 +26,13 @@ import {
 } from '../models/index.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
 import {
+  assertFreshActiveOrganizerActor,
+  buildParticipantUpdateRestoreOp,
+  captureParticipantUpdateSnapshot,
   countActiveLinkedOrganizers,
   isActiveLinkedOrganizer,
   runSerializedTripOrganizerMutation,
+  type ParticipantUpdateSnapshot,
 } from '../services/organizerInvariant.js';
 import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
 import { isDuplicateKeyError } from '../utils/mongoErrors.js';
@@ -392,63 +396,6 @@ async function assertValidFamilyInTrip(
   return family._id;
 }
 
-interface ParticipantUpdateSnapshot {
-  _id: mongoose.Types.ObjectId;
-  name: string;
-  email: string | undefined;
-  phone: string | undefined;
-  role: IParticipant['role'];
-  memberType: IParticipant['memberType'];
-  defaultWeight: number;
-  isActive: boolean;
-  familyId: mongoose.Types.ObjectId | null | undefined;
-}
-
-function buildParticipantUpdateRestoreOp(snapshot: ParticipantUpdateSnapshot) {
-  const $set: Record<string, unknown> = {
-    name: snapshot.name,
-    role: snapshot.role,
-    memberType: snapshot.memberType,
-    defaultWeight: snapshot.defaultWeight,
-    isActive: snapshot.isActive,
-    familyId: snapshot.familyId ?? null,
-  };
-  const $unset: Record<string, 1> = {};
-  if (snapshot.email !== undefined) {
-    $set.email = snapshot.email;
-  } else {
-    $unset.email = 1;
-  }
-  if (snapshot.phone !== undefined) {
-    $set.phone = snapshot.phone;
-  } else {
-    $unset.phone = 1;
-  }
-  return Object.keys($unset).length > 0 ? { $set, $unset } : { $set };
-}
-
-async function assertFreshActiveOrganizerActor(
-  tripId: mongoose.Types.ObjectId,
-  actorParticipantId: mongoose.Types.ObjectId,
-  session: ClientSession | null
-): Promise<void> {
-  const freshActor = await ParticipantModel.findOne({
-    _id: actorParticipantId,
-    tripId,
-  }).session(session);
-
-  if (!freshActor || !freshActor.isActive) {
-    throw new AppError('You do not have access to this trip.', 403, 'FORBIDDEN_TRIP_ACCESS');
-  }
-  if (freshActor.role !== 'ORGANIZER') {
-    throw new AppError(
-      `Insufficient permissions. Required role: ORGANIZER. Your role: ${freshActor.role}.`,
-      403,
-      'INSUFFICIENT_ROLE'
-    );
-  }
-}
-
 async function assertActiveRepresentativeInTrip(
   tripId: mongoose.Types.ObjectId,
   participantId: string
@@ -611,17 +558,7 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
         }
       }
 
-      txState.rollbackSnapshot = {
-        _id: participant._id,
-        name: participant.name,
-        email: participant.email,
-        phone: participant.phone,
-        role: participant.role,
-        memberType: participant.memberType,
-        defaultWeight: participant.defaultWeight,
-        isActive: participant.isActive,
-        familyId: participant.familyId,
-      };
+      txState.rollbackSnapshot = captureParticipantUpdateSnapshot(participant);
 
       if (hasEmailChange) participant.email = nextEmail;
       if (parsed.name !== undefined) participant.name = parsed.name;
@@ -997,7 +934,27 @@ export const closeTrip = asyncHandler(async (req: Request, res: Response) => {
   sendSuccess(res, { trip: formatTripDoc(trip) });
 });
 
-export function formatTripDoc(trip: ITrip) {
+export function formatParticipantDoc(participant: IParticipant) {
+  return {
+    id: participant._id.toString(),
+    tripId: participant.tripId.toString(),
+    userId: participant.userId ? participant.userId.toString() : null,
+    familyId: participant.familyId ? participant.familyId.toString() : null,
+    name: participant.name,
+    email: participant.email,
+    phone: participant.phone,
+    role: participant.role,
+    memberType: participant.memberType,
+    defaultWeight: participant.defaultWeight,
+    isActive: participant.isActive,
+  };
+}
+
+export function formatTripDoc(
+  trip: ITrip,
+  options: { includeInviteCode?: boolean } = {}
+) {
+  const includeInviteCode = options.includeInviteCode ?? true;
   return {
     id: trip._id.toString(),
     name: trip.name,
@@ -1009,7 +966,7 @@ export function formatTripDoc(trip: ITrip) {
     startDate: trip.startDate ? trip.startDate.toISOString() : undefined,
     endDate: trip.endDate ? trip.endDate.toISOString() : undefined,
     createdBy: trip.createdBy.toString(),
-    inviteCode: trip.inviteCode,
+    ...(includeInviteCode ? { inviteCode: trip.inviteCode } : {}),
     inviteEnabled: trip.inviteEnabled !== false,
     inviteExpiresAt: trip.inviteExpiresAt ? trip.inviteExpiresAt.toISOString() : null,
     inviteCodeRotatedAt: trip.inviteCodeRotatedAt

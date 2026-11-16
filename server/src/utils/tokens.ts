@@ -50,7 +50,13 @@ export function generateShareToken(): string {
   return crypto.randomBytes(24).toString('base64url');
 }
 
-export interface GeneratedVerificationToken {
+export interface GeneratedEmailVerificationToken {
+  rawToken: string;
+  tokenHash: string;
+  expiresAt: Date;
+}
+
+export interface GeneratedParticipantInviteToken {
   rawToken: string;
   tokenHash: string;
   expiresAt: Date;
@@ -58,9 +64,18 @@ export interface GeneratedVerificationToken {
 
 export function generateEmailVerificationToken(
   ttlMinutes = EMAIL_VERIFICATION_TTL_MINUTES
-): GeneratedVerificationToken {
+): GeneratedEmailVerificationToken {
   const rawToken = crypto.randomBytes(32).toString('base64url');
   const tokenHash = hashToken(rawToken);
   const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+  return { rawToken, tokenHash, expiresAt };
+}
+
+export function generateParticipantInviteToken(
+  ttlHours: number
+): GeneratedParticipantInviteToken {
+  const rawToken = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashToken(rawToken);
+  const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
   return { rawToken, tokenHash, expiresAt };
 }

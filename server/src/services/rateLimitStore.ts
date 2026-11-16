@@ -185,6 +185,8 @@ export interface AuthRateLimiters {
 export interface TripRateLimiters {
   joinByUser: RateLimitRequestHandler;
   joinByIp: RateLimitRequestHandler;
+  inviteClaimByUser: RateLimitRequestHandler;
+  inviteClaimByIp: RateLimitRequestHandler;
 }
 
 export function createTripRateLimiters(params: {
@@ -215,6 +217,24 @@ export function createTripRateLimiters(params: {
       storeType: params.storeType,
       enabled: params.enabled,
       message: 'Too many trip join attempts from this address. Please try again later.',
+    }),
+    inviteClaimByUser: createConfiguredRateLimiter({
+      prefix: 'trip-invite-claim-user:',
+      windowMs,
+      limit: maxPerUser,
+      storeType: params.storeType,
+      enabled: params.enabled,
+      keyGenerator: (req) =>
+        req.user?.userId ? `user:${req.user.userId}` : `ip:${req.ip ?? 'anonymous'}`,
+      message: 'Too many invitation redemption attempts. Please try again later.',
+    }),
+    inviteClaimByIp: createConfiguredRateLimiter({
+      prefix: 'trip-invite-claim-ip:',
+      windowMs,
+      limit: Math.max(maxPerUser * 2, maxPerUser),
+      storeType: params.storeType,
+      enabled: params.enabled,
+      message: 'Too many invitation redemption attempts from this address. Please try again later.',
     }),
   };
 }

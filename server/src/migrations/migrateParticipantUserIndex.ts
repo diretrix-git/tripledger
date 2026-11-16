@@ -8,6 +8,11 @@ import {
   ParticipantModel,
 } from '../models/Participant.js';
 import {
+  PARTICIPANT_INVITE_EMAIL_PENDING_INDEX_NAME,
+  PARTICIPANT_INVITE_TOKEN_INDEX_NAME,
+  ParticipantInviteModel,
+} from '../models/ParticipantInvite.js';
+import {
   USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME,
   UserModel,
 } from '../models/User.js';
@@ -64,10 +69,12 @@ export interface ParticipantLinkingRiskAuditReport {
   unverifiedUsersCount: number;
   unlinkedGuestsWithEmailCount: number;
   unlinkedPrivilegedGuestsWithEmailCount: number;
+  unlinkedPrivilegedGuestsCount: number;
   nonCreatorUnverifiedPrivilegedLinks: HistoricalPrivilegedLinkRiskEntry[];
   participantsTripUserPartialIndexPresent: boolean;
   usersVerificationTokenPartialIndexPresent: boolean;
   rateLimitBucketIndexesPresent: boolean;
+  participantInvitesIndexesPresent: boolean;
 }
 
 interface IndexInfo {
@@ -158,6 +165,68 @@ function isExpectedUserVerificationPartialFilter(expr: unknown): boolean {
     field.$type === 'string' &&
     field.$gt === ''
   );
+}
+
+function hasKeySequence(
+  key: Record<string, unknown> | undefined,
+  expectedEntries: ReadonlyArray<readonly [string, number]>
+): boolean {
+  if (!key) return false;
+  const entries = Object.entries(key);
+  if (entries.length !== expectedEntries.length) return false;
+  return expectedEntries.every(
+    ([field, dir], idx) => entries[idx]?.[0] === field && entries[idx]?.[1] === dir
+  );
+}
+
+function areParticipantInviteIndexesPresent(indexes: readonly IndexInfo[]): boolean {
+  const hasTokenUnique = indexes.some(
+    (idx) =>
+      idx.name === PARTICIPANT_INVITE_TOKEN_INDEX_NAME &&
+      idx.unique === true &&
+      hasKeySequence(idx.key, [['tokenHash', 1]])
+  );
+  const hasEmailPending = indexes.some(
+    (idx) =>
+      idx.name === PARTICIPANT_INVITE_EMAIL_PENDING_INDEX_NAME &&
+      hasKeySequence(idx.key, [
+        ['intendedEmail', 1],
+        ['usedAt', 1],
+        ['revokedAt', 1],
+        ['expiresAt', 1],
+      ])
+  );
+  const hasParticipantPending = indexes.some((idx) =>
+    hasKeySequence(idx.key, [
+      ['participantId', 1],
+      ['usedAt', 1],
+      ['revokedAt', 1],
+    ])
+  );
+  const hasTripHistory = indexes.some((idx) =>
+    hasKeySequence(idx.key, [
+      ['tripId', 1],
+      ['participantId', 1],
+      ['createdAt', -1],
+    ])
+  );
+  return hasTokenUnique && hasEmailPending && hasParticipantPending && hasTripHistory;
+}
+
+export async function ensureParticipantInviteIndexes(
+  collection: mongoose.Collection = ParticipantInviteModel.collection
+): Promise<void> {
+  await ensureCollectionExists(collection);
+  await collection.createIndex(
+    { tokenHash: 1 },
+    { name: PARTICIPANT_INVITE_TOKEN_INDEX_NAME, unique: true }
+  );
+  await collection.createIndex({ participantId: 1, usedAt: 1, revokedAt: 1 });
+  await collection.createIndex(
+    { intendedEmail: 1, usedAt: 1, revokedAt: 1, expiresAt: 1 },
+    { name: PARTICIPANT_INVITE_EMAIL_PENDING_INDEX_NAME }
+  );
+  await collection.createIndex({ tripId: 1, participantId: 1, createdAt: -1 });
 }
 
 function isExpectedUserVerificationPartialIndex(idx: IndexInfo): boolean {
@@ -534,10 +603,12 @@ export async function auditParticipantLinkingRisks(
     unverifiedUsersCount,
     unlinkedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsWithEmailCount,
+    unlinkedPrivilegedGuestsCount,
     anomalousLinks,
     participantIndexes,
     userIndexes,
     rateLimitIndexes,
+    inviteIndexes,
   ] = await Promise.all([
     usersCol.countDocuments({ emailVerified: { $ne: true } }),
     participantsCol.countDocuments({
@@ -549,6 +620,9 @@ export async function auditParticipantLinkingRisks(
         nonBlankEmailFilter,
         { role: { $in: [...PRIVILEGED_TRIP_ROLES] } },
       ],
+    }),
+    participantsCol.countDocuments({
+      $and: [unlinkedFilter, { role: { $in: [...PRIVILEGED_TRIP_ROLES] } }],
     }),
     participantsCol
       .aggregate<{
@@ -613,6 +687,7 @@ export async function auditParticipantLinkingRisks(
     listCollectionIndexesReadOnly(db, 'participants'),
     listCollectionIndexesReadOnly(db, 'users'),
     listCollectionIndexesReadOnly(db, 'rate_limit_buckets'),
+    listCollectionIndexesReadOnly(db, ParticipantInviteModel.collection.collectionName),
   ]);
 
   const participantsTripUserPartialIndexPresent = participantIndexes.some((idx) =>
@@ -626,11 +701,13 @@ export async function auditParticipantLinkingRisks(
     rateLimitIndexes.some(
       (idx) => idx.key?.expiresAt === 1 && idx.expireAfterSeconds === 0
     );
+  const participantInvitesIndexesPresent = areParticipantInviteIndexesPresent(inviteIndexes);
 
   return {
     unverifiedUsersCount,
     unlinkedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsWithEmailCount,
+    unlinkedPrivilegedGuestsCount,
     nonCreatorUnverifiedPrivilegedLinks: anomalousLinks.map((entry) => ({
       tripId: String(entry.tripId),
       participantId: String(entry._id),
@@ -642,6 +719,7 @@ export async function auditParticipantLinkingRisks(
     participantsTripUserPartialIndexPresent,
     usersVerificationTokenPartialIndexPresent,
     rateLimitBucketIndexesPresent: rateLimitBucketsIndexesPresent,
+    participantInvitesIndexesPresent,
   };
 }
 
@@ -672,6 +750,7 @@ export async function runParticipantMigrationCli(
     const indexReport = await migrateParticipantUserIndex();
     const userVerificationIndexReport = await migrateUserVerificationTokenIndex();
     await ensureRateLimitIndexes();
+    await ensureParticipantInviteIndexes();
     const backfillReport = await backfillInviteSecurityDefaults();
     const auditReport = await auditParticipantLinkingRisks();
     console.log('[TripLedger Migration] Participant user index migration complete:', {

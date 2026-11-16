@@ -39,6 +39,83 @@ export function isActiveLinkedOrganizer(
   );
 }
 
+export interface ParticipantUpdateSnapshot {
+  _id: mongoose.Types.ObjectId;
+  userId: mongoose.Types.ObjectId | null | undefined;
+  name: string;
+  email: string | undefined;
+  phone: string | undefined;
+  role: IParticipant['role'];
+  memberType: IParticipant['memberType'];
+  defaultWeight: number;
+  isActive: boolean;
+  familyId: mongoose.Types.ObjectId | null | undefined;
+}
+
+export function captureParticipantUpdateSnapshot(
+  participant: IParticipant
+): ParticipantUpdateSnapshot {
+  return {
+    _id: participant._id,
+    userId: participant.userId,
+    name: participant.name,
+    email: participant.email,
+    phone: participant.phone,
+    role: participant.role,
+    memberType: participant.memberType,
+    defaultWeight: participant.defaultWeight,
+    isActive: participant.isActive,
+    familyId: participant.familyId,
+  };
+}
+
+export function buildParticipantUpdateRestoreOp(snapshot: ParticipantUpdateSnapshot) {
+  const $set: Record<string, unknown> = {
+    userId: snapshot.userId ?? null,
+    name: snapshot.name,
+    role: snapshot.role,
+    memberType: snapshot.memberType,
+    defaultWeight: snapshot.defaultWeight,
+    isActive: snapshot.isActive,
+    familyId: snapshot.familyId ?? null,
+  };
+  const $unset: Record<string, 1> = {};
+  if (snapshot.email !== undefined) {
+    $set.email = snapshot.email;
+  } else {
+    $unset.email = 1;
+  }
+  if (snapshot.phone !== undefined) {
+    $set.phone = snapshot.phone;
+  } else {
+    $unset.phone = 1;
+  }
+  return Object.keys($unset).length > 0 ? { $set, $unset } : { $set };
+}
+
+export async function assertFreshActiveOrganizerActor(
+  tripId: mongoose.Types.ObjectId,
+  actorParticipantId: mongoose.Types.ObjectId,
+  session: ClientSession | null
+): Promise<IParticipant> {
+  const freshActor = await ParticipantModel.findOne({
+    _id: actorParticipantId,
+    tripId,
+  }).session(session);
+
+  if (!freshActor || !freshActor.isActive) {
+    throw new AppError('You do not have access to this trip.', 403, 'FORBIDDEN_TRIP_ACCESS');
+  }
+  if (freshActor.role !== 'ORGANIZER') {
+    throw new AppError(
+      `Insufficient permissions. Required role: ORGANIZER. Your role: ${freshActor.role}.`,
+      403,
+      'INSUFFICIENT_ROLE'
+    );
+  }
+  return freshActor;
+}
+
 /**
  * Counts active linked organizers in `tripId`, optionally excluding one participant and binding to `session`.
  */

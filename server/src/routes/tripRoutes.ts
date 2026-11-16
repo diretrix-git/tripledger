@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { createParticipantInviteHandlers } from '../controllers/participantInviteController.js';
 import {
   addParticipant,
   closeTrip,
@@ -15,7 +16,8 @@ import {
   updateTrip,
 } from '../controllers/tripController.js';
 import { getDashboardSummary } from '../controllers/dashboardController.js';
-import { requireAuth, requireTripRole } from '../middleware/auth.js';
+import { requireAuth, requireTripRole, requireVerifiedEmail } from '../middleware/auth.js';
+import type { EmailDeliveryService } from '../services/emailService.js';
 import { expenseRouter } from './expenseRoutes.js';
 import {
   balanceRouter,
@@ -33,6 +35,7 @@ dashboardRouter.get('/summary', requireAuth, getDashboardSummary);
 
 export interface CreateTripRouterOptions {
   rateLimiters?: TripRateLimiters;
+  emailDeliveryService?: EmailDeliveryService;
 }
 
 export function createTripRouter(options: CreateTripRouterOptions = {}): Router {
@@ -44,12 +47,23 @@ export function createTripRouter(options: CreateTripRouterOptions = {}): Router 
       storeType: effective.storeType,
     });
 
+  const inviteHandlers = createParticipantInviteHandlers({
+    emailDeliveryService: options.emailDeliveryService,
+  });
+
   const router = Router();
 
   router.use(requireAuth);
 
   router.post('/', createTrip);
   router.get('/', listTrips);
+  router.get('/invites/pending', requireVerifiedEmail, inviteHandlers.listPendingParticipantInvites);
+  router.post(
+    '/invites/claim',
+    limiters.inviteClaimByUser,
+    limiters.inviteClaimByIp,
+    inviteHandlers.claimParticipantInvite
+  );
   router.post(
     '/join/:inviteCode',
     limiters.joinByIp,
@@ -62,8 +76,21 @@ export function createTripRouter(options: CreateTripRouterOptions = {}): Router 
   router.patch('/:tripId/checklist', requireTripRole(['ORGANIZER']), updateChecklistItem);
   router.post('/:tripId/close', requireTripRole(['ORGANIZER']), closeTrip);
 
+  // Role Invitations (Organizer-only)
+  router.get('/:tripId/invites', requireTripRole(['ORGANIZER']), inviteHandlers.listTripParticipantInvites);
+  router.post(
+    '/:tripId/invites/:inviteId/revoke',
+    requireTripRole(['ORGANIZER']),
+    inviteHandlers.revokeParticipantInvite
+  );
+
   // Participants
   router.post('/:tripId/participants', requireTripRole(['ORGANIZER']), addParticipant);
+  router.post(
+    '/:tripId/participants/:participantId/invites',
+    requireTripRole(['ORGANIZER']),
+    inviteHandlers.createParticipantInvite
+  );
   router.patch(
     '/:tripId/participants/:participantId',
     requireTripRole(['ORGANIZER']),

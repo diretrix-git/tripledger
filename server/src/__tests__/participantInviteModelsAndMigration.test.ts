@@ -1355,6 +1355,7 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
       expect(preAudit.auditReport.participantsTripUserPartialIndexPresent).toBe(false);
       expect(preAudit.auditReport.usersVerificationTokenPartialIndexPresent).toBe(false);
       expect(preAudit.auditReport.rateLimitBucketIndexesPresent).toBe(false);
+      expect(preAudit.auditReport.participantInvitesIndexesPresent).toBe(false);
 
       const migrated = await runParticipantMigrationCli([], TEST_DB_URI);
       expect(migrated.mode).toBe('migrate');
@@ -1365,6 +1366,7 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
         expect(migrated.auditReport.participantsTripUserPartialIndexPresent).toBe(true);
         expect(migrated.auditReport.usersVerificationTokenPartialIndexPresent).toBe(true);
         expect(migrated.auditReport.rateLimitBucketIndexesPresent).toBe(true);
+        expect(migrated.auditReport.participantInvitesIndexesPresent).toBe(true);
       }
 
       // Repeat execution is idempotent

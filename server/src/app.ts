@@ -95,7 +95,13 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
     })
   );
   app.use('/api/v1/dashboard', dashboardRouter);
-  app.use('/api/v1/trips', createTripRouter({ rateLimiters: tripRateLimiters }));
+  app.use(
+    '/api/v1/trips',
+    createTripRouter({
+      rateLimiters: tripRateLimiters,
+      emailDeliveryService: options.emailDeliveryService,
+    })
+  );
   app.use('/api/v1/shared', publicSharedRouter);
 
   app.use(errorHandler);

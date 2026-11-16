@@ -1,5 +1,5 @@
 import nodemailer, { type Transporter } from 'nodemailer';
-import { type EmailDeliveryProvider } from '@tripledger/shared';
+import { type EmailDeliveryProvider, type TripRole } from '@tripledger/shared';
 import { env, validateClientUrl, validateEmailConfig, type EnvConfig } from '../config/env.js';
 import { AppError } from '../utils/http.js';
 import { redactSensitiveText } from '../utils/redact.js';
@@ -9,6 +9,15 @@ export interface VerificationEmailRequest {
   recipientName: string;
   rawToken: string;
   expiresInMinutes: number;
+}
+
+export interface ParticipantInviteEmailRequest {
+  to: string;
+  recipientName?: string;
+  tripName: string;
+  grantedRole: TripRole;
+  rawToken: string;
+  expiresInHours: number;
 }
 
 export interface EmailDeliveryResult {
@@ -23,6 +32,7 @@ export interface CapturedEmailMessage {
   text: string;
   html: string;
   verificationUrl: string;
+  inviteUrl?: string;
   sentAt: Date;
 }
 
@@ -43,17 +53,34 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
-export function buildEmailVerificationUrl(
+function buildClientActionUrl(
   clientUrl: string,
+  subpath: string,
   rawToken: string,
   nodeEnv: string
 ): string {
   const baseUrl = validateClientUrl(clientUrl, nodeEnv);
   const basePath = baseUrl.pathname.replace(/\/+$/, '');
   const target = new URL(baseUrl.origin);
-  target.pathname = `${basePath}/verify-email`;
+  target.pathname = `${basePath}${subpath}`;
   target.searchParams.set('token', rawToken);
   return target.toString();
+}
+
+export function buildEmailVerificationUrl(
+  clientUrl: string,
+  rawToken: string,
+  nodeEnv: string
+): string {
+  return buildClientActionUrl(clientUrl, '/verify-email', rawToken, nodeEnv);
+}
+
+export function buildParticipantInviteUrl(
+  clientUrl: string,
+  rawToken: string,
+  nodeEnv: string
+): string {
+  return buildClientActionUrl(clientUrl, '/invites/claim', rawToken, nodeEnv);
 }
 
 function redactSecrets(message: string, secrets: readonly string[]): string {
@@ -84,6 +111,36 @@ function composeVerificationEmailPayload(
     `<p><a href="${escapedUrl}">Verify Email Address</a></p>`,
     `<p>This verification link expires in ${params.expiresInMinutes} minutes.</p>`,
     '<p>If you did not create a TripLedger account, you can safely ignore this email.</p>',
+  ].join('\n');
+
+  return { subject, text, html };
+}
+
+function composeParticipantInviteEmailPayload(
+  params: ParticipantInviteEmailRequest,
+  inviteUrl: string
+): { subject: string; text: string; html: string } {
+  const safeName = params.recipientName?.trim() || 'there';
+  const safeTripName = params.tripName.trim() || 'a TripLedger trip';
+  const subject = `TripLedger invitation: ${params.grantedRole} on "${safeTripName}"`;
+  const text = [
+    `Hi ${safeName},`,
+    '',
+    `You have been invited to claim your participant role (${params.grantedRole}) for "${safeTripName}" on TripLedger.`,
+    'You must sign in and verify this exact email address before accepting the invitation.',
+    `Invitation link (expires in ${params.expiresInHours} hours):`,
+    inviteUrl,
+    '',
+    'If you were not expecting this invitation, you can safely ignore this email.',
+  ].join('\n');
+
+  const html = [
+    `<p>Hi ${escapeHtml(safeName)},</p>`,
+    `<p>You have been invited to claim the role <strong>${escapeHtml(params.grantedRole)}</strong> for <strong>${escapeHtml(safeTripName)}</strong> on TripLedger.</p>`,
+    '<p>You must sign in with an account holding this exact verified email address before redeeming this invitation.</p>',
+    `<p><a href="${escapeHtml(inviteUrl)}">Accept Trip Invitation</a></p>`,
+    `<p>This single-use invitation link expires in ${params.expiresInHours} hours.</p>`,
+    '<p>If you were not expecting this invitation, you can safely ignore this email.</p>',
   ].join('\n');
 
   return { subject, text, html };
@@ -124,26 +181,7 @@ export class EmailDeliveryService {
   public async sendVerificationEmail(
     request: VerificationEmailRequest
   ): Promise<EmailDeliveryResult> {
-    if (
-      this.config.EMAIL_PROVIDER === 'DISABLED' ||
-      (this.config.NODE_ENV === 'production' && this.config.EMAIL_PROVIDER === 'MEMORY')
-    ) {
-      throw new AppError(
-        'Verification email delivery is unavailable.',
-        503,
-        'EMAIL_DELIVERY_FAILED'
-      );
-    }
-
-    try {
-      validateEmailConfig(this.config);
-    } catch {
-      throw new AppError(
-        'Verification email delivery configuration is invalid.',
-        503,
-        'EMAIL_DELIVERY_FAILED'
-      );
-    }
+    this.assertDeliveryConfigured('Verification email');
 
     let verificationUrl: string;
     try {
@@ -161,24 +199,105 @@ export class EmailDeliveryService {
     }
 
     const composed = composeVerificationEmailPayload(request, verificationUrl);
-    const secretsToScrub = [
-      request.rawToken,
+    return this.dispatchEmail({
+      to: request.to,
+      subject: composed.subject,
+      text: composed.text,
+      html: composed.html,
       verificationUrl,
-      this.config.SMTP_PASS,
-      this.config.EMAIL_WEBHOOK_API_KEY,
-    ];
+      secretsToScrub: [
+        request.rawToken,
+        verificationUrl,
+        this.config.SMTP_PASS,
+        this.config.EMAIL_WEBHOOK_API_KEY,
+      ],
+      label: 'verification email',
+    });
+  }
 
+  public async sendParticipantInviteEmail(
+    request: ParticipantInviteEmailRequest
+  ): Promise<EmailDeliveryResult> {
+    this.assertDeliveryConfigured('Invitation email');
+
+    let inviteUrl: string;
+    try {
+      inviteUrl = buildParticipantInviteUrl(
+        this.config.CLIENT_URL,
+        request.rawToken,
+        this.config.NODE_ENV
+      );
+    } catch {
+      throw new AppError(
+        'Invitation link configuration is invalid.',
+        503,
+        'EMAIL_DELIVERY_FAILED'
+      );
+    }
+
+    const composed = composeParticipantInviteEmailPayload(request, inviteUrl);
+    return this.dispatchEmail({
+      to: request.to,
+      subject: composed.subject,
+      text: composed.text,
+      html: composed.html,
+      verificationUrl: '',
+      inviteUrl,
+      secretsToScrub: [
+        request.rawToken,
+        inviteUrl,
+        this.config.SMTP_PASS,
+        this.config.EMAIL_WEBHOOK_API_KEY,
+      ],
+      label: 'invitation email',
+    });
+  }
+
+  private assertDeliveryConfigured(purposeLabel: string): void {
+    if (
+      this.config.EMAIL_PROVIDER === 'DISABLED' ||
+      (this.config.NODE_ENV === 'production' && this.config.EMAIL_PROVIDER === 'MEMORY')
+    ) {
+      throw new AppError(
+        `${purposeLabel} delivery is unavailable.`,
+        503,
+        'EMAIL_DELIVERY_FAILED'
+      );
+    }
+
+    try {
+      validateEmailConfig(this.config);
+    } catch {
+      throw new AppError(
+        `${purposeLabel} delivery configuration is invalid.`,
+        503,
+        'EMAIL_DELIVERY_FAILED'
+      );
+    }
+  }
+
+  private async dispatchEmail(params: {
+    to: string;
+    subject: string;
+    text: string;
+    html: string;
+    verificationUrl: string;
+    inviteUrl?: string;
+    secretsToScrub: readonly string[];
+    label: string;
+  }): Promise<EmailDeliveryResult> {
     if (this.config.EMAIL_PROVIDER === 'MEMORY') {
       if (this.outbox.length >= MAX_MEMORY_OUTBOX_ENTRIES) {
         this.outbox.shift();
       }
       this.outbox.push({
-        to: request.to,
+        to: params.to,
         from: this.config.EMAIL_FROM,
-        subject: composed.subject,
-        text: composed.text,
-        html: composed.html,
-        verificationUrl,
+        subject: params.subject,
+        text: params.text,
+        html: params.html,
+        verificationUrl: params.verificationUrl,
+        ...(params.inviteUrl ? { inviteUrl: params.inviteUrl } : {}),
         sentAt: new Date(),
       });
       return { provider: 'MEMORY' };
@@ -189,10 +308,10 @@ export class EmailDeliveryService {
         const transporter = this.smtpTransporterFactory(this.config);
         const info = await transporter.sendMail({
           from: this.config.EMAIL_FROM,
-          to: request.to,
-          subject: composed.subject,
-          text: composed.text,
-          html: composed.html,
+          to: params.to,
+          subject: params.subject,
+          text: params.text,
+          html: params.html,
         });
         return {
           provider: 'SMTP',
@@ -201,11 +320,11 @@ export class EmailDeliveryService {
       } catch (err) {
         const safeReason = redactSecrets(
           err instanceof Error ? err.message : 'SMTP error',
-          secretsToScrub
+          params.secretsToScrub
         );
-        console.error('[TripLedger Email] SMTP verification delivery failed:', safeReason);
+        console.error(`[TripLedger Email] SMTP ${params.label} delivery failed:`, safeReason);
         throw new AppError(
-          'Unable to deliver verification email at this time. Please try again later.',
+          `Unable to deliver ${params.label} at this time. Please try again later.`,
           503,
           'EMAIL_DELIVERY_FAILED'
         );
@@ -228,10 +347,10 @@ export class EmailDeliveryService {
           },
           body: JSON.stringify({
             from: this.config.EMAIL_FROM,
-            to: request.to,
-            subject: composed.subject,
-            text: composed.text,
-            html: composed.html,
+            to: params.to,
+            subject: params.subject,
+            text: params.text,
+            html: params.html,
           }),
           signal: controller.signal,
         });
@@ -248,11 +367,11 @@ export class EmailDeliveryService {
       } catch (err) {
         const safeReason = redactSecrets(
           err instanceof Error ? err.message : 'Webhook delivery error',
-          secretsToScrub
+          params.secretsToScrub
         );
-        console.error('[TripLedger Email] Webhook verification delivery failed:', safeReason);
+        console.error(`[TripLedger Email] Webhook ${params.label} delivery failed:`, safeReason);
         throw new AppError(
-          'Unable to deliver verification email at this time. Please try again later.',
+          `Unable to deliver ${params.label} at this time. Please try again later.`,
           503,
           'EMAIL_DELIVERY_FAILED'
         );

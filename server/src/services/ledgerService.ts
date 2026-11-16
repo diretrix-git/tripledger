@@ -33,7 +33,7 @@ export async function logTripActivity(params: {
   actorParticipantId?: mongoose.Types.ObjectId | string | null;
   actorName: string;
   actionType: string;
-  entityType: 'TRIP' | 'PARTICIPANT' | 'FAMILY' | 'EXPENSE' | 'SETTLEMENT';
+  entityType: 'TRIP' | 'PARTICIPANT' | 'PARTICIPANT_INVITE' | 'FAMILY' | 'EXPENSE' | 'SETTLEMENT';
   entityId: mongoose.Types.ObjectId | string;
   summary: string;
   metadata?: Record<string, unknown>;
