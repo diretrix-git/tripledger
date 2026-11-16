@@ -1,16 +1,32 @@
+import path from 'path';
+import { pathToFileURL } from 'url';
 import { createApp } from './app.js';
 import { connectDatabase } from './config/database.js';
-import { env } from './config/env.js';
+import { env, validateProductionStartupConfig, type EnvConfig } from './config/env.js';
 
-async function bootstrap() {
-  await connectDatabase();
-  const app = createApp();
-  app.listen(env.PORT, () => {
-    console.log(`[TripLedger Server] Running on http://localhost:${env.PORT}`);
+export async function bootstrap(
+  config: EnvConfig = env,
+  deps: {
+    connectDb?: () => Promise<void>;
+    createAppFn?: typeof createApp;
+  } = {}
+): Promise<void> {
+  // Validate production email delivery, HTTPS CLIENT_URL, proxy/rate-limit topology, and JWT secrets BEFORE connecting or listening.
+  validateProductionStartupConfig(config);
+  await (deps.connectDb ? deps.connectDb() : connectDatabase());
+  const app = (deps.createAppFn ?? createApp)();
+  app.listen(config.PORT, () => {
+    console.log(`[TripLedger Server] Running on http://localhost:${config.PORT}`);
   });
 }
 
-bootstrap().catch((err) => {
-  console.error('[TripLedger Server] Fatal startup error:', err);
-  process.exit(1);
-});
+const isEntrypoint =
+  typeof process.argv[1] === 'string' &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isEntrypoint) {
+  bootstrap().catch((err) => {
+    console.error('[TripLedger Server] Fatal startup error:', err);
+    process.exit(1);
+  });
+}

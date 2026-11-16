@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import { EMAIL_VERIFICATION_TTL_MINUTES } from '@tripledger/shared';
 import { env } from '../config/env.js';
 
 export interface AccessTokenPayload {
@@ -47,4 +48,19 @@ export function generateInviteCode(length = 8): string {
 
 export function generateShareToken(): string {
   return crypto.randomBytes(24).toString('base64url');
+}
+
+export interface GeneratedVerificationToken {
+  rawToken: string;
+  tokenHash: string;
+  expiresAt: Date;
+}
+
+export function generateEmailVerificationToken(
+  ttlMinutes = EMAIL_VERIFICATION_TTL_MINUTES
+): GeneratedVerificationToken {
+  const rawToken = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashToken(rawToken);
+  const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+  return { rawToken, tokenHash, expiresAt };
 }
