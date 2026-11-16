@@ -19,6 +19,7 @@ export function isPrivilegedTripRole(role: TripRole): role is PrivilegedTripRole
 export const DEFAULT_PARTICIPANT_INVITE_TTL_HOURS = 48;
 export const MAX_PARTICIPANT_INVITE_TTL_HOURS = 168;
 export const EMAIL_VERIFICATION_TTL_MINUTES = 30;
+export const EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
 
 export const EMAIL_DELIVERY_PROVIDERS = ['DISABLED', 'MEMORY', 'SMTP', 'WEBHOOK'] as const;
 export type EmailDeliveryProvider = (typeof EMAIL_DELIVERY_PROVIDERS)[number];

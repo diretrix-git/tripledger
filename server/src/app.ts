@@ -28,6 +28,9 @@ export interface CreateAppOptions {
     tripJoin?: number;
   };
   emailDeliveryService?: EmailDeliveryService;
+  resendCooldownMs?: number;
+  resendWindowMs?: number;
+  now?: () => number;
 }
 
 export function createApp(options: CreateAppOptions = {}): express.Application {
@@ -85,6 +88,10 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
     createAuthRouter({
       emailDeliveryService: options.emailDeliveryService,
       rateLimiters: authRateLimiters,
+      resendCooldownMs: options.resendCooldownMs,
+      resendWindowMs: options.resendWindowMs,
+      resendMaxPerWindow: options.authRateLimitMaxOverrides?.resendVerification,
+      now: options.now,
     })
   );
   app.use('/api/v1/dashboard', dashboardRouter);

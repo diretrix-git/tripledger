@@ -44,6 +44,9 @@ Stores registered platform accounts. Note that trip participants do not need a `
 - `emailVerifiedAt`: `Date` (nullable)
 - `emailVerificationTokenHash`: `String` (`select: false`, nullable, 64-char SHA-256 hex digest)
 - `emailVerificationExpiresAt`: `Date` (`select: false`, nullable)
+- `emailVerificationLastSentAt`: `Date` (`select: false`, nullable — tracks last successful verification email send for atomic 60-second cooldown)
+- `emailVerificationResendWindowStart`: `Date` (`select: false`, nullable — start of 15-minute successful resend quota window)
+- `emailVerificationResendCount`: `Number` (`select: false`, default: `0` — successful resend count in active window; rolled back on delivery failure)
 - `passwordHash`: `String` (required, `select: false`)
 - `phone`: `String` (optional)
 - `defaultCurrency`: `String` (default: `'NPR'`)
@@ -231,7 +234,7 @@ Shared fixed-window HTTP rate-limit counter buckets when `RATE_LIMIT_STORE=mongo
 - **Application-enforced (`@tripledger/shared` & Mongoose models):** `ParticipantInvite` privileged-role verified-email requirements, expiration checks, SHA-256 hash format checks, immutable policy-field guards on document/query updates, single-use/revocation consistency, and `Trip.defaultInviteRole = 'PARTICIPANT'`. Direct MongoDB shell/driver writes bypass Mongoose validation and hooks.
 
 ### Registered Migration Commands (`migrateParticipantUserIndex`)
-All migration CLI runs connect with `autoIndex: false` so read-only audits never create indexes and duplicate/malformed audits execute strictly prior to index DDL.
+All migration CLI runs connect with `autoIndex: false` so read-only audits never create indexes and duplicate/malformed audits execute strictly prior to index DDL. Note that when Mongoose `autoIndex` is disabled in production, application startup (`bootstrap`) only runs `ensureRateLimitIndexes()` for `rate_limit_buckets` and does **not** automatically build `users.emailVerificationTokenHash_partial_unique` or `participants.tripId_1_userId_partial_unique`. Operators must explicitly run the migration and audit commands against target `MONGODB_URI` (committing migration code alone does not modify live databases).
 
 - **Production (requires prior `npm run build`):**
   - Read-only pre-flight audit: `npm run migrate:participant-audit` (`node dist/migrations/migrateParticipantUserIndex.js --audit-only`)
@@ -241,10 +244,10 @@ All migration CLI runs connect with `autoIndex: false` so read-only audits never
   - Execute migration & default backfill: `npm run migrate:participant-user-index:dev`
 
 ### Required Production Rollout Sequence
-1. **Audit (read-only):** Build the server (`npm run build:shared && npm run build:server`) and run `npm run migrate:participant-audit` against the target `MONGODB_URI`. Review `unverifiedUsersCount`, `unlinkedPrivilegedGuestsWithEmailCount`, and `nonCreatorUnverifiedPrivilegedLinks`.
-2. **Resolve duplicate or malformed records manually:** If a dry/migration run reports duplicate `(tripId, userId)` `Participant` pairs or malformed non-ObjectId `userId` entries, it **aborts before changing indexes** and never automatically deletes or merges participant rows. Operators must manually inspect and reconcile any `ExpensePayment`, `ExpenseShare`, `Settlement`, `Family.representativeId`, and `ActivityLog` references before removing or consolidating duplicate rows.
-3. **Run migration:** Execute `npm run migrate:participant-user-index`. This safely creates `tripId_1_userId_partial_unique`, verifies readiness, drops only the legacy non-unique `tripId_1_userId_1` index, normalizes empty-string `userId` fields to `null`, initializes missing `User.emailVerified: false` (never auto-verifying legacy accounts), and initializes missing `Trip.inviteEnabled: true` / `Trip.defaultInviteRole: 'PARTICIPANT'`.
-4. **Verify indexes & state:** Re-run `npm run migrate:participant-audit` and confirm `tripId_1_userId_partial_unique` exists and `tripId_1_userId_1` is absent (repeating the migration is idempotent).
-5. **Deploy application code:** Start/roll out the updated server processes (`npm start`).
+1. **Audit (read-only):** Build the server (`npm run build:shared && npm run build:server`) and run `npm run migrate:participant-audit` against the target `MONGODB_URI`. Review `unverifiedUsersCount`, `unlinkedPrivilegedGuestsWithEmailCount`, `nonCreatorUnverifiedPrivilegedLinks`, and the read-only index presence flags (`participantsTripUserPartialIndexPresent`, `usersVerificationTokenPartialIndexPresent`, `rateLimitBucketIndexesPresent`).
+2. **Resolve duplicate or malformed records manually:** If a dry/migration run reports duplicate `(tripId, userId)` `Participant` pairs, duplicate non-empty `Users.emailVerificationTokenHash` values, or malformed non-ObjectId `userId` entries, it **aborts before changing indexes** and never automatically deletes or merges rows. Operators must manually inspect and reconcile any `ExpensePayment`, `ExpenseShare`, `Settlement`, `Family.representativeId`, and `ActivityLog` references before removing or consolidating duplicate rows.
+3. **Run migration:** Execute `npm run migrate:participant-user-index`. This safely creates `participants.tripId_1_userId_partial_unique`, verifies readiness, drops only the legacy non-unique `tripId_1_userId_1` index, ensures `users.emailVerificationTokenHash_partial_unique` and `rate_limit_buckets` unique/TTL indexes exist (safe with `autoIndex: false`), normalizes empty-string `userId` / `emailVerificationTokenHash` fields to `null`, initializes missing `User.emailVerified: false` (never auto-verifying legacy accounts), and initializes missing `Trip.inviteEnabled: true` / `Trip.defaultInviteRole: 'PARTICIPANT'`.
+4. **Verify indexes & state:** Re-run `npm run migrate:participant-audit` and confirm all three index presence booleans report `true` and `tripId_1_userId_1` is absent (repeating the migration is idempotent).
+5. **Deploy application code:** Validate environment configuration (`NODE_ENV=production`, `https://` non-loopback `CLIENT_URL`, `EMAIL_PROVIDER=SMTP|WEBHOOK`, `RATE_LIMIT_STORE=mongo`, valid `TRUST_PROXY`, strong `JWT_*_SECRET`s) and start the updated server processes (`npm start`).
 
 *(Note for Phases 3–4: `TripSummaryEntity.inviteCode` remains required during Phase 1 for client compatibility; when Phase 3 restricts `inviteCode` visibility to `ORGANIZER` responses, narrow `TripSummaryEntity.inviteCode` to optional alongside guarding client UI callers.)*

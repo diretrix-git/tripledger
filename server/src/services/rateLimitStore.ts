@@ -281,8 +281,10 @@ export function createAuthRateLimiters(params: {
     resendVerification: createConfiguredRateLimiter({
       prefix: 'auth-resend-verification:',
       windowMs,
-      limit:
-        params.maxOverrides?.resendVerification ?? cfg.AUTH_RESEND_VERIFICATION_RATE_LIMIT_MAX,
+      limit: Math.max(
+        (params.maxOverrides?.resendVerification ?? cfg.AUTH_RESEND_VERIFICATION_RATE_LIMIT_MAX) * 4,
+        20
+      ),
       storeType: params.storeType,
       enabled: params.enabled,
       keyGenerator: (req) => (req.user?.userId ? `user:${req.user.userId}` : 'anonymous'),

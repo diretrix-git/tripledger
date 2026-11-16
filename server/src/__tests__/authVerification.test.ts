@@ -247,7 +247,19 @@ describe('Phase 2 Commit 2: Email verification lifecycle, live DB checks & multi
     const accessToken = reg.body.data.accessToken as string;
     const firstToken = extractTokenFromOutboxUrl(getTestEmailOutbox()[0].verificationUrl);
 
-    // Resend invalidates firstToken
+    // Immediate resend right after registration is gated by the 60s cooldown
+    const tooEarlyResend = await request(app)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${accessToken}`);
+    expect(tooEarlyResend.status).toBe(429);
+    expect(tooEarlyResend.body.error.code).toBe('VERIFICATION_RESEND_COOLDOWN');
+    expect(Number(tooEarlyResend.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+
+    // Advance past 60s cooldown -> resend rotates and invalidates firstToken
+    await UserModel.updateOne(
+      { _id: reg.body.data.user.id },
+      { $set: { emailVerificationLastSentAt: new Date(Date.now() - 61_000) } }
+    );
     const resend = await request(app)
       .post('/api/v1/auth/resend-verification')
       .set('Authorization', `Bearer ${accessToken}`);
@@ -387,5 +399,187 @@ describe('Phase 2 Commit 2: Email verification lifecycle, live DB checks & multi
     });
     expect(l3.status).toBe(429);
     expect(l3.body.error.code).toBe('RATE_LIMITED');
+  });
+
+  it('M-03: enforces atomic 60s resend cooldown at exact boundary, serializes concurrent resends, preserves rollback vs newer resend, and excludes 503 failures from quota', async () => {
+    let clockMs = 1_700_000_000_000;
+    const nowFn = () => clockMs;
+
+    const appA = createApp({
+      enableRateLimitInTest: true,
+      rateLimitStoreOverride: 'mongo',
+      now: nowFn,
+    });
+    const appB = createApp({
+      enableRateLimitInTest: true,
+      rateLimitStoreOverride: 'mongo',
+      now: nowFn,
+    });
+
+    const reg = await request(appA).post('/api/v1/auth/register').send({
+      name: 'Cooldown Tester',
+      email: 'cooldown@example.com',
+      password: 'Password123',
+    });
+    expect(reg.status).toBe(201);
+    const accessToken = reg.body.data.accessToken as string;
+    const userId = reg.body.data.user.id as string;
+
+    // 1. Immediate repeat request blocked across instances with 429 & Retry-After
+    const immediate = await request(appB)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${accessToken}`);
+    expect(immediate.status).toBe(429);
+    expect(immediate.body.error.code).toBe('VERIFICATION_RESEND_COOLDOWN');
+    expect(immediate.headers['retry-after']).toBe('60');
+
+    // 2. Exact boundary checks: 59,999ms -> 429 (Retry-After: 1); 60,000ms -> 200
+    clockMs += 59_999;
+    const at59999 = await request(appB)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${accessToken}`);
+    expect(at59999.status).toBe(429);
+    expect(at59999.body.error.code).toBe('VERIFICATION_RESEND_COOLDOWN');
+    expect(at59999.headers['retry-after']).toBe('1');
+    expect(getTestEmailOutbox()).toHaveLength(1);
+
+    clockMs += 1; // Exactly 60,000ms elapsed
+    const at60000 = await request(appB)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${accessToken}`);
+    expect(at60000.status).toBe(200);
+    expect(at60000.body.data.sent).toBe(true);
+    expect(getTestEmailOutbox()).toHaveLength(2);
+
+    // 3. Concurrent bursts after cooldown: strictly 1 winner rotates token, 4 losers get 429 with Retry-After
+    clockMs += 60_000;
+    const beforeConcurrentOutboxCount = getTestEmailOutbox().length;
+    const burst = await Promise.all([
+      request(appA).post('/api/v1/auth/resend-verification').set('Authorization', `Bearer ${accessToken}`),
+      request(appB).post('/api/v1/auth/resend-verification').set('Authorization', `Bearer ${accessToken}`),
+      request(appA).post('/api/v1/auth/resend-verification').set('Authorization', `Bearer ${accessToken}`),
+      request(appB).post('/api/v1/auth/resend-verification').set('Authorization', `Bearer ${accessToken}`),
+      request(appA).post('/api/v1/auth/resend-verification').set('Authorization', `Bearer ${accessToken}`),
+    ]);
+    const burstStatuses = burst.map((r) => r.status).sort((a, b) => a - b);
+    expect(burstStatuses).toEqual([200, 429, 429, 429, 429]);
+    for (const r of burst.filter((x) => x.status === 429)) {
+      expect(r.body.error.code).toBe('VERIFICATION_RESEND_COOLDOWN');
+      expect(Number(r.headers['retry-after'])).toBe(60);
+    }
+    expect(getTestEmailOutbox()).toHaveLength(beforeConcurrentOutboxCount + 1);
+    const dbAfterBurst = await UserModel.findById(userId).select('+emailVerificationResendCount');
+    expect(dbAfterBurst?.emailVerificationResendCount).toBe(2);
+
+    // 4. Slow delivery failure rollback racing with a newer successful resend NEVER overwrites newer token or cooldown
+    let rejectSlowDelivery!: (err: Error) => void;
+    let slowStartedResolve!: () => void;
+    const slowStarted = new Promise<void>((resolve) => {
+      slowStartedResolve = resolve;
+    });
+    const slowFailingDelivery = {
+      sendVerificationEmail: vi.fn(
+        () =>
+          new Promise<never>((_resolve, reject) => {
+            rejectSlowDelivery = reject;
+            slowStartedResolve();
+          })
+      ),
+    } as unknown as EmailDeliveryService;
+
+    const appSlowFail = createApp({
+      emailDeliveryService: slowFailingDelivery,
+      now: nowFn,
+    });
+
+    clockMs += 60_000;
+    const slowPromise = request(appSlowFail)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .then((res) => res);
+    await slowStarted;
+
+    // While slow request A is still in flight, advance past 60s and let newer resend B succeed
+    clockMs += 60_000;
+    const newerSuccess = await request(appA)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${accessToken}`);
+    expect(newerSuccess.status).toBe(200);
+    const newerToken = extractTokenFromOutboxUrl(
+      getTestEmailOutbox()[getTestEmailOutbox().length - 1].verificationUrl
+    );
+    const userAfterNewer = await UserModel.findById(userId).select(
+      '+emailVerificationTokenHash +emailVerificationLastSentAt'
+    );
+    const newerHash = userAfterNewer!.emailVerificationTokenHash!;
+    const newerSentAtMs = userAfterNewer!.emailVerificationLastSentAt!.getTime();
+
+    // Now older slow delivery rejects -> rollback must match 0 docs and keep newerHash + newerSentAtMs intact
+    rejectSlowDelivery(
+      new (await import('../utils/http.js')).AppError(
+        'SMTP timeout',
+        503,
+        'EMAIL_DELIVERY_FAILED'
+      )
+    );
+    const slowRes = await slowPromise;
+    expect(slowRes.status).toBe(503);
+
+    const userAfterLateRollback = await UserModel.findById(userId).select(
+      '+emailVerificationTokenHash +emailVerificationLastSentAt'
+    );
+    expect(userAfterLateRollback?.emailVerificationTokenHash).toBe(newerHash);
+    expect(userAfterLateRollback?.emailVerificationLastSentAt?.getTime()).toBe(newerSentAtMs);
+
+    // 5. Provider 503 failures do not penalize 60s cooldown or 5-per-15m quota
+    const failingMailer = new EmailDeliveryService(
+      buildEnvConfig({ NODE_ENV: 'development', EMAIL_PROVIDER: 'DISABLED' })
+    );
+    const appFailQuota = createApp({
+      enableRateLimitInTest: true,
+      rateLimitStoreOverride: 'mongo',
+      emailDeliveryService: failingMailer,
+      now: nowFn,
+    });
+
+    const regQuota = await request(appA).post('/api/v1/auth/register').send({
+      name: 'Quota User',
+      email: 'quota@example.com',
+      password: 'Password123',
+    });
+    const quotaToken = regQuota.body.data.accessToken as string;
+
+    // Advance 61s after registration, then fail 6 consecutive times with 503
+    clockMs += 61_000;
+    for (let i = 0; i < 6; i++) {
+      const failAttempt = await request(appFailQuota)
+        .post('/api/v1/auth/resend-verification')
+        .set('Authorization', `Bearer ${quotaToken}`);
+      expect(failAttempt.status).toBe(503);
+      expect(failAttempt.body.error.code).toBe('EMAIL_DELIVERY_FAILED');
+    }
+
+    // Immediate next 5 successful deliveries (spaced 60s apart inside same 15-min window) ALL succeed!
+    for (let i = 0; i < 5; i++) {
+      const okAttempt = await request(appA)
+        .post('/api/v1/auth/resend-verification')
+        .set('Authorization', `Bearer ${quotaToken}`);
+      expect(okAttempt.status).toBe(200);
+      clockMs += 60_000;
+    }
+
+    // 6th successful send in the same 15-minute window is blocked with 429 RATE_LIMITED + Retry-After
+    const sixthSend = await request(appA)
+      .post('/api/v1/auth/resend-verification')
+      .set('Authorization', `Bearer ${quotaToken}`);
+    expect(sixthSend.status).toBe(429);
+    expect(sixthSend.body.error.code).toBe('RATE_LIMITED');
+    expect(Number(sixthSend.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+
+    // Newer token from race scenario remains valid and verifies account cleanly
+    const verifyNewer = await request(appA)
+      .post('/api/v1/auth/verify-email')
+      .send({ token: newerToken });
+    expect(verifyNewer.status).toBe(200);
   });
 });

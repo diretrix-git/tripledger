@@ -8,6 +8,9 @@ export interface IUser extends Document {
   emailVerifiedAt?: Date | null;
   emailVerificationTokenHash?: string | null;
   emailVerificationExpiresAt?: Date | null;
+  emailVerificationLastSentAt?: Date | null;
+  emailVerificationResendWindowStart?: Date | null;
+  emailVerificationResendCount?: number;
   passwordHash: string;
   phone?: string;
   defaultCurrency: string;
@@ -43,6 +46,9 @@ const userSchema = new Schema<IUser>(
       },
     },
     emailVerificationExpiresAt: { type: Date, select: false, default: null },
+    emailVerificationLastSentAt: { type: Date, select: false, default: null },
+    emailVerificationResendWindowStart: { type: Date, select: false, default: null },
+    emailVerificationResendCount: { type: Number, select: false, default: 0, min: 0 },
     passwordHash: { type: String, required: true, select: false },
     phone: { type: String, trim: true, maxlength: 25 },
     defaultCurrency: { type: String, default: 'NPR' },

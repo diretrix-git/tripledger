@@ -1320,6 +1320,12 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
     expect(postIndexes.map((i) => i.name).sort()).toEqual(['_id_', 'tripId_1_userId_1']);
     expect(postIndexes.some((i) => i.name === PARTICIPANT_TRIP_USER_INDEX_NAME)).toBe(false);
 
+    // Verify with autoIndex: false that users verification-token index is NOT created until explicit migration runs
+    const preUserIndexes = await postAuditDb.collection('users').indexes();
+    expect(
+      preUserIndexes.some((i) => i.name === 'emailVerificationTokenHash_partial_unique')
+    ).toBe(false);
+
     // Documents remain completely untouched (emailVerified still absent, userId still '')
     const rawUser = await postAuditDb.collection('users').findOne({ _id: unverifiedUserId });
     expect('emailVerified' in (rawUser ?? {})).toBe(false);
@@ -1327,5 +1333,48 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
       .collection('participants')
       .findOne({ name: 'Empty String Guest' });
     expect(rawEmptyGuest?.userId).toBe('');
+  });
+
+  it('autoIndex: false leaves users.emailVerificationTokenHash_partial_unique absent until migration applies it idempotently', async () => {
+    const db = mongoose.connection.db!;
+    await db.dropDatabase();
+
+    // Seed un-migrated collections without indexes (simulating production DB before migration with autoIndex: false)
+    await db.collection('users').insertOne({
+      name: 'AutoIndex Check',
+      email: 'autoindex@example.com',
+      passwordHash: 'hash',
+      emailVerificationTokenHash: '',
+    });
+    await db.collection('participants').createIndex({ tripId: 1, userId: 1 }, { name: 'tripId_1_userId_1' });
+
+    await disconnectDatabase();
+    try {
+      const preAudit = await runParticipantMigrationCli(['--audit-only'], TEST_DB_URI);
+      expect(preAudit.mode).toBe('audit-only');
+      expect(preAudit.auditReport.participantsTripUserPartialIndexPresent).toBe(false);
+      expect(preAudit.auditReport.usersVerificationTokenPartialIndexPresent).toBe(false);
+      expect(preAudit.auditReport.rateLimitBucketIndexesPresent).toBe(false);
+
+      const migrated = await runParticipantMigrationCli([], TEST_DB_URI);
+      expect(migrated.mode).toBe('migrate');
+      if (migrated.mode === 'migrate') {
+        expect(migrated.userVerificationIndexReport.createdNewIndex).toBe(true);
+        expect(migrated.userVerificationIndexReport.verifiedNewIndexReady).toBe(true);
+        expect(migrated.userVerificationIndexReport.cleanedEmptyStringTokenCount).toBe(1);
+        expect(migrated.auditReport.participantsTripUserPartialIndexPresent).toBe(true);
+        expect(migrated.auditReport.usersVerificationTokenPartialIndexPresent).toBe(true);
+        expect(migrated.auditReport.rateLimitBucketIndexesPresent).toBe(true);
+      }
+
+      // Repeat execution is idempotent
+      const repeat = await runParticipantMigrationCli([], TEST_DB_URI);
+      if (repeat.mode === 'migrate') {
+        expect(repeat.userVerificationIndexReport.createdNewIndex).toBe(false);
+        expect(repeat.userVerificationIndexReport.verifiedNewIndexReady).toBe(true);
+      }
+    } finally {
+      await connectDatabase(TEST_DB_URI);
+    }
   });
 });

@@ -7,6 +7,11 @@ import {
   PARTICIPANT_TRIP_USER_INDEX_NAME,
   ParticipantModel,
 } from '../models/Participant.js';
+import {
+  USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME,
+  UserModel,
+} from '../models/User.js';
+import { ensureRateLimitIndexes } from '../services/rateLimitStore.js';
 
 export interface DuplicateTripUserAuditEntry {
   tripId: string;
@@ -33,6 +38,13 @@ export interface ParticipantUserIndexMigrationReport {
   droppedLegacyIndexNames: string[];
 }
 
+export interface UserVerificationTokenIndexMigrationReport {
+  cleanedEmptyStringTokenCount: number;
+  duplicateTokenHashesCount: number;
+  createdNewIndex: boolean;
+  verifiedNewIndexReady: boolean;
+}
+
 export interface LegacyInviteDefaultsBackfillReport {
   updatedUsersCount: number;
   updatedTripsInviteEnabledCount: number;
@@ -53,6 +65,9 @@ export interface ParticipantLinkingRiskAuditReport {
   unlinkedGuestsWithEmailCount: number;
   unlinkedPrivilegedGuestsWithEmailCount: number;
   nonCreatorUnverifiedPrivilegedLinks: HistoricalPrivilegedLinkRiskEntry[];
+  participantsTripUserPartialIndexPresent: boolean;
+  usersVerificationTokenPartialIndexPresent: boolean;
+  rateLimitBucketIndexesPresent: boolean;
 }
 
 interface IndexInfo {
@@ -115,6 +130,59 @@ function isExpectedLegacyNonUniqueIndex(idx: IndexInfo): boolean {
     idx.expireAfterSeconds === undefined &&
     idx.collation === undefined
   );
+}
+
+function isUserVerificationTokenKey(key: Record<string, unknown> | undefined): boolean {
+  if (!key) return false;
+  const entries = Object.entries(key);
+  return (
+    entries.length === 1 &&
+    entries[0][0] === 'emailVerificationTokenHash' &&
+    entries[0][1] === 1
+  );
+}
+
+function isExpectedUserVerificationPartialFilter(expr: unknown): boolean {
+  if (!isPlainRecord(expr)) return false;
+  const topKeys = Object.keys(expr);
+  if (topKeys.length !== 1 || topKeys[0] !== 'emailVerificationTokenHash') {
+    return false;
+  }
+  const field = expr.emailVerificationTokenHash;
+  if (!isPlainRecord(field)) return false;
+  const fieldKeys = Object.keys(field).sort();
+  return (
+    fieldKeys.length === 2 &&
+    fieldKeys[0] === '$gt' &&
+    fieldKeys[1] === '$type' &&
+    field.$type === 'string' &&
+    field.$gt === ''
+  );
+}
+
+function isExpectedUserVerificationPartialIndex(idx: IndexInfo): boolean {
+  return (
+    idx.name === USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME &&
+    idx.unique === true &&
+    idx.sparse !== true &&
+    isUserVerificationTokenKey(idx.key) &&
+    isExpectedUserVerificationPartialFilter(idx.partialFilterExpression) &&
+    idx.expireAfterSeconds === undefined &&
+    idx.collation === undefined
+  );
+}
+
+async function listCollectionIndexesReadOnly(
+  db: NonNullable<mongoose.Connection['db']>,
+  collectionName: string
+): Promise<IndexInfo[]> {
+  const existing = await db
+    .listCollections({ name: collectionName }, { nameOnly: true })
+    .toArray();
+  if (existing.length === 0) {
+    return [];
+  }
+  return (await db.collection(collectionName).indexes()) as IndexInfo[];
 }
 
 async function ensureCollectionExists(collection: mongoose.Collection): Promise<void> {
@@ -318,6 +386,93 @@ export async function migrateParticipantUserIndex(
 }
 
 /**
+ * Safely ensures `users.emailVerificationTokenHash_partial_unique` exists even when Mongoose
+ * `autoIndex` is disabled in production. Aborts before DDL if duplicate non-empty hashes or
+ * conflicting index specifications exist.
+ */
+export async function migrateUserVerificationTokenIndex(
+  collection: mongoose.Collection = UserModel.collection
+): Promise<UserVerificationTokenIndexMigrationReport> {
+  await ensureCollectionExists(collection);
+
+  const duplicateHashes = await collection
+    .aggregate<{ _id: string; count: number }>([
+      { $match: { emailVerificationTokenHash: { $type: 'string', $gt: '' } } },
+      { $group: { _id: '$emailVerificationTokenHash', count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+    ])
+    .toArray();
+
+  if (duplicateHashes.length > 0) {
+    throw new Error(
+      `Cannot build ${USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME}: found ${duplicateHashes.length} duplicate verification token hash(es).`
+    );
+  }
+
+  const beforeIndexes = (await collection.indexes()) as IndexInfo[];
+  const existingTarget = beforeIndexes.find(
+    (idx) => idx.name === USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME
+  );
+
+  if (existingTarget && !isExpectedUserVerificationPartialIndex(existingTarget)) {
+    throw new Error(
+      `Existing index "${USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME}" has unexpected options and was not overwritten automatically.`
+    );
+  }
+
+  const unfamiliarTokenIndexes = beforeIndexes.filter(
+    (idx) =>
+      idx.name !== USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME &&
+      isUserVerificationTokenKey(idx.key)
+  );
+  if (unfamiliarTokenIndexes.length > 0) {
+    throw new Error(
+      `Cannot migrate ${USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME}: found unfamiliar index(es) on emailVerificationTokenHash: ${JSON.stringify(
+        unfamiliarTokenIndexes.map((idx) => idx.name)
+      )}`
+    );
+  }
+
+  let createdNewIndex = false;
+  if (!existingTarget) {
+    await collection.createIndex(
+      { emailVerificationTokenHash: 1 },
+      {
+        name: USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME,
+        unique: true,
+        partialFilterExpression: { emailVerificationTokenHash: { $type: 'string', $gt: '' } },
+      }
+    );
+    createdNewIndex = true;
+  }
+
+  const verifiedIndexes = (await collection.indexes()) as IndexInfo[];
+  const readyTarget = verifiedIndexes.find(
+    (idx) => idx.name === USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME
+  );
+  const verifiedNewIndexReady = Boolean(
+    readyTarget && isExpectedUserVerificationPartialIndex(readyTarget)
+  );
+  if (!verifiedNewIndexReady) {
+    throw new Error(
+      `Verification failed: index "${USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME}" was not ready after creation.`
+    );
+  }
+
+  const cleanupResult = await collection.updateMany(
+    { emailVerificationTokenHash: { $type: 'string', $regex: /^\s*$/ } },
+    { $set: { emailVerificationTokenHash: null } }
+  );
+
+  return {
+    cleanedEmptyStringTokenCount: cleanupResult.modifiedCount ?? 0,
+    duplicateTokenHashesCount: 0,
+    createdNewIndex,
+    verifiedNewIndexReady,
+  };
+}
+
+/**
  * Safely populates missing security defaults on legacy User and Trip documents.
  * Deliberately sets `emailVerified: false` on legacy accounts (never auto-verifies
  * unverified pre-migration accounts) and sets `defaultInviteRole: 'PARTICIPANT'`.
@@ -380,6 +535,9 @@ export async function auditParticipantLinkingRisks(
     unlinkedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsWithEmailCount,
     anomalousLinks,
+    participantIndexes,
+    userIndexes,
+    rateLimitIndexes,
   ] = await Promise.all([
     usersCol.countDocuments({ emailVerified: { $ne: true } }),
     participantsCol.countDocuments({
@@ -452,7 +610,22 @@ export async function auditParticipantLinkingRisks(
         },
       ])
       .toArray(),
+    listCollectionIndexesReadOnly(db, 'participants'),
+    listCollectionIndexesReadOnly(db, 'users'),
+    listCollectionIndexesReadOnly(db, 'rate_limit_buckets'),
   ]);
+
+  const participantsTripUserPartialIndexPresent = participantIndexes.some((idx) =>
+    isExpectedTargetPartialIndex(idx)
+  );
+  const usersVerificationTokenPartialIndexPresent = userIndexes.some((idx) =>
+    isExpectedUserVerificationPartialIndex(idx)
+  );
+  const rateLimitBucketsIndexesPresent =
+    rateLimitIndexes.some((idx) => idx.key?.key === 1 && idx.unique === true) &&
+    rateLimitIndexes.some(
+      (idx) => idx.key?.expiresAt === 1 && idx.expireAfterSeconds === 0
+    );
 
   return {
     unverifiedUsersCount,
@@ -466,6 +639,9 @@ export async function auditParticipantLinkingRisks(
       email: entry.email ?? null,
       userEmailVerified: Boolean(entry.userEmailVerified),
     })),
+    participantsTripUserPartialIndexPresent,
+    usersVerificationTokenPartialIndexPresent,
+    rateLimitBucketIndexesPresent: rateLimitBucketsIndexesPresent,
   };
 }
 
@@ -477,13 +653,14 @@ export async function runParticipantMigrationCli(
   | {
       mode: 'migrate';
       indexReport: ParticipantUserIndexMigrationReport;
+      userVerificationIndexReport: UserVerificationTokenIndexMigrationReport;
       backfillReport: LegacyInviteDefaultsBackfillReport;
       auditReport: ParticipantLinkingRiskAuditReport;
     }
 > {
   const args = new Set(argv);
   // Disable Mongoose background autoIndex so --audit-only never performs index DDL
-  // and migrateParticipantUserIndex always completes audits prior to index creation.
+  // and migrations always complete audits prior to index creation.
   await connectDatabase(uriOverride, { autoIndex: false });
   try {
     if (args.has('--audit-only')) {
@@ -493,14 +670,23 @@ export async function runParticipantMigrationCli(
     }
 
     const indexReport = await migrateParticipantUserIndex();
+    const userVerificationIndexReport = await migrateUserVerificationTokenIndex();
+    await ensureRateLimitIndexes();
     const backfillReport = await backfillInviteSecurityDefaults();
     const auditReport = await auditParticipantLinkingRisks();
     console.log('[TripLedger Migration] Participant user index migration complete:', {
       indexReport,
+      userVerificationIndexReport,
       backfillReport,
       auditReport,
     });
-    return { mode: 'migrate', indexReport, backfillReport, auditReport };
+    return {
+      mode: 'migrate',
+      indexReport,
+      userVerificationIndexReport,
+      backfillReport,
+      auditReport,
+    };
   } finally {
     await disconnectDatabase();
   }

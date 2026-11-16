@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { createAuthHandlers } from '../controllers/authController.js';
+import { createAuthHandlers, type AuthHandlersOptions } from '../controllers/authController.js';
 import { requireAuth } from '../middleware/auth.js';
 import type { EmailDeliveryService } from '../services/emailService.js';
 import {
@@ -11,10 +11,21 @@ import {
 export interface CreateAuthRouterOptions {
   emailDeliveryService?: EmailDeliveryService;
   rateLimiters?: AuthRateLimiters;
+  resendCooldownMs?: number;
+  resendWindowMs?: number;
+  resendMaxPerWindow?: number;
+  now?: () => number;
 }
 
 export function createAuthRouter(options: CreateAuthRouterOptions = {}): Router {
-  const handlers = createAuthHandlers(options.emailDeliveryService);
+  const handlerOpts: AuthHandlersOptions = {
+    emailDeliveryService: options.emailDeliveryService,
+    resendCooldownMs: options.resendCooldownMs,
+    resendWindowMs: options.resendWindowMs,
+    resendMaxPerWindow: options.resendMaxPerWindow,
+    now: options.now,
+  };
+  const handlers = createAuthHandlers(handlerOpts);
   const effective = resolveEffectiveRateLimitConfig();
   const limiters =
     options.rateLimiters ??

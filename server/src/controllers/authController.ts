@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import {
+  EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS,
   EMAIL_VERIFICATION_TTL_MINUTES,
   loginUserSchema,
   registerUserSchema,
@@ -50,9 +51,48 @@ export function formatAuthUser(user: IUser): AuthUserEntity {
   };
 }
 
+export interface AuthHandlersOptions {
+  emailDeliveryService?: EmailDeliveryService;
+  resendCooldownMs?: number;
+  resendWindowMs?: number;
+  resendMaxPerWindow?: number;
+  now?: () => number;
+}
+
+function resolveAuthHandlerOptions(
+  emailDeliveryOrOptions?: EmailDeliveryService | AuthHandlersOptions
+): Required<Omit<AuthHandlersOptions, 'emailDeliveryService'>> & {
+  emailDelivery: EmailDeliveryService;
+} {
+  const isServiceInstance =
+    emailDeliveryOrOptions !== undefined &&
+    typeof (emailDeliveryOrOptions as EmailDeliveryService).sendVerificationEmail === 'function';
+  const opts: AuthHandlersOptions = isServiceInstance
+    ? { emailDeliveryService: emailDeliveryOrOptions as EmailDeliveryService }
+    : ((emailDeliveryOrOptions as AuthHandlersOptions | undefined) ?? {});
+
+  return {
+    emailDelivery: opts.emailDeliveryService ?? defaultEmailDeliveryService,
+    resendCooldownMs:
+      opts.resendCooldownMs ?? EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS * 1000,
+    resendWindowMs: opts.resendWindowMs ?? env.AUTH_RATE_LIMIT_WINDOW_MS,
+    resendMaxPerWindow:
+      opts.resendMaxPerWindow ?? env.AUTH_RESEND_VERIFICATION_RATE_LIMIT_MAX,
+    now: opts.now ?? (() => Date.now()),
+  };
+}
+
 export function createAuthHandlers(
-  emailDelivery: EmailDeliveryService = defaultEmailDeliveryService
+  emailDeliveryOrOptions?: EmailDeliveryService | AuthHandlersOptions
 ) {
+  const {
+    emailDelivery,
+    resendCooldownMs,
+    resendWindowMs,
+    resendMaxPerWindow,
+    now: nowProvider,
+  } = resolveAuthHandlerOptions(emailDeliveryOrOptions);
+
   const register = asyncHandler(async (req: Request, res: Response) => {
     const parsed = registerUserSchema.parse(req.body);
 
@@ -73,6 +113,9 @@ export function createAuthHandlers(
         emailVerifiedAt: null,
         emailVerificationTokenHash: tokenHash,
         emailVerificationExpiresAt: expiresAt,
+        emailVerificationLastSentAt: null,
+        emailVerificationResendWindowStart: null,
+        emailVerificationResendCount: 0,
         passwordHash,
         phone: parsed.phone,
         defaultCurrency: 'NPR',
@@ -100,6 +143,8 @@ export function createAuthHandlers(
     });
     const refreshToken = signRefreshToken({ userId: user._id.toString() });
 
+    // Record successful verification send timestamp for the 60-second resend cooldown only AFTER delivery succeeds.
+    user.emailVerificationLastSentAt = new Date(nowProvider());
     user.refreshTokenHash = hashToken(refreshToken);
     await user.save();
 
@@ -193,7 +238,7 @@ export function createAuthHandlers(
     }
 
     const user = await UserModel.findById(req.user.userId).select(
-      '+emailVerificationTokenHash +emailVerificationExpiresAt'
+      '+emailVerificationTokenHash +emailVerificationExpiresAt +emailVerificationLastSentAt +emailVerificationResendWindowStart +emailVerificationResendCount'
     );
     if (!user) {
       throw new AppError('User account not found.', 404, 'USER_NOT_FOUND');
@@ -208,27 +253,96 @@ export function createAuthHandlers(
       return;
     }
 
+    const nowMs = nowProvider();
+    const nowDate = new Date(nowMs);
     const prevHash = user.emailVerificationTokenHash ?? null;
     const prevExpiresAt = user.emailVerificationExpiresAt ?? null;
+    const prevLastSentAt = user.emailVerificationLastSentAt ?? null;
+    const prevWindowStart = user.emailVerificationResendWindowStart ?? null;
+    const prevCount =
+      typeof user.emailVerificationResendCount === 'number'
+        ? user.emailVerificationResendCount
+        : 0;
+
+    if (prevLastSentAt !== null) {
+      const elapsedMs = nowMs - prevLastSentAt.getTime();
+      if (elapsedMs < resendCooldownMs) {
+        const retryAfterSeconds = Math.max(
+          1,
+          Math.ceil((resendCooldownMs - elapsedMs) / 1000)
+        );
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+        throw new AppError(
+          `Please wait ${retryAfterSeconds} seconds before requesting another verification email.`,
+          429,
+          'VERIFICATION_RESEND_COOLDOWN',
+          { retryAfterSeconds }
+        );
+      }
+    }
+
+    const isWindowActive =
+      prevWindowStart !== null && nowMs - prevWindowStart.getTime() < resendWindowMs;
+    const currentWindowCount = isWindowActive ? prevCount : 0;
+    if (currentWindowCount >= resendMaxPerWindow) {
+      const retryAfterSeconds = Math.max(
+        1,
+        Math.ceil((prevWindowStart!.getTime() + resendWindowMs - nowMs) / 1000)
+      );
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      throw new AppError(
+        'Too many verification email requests. Please try again later.',
+        429,
+        'RATE_LIMITED',
+        { retryAfterSeconds }
+      );
+    }
+
     const { rawToken, tokenHash, expiresAt } = generateEmailVerificationToken();
+    const cooldownCutoff = new Date(nowMs - resendCooldownMs);
+    const windowCutoff = new Date(nowMs - resendWindowMs);
+    const nextWindowStart = isWindowActive ? prevWindowStart! : nowDate;
+    const nextWindowCount = currentWindowCount + 1;
 
     const swapped = await UserModel.findOneAndUpdate(
       {
         _id: user._id,
         emailVerified: false,
         emailVerificationTokenHash: prevHash,
+        emailVerificationLastSentAt: prevLastSentAt,
+        $and: [
+          {
+            $or: [
+              { emailVerificationLastSentAt: null },
+              { emailVerificationLastSentAt: { $lte: cooldownCutoff } },
+            ],
+          },
+          {
+            $or: [
+              { emailVerificationResendWindowStart: null },
+              { emailVerificationResendWindowStart: { $lte: windowCutoff } },
+              { emailVerificationResendCount: { $exists: false } },
+              { emailVerificationResendCount: { $lt: resendMaxPerWindow } },
+            ],
+          },
+        ],
       },
       {
         $set: {
           emailVerificationTokenHash: tokenHash,
           emailVerificationExpiresAt: expiresAt,
+          emailVerificationLastSentAt: nowDate,
+          emailVerificationResendWindowStart: nextWindowStart,
+          emailVerificationResendCount: nextWindowCount,
         },
       },
       { new: true }
     );
 
     if (!swapped) {
-      const latest = await UserModel.findById(user._id);
+      const latest = await UserModel.findById(user._id).select(
+        '+emailVerificationLastSentAt +emailVerificationResendWindowStart +emailVerificationResendCount'
+      );
       if (latest?.emailVerified === true) {
         sendSuccess(res, {
           sent: false,
@@ -236,6 +350,41 @@ export function createAuthHandlers(
           emailVerified: true,
         });
         return;
+      }
+      if (latest?.emailVerificationLastSentAt) {
+        const elapsedMs = nowMs - latest.emailVerificationLastSentAt.getTime();
+        if (elapsedMs < resendCooldownMs) {
+          const retryAfterSeconds = Math.max(
+            1,
+            Math.ceil((resendCooldownMs - elapsedMs) / 1000)
+          );
+          res.setHeader('Retry-After', String(retryAfterSeconds));
+          throw new AppError(
+            `Please wait ${retryAfterSeconds} seconds before requesting another verification email.`,
+            429,
+            'VERIFICATION_RESEND_COOLDOWN',
+            { retryAfterSeconds }
+          );
+        }
+      }
+      if (
+        latest?.emailVerificationResendWindowStart &&
+        nowMs - latest.emailVerificationResendWindowStart.getTime() < resendWindowMs &&
+        (latest.emailVerificationResendCount ?? 0) >= resendMaxPerWindow
+      ) {
+        const retryAfterSeconds = Math.max(
+          1,
+          Math.ceil(
+            (latest.emailVerificationResendWindowStart.getTime() + resendWindowMs - nowMs) / 1000
+          )
+        );
+        res.setHeader('Retry-After', String(retryAfterSeconds));
+        throw new AppError(
+          'Too many verification email requests. Please try again later.',
+          429,
+          'RATE_LIMITED',
+          { retryAfterSeconds }
+        );
       }
       throw new AppError(
         'Verification request conflicted with a concurrent update. Please try again.',
@@ -252,6 +401,7 @@ export function createAuthHandlers(
         expiresInMinutes: EMAIL_VERIFICATION_TTL_MINUTES,
       });
     } catch (err) {
+      // Conditionally roll back token AND cooldown/quota ONLY if no newer resend superseded this tokenHash.
       await UserModel.updateOne(
         {
           _id: user._id,
@@ -262,6 +412,9 @@ export function createAuthHandlers(
           $set: {
             emailVerificationTokenHash: prevHash,
             emailVerificationExpiresAt: prevExpiresAt,
+            emailVerificationLastSentAt: prevLastSentAt,
+            emailVerificationResendWindowStart: prevWindowStart,
+            emailVerificationResendCount: prevCount,
           },
         }
       );
