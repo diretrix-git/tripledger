@@ -6,9 +6,42 @@ import {
   updateSettlementStatusSchema,
   type SettlementStatus,
 } from '@tripledger/shared';
-import { ParticipantModel, SettlementModel } from '../models/index.js';
+import { FamilyModel, ParticipantModel, SettlementModel, type IParticipant } from '../models/index.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
 import { AppError, asyncHandler, sendSuccess } from '../utils/http.js';
+
+async function resolveValidatedSettlementFamilyId(params: {
+  tripId: mongoose.Types.ObjectId;
+  explicitFamilyId: string | null | undefined;
+  participant: IParticipant;
+}): Promise<mongoose.Types.ObjectId | null> {
+  const trimmed = params.explicitFamilyId?.trim();
+  if (!trimmed) {
+    return params.participant.familyId ?? null;
+  }
+  if (!mongoose.Types.ObjectId.isValid(trimmed)) {
+    throw new AppError('Invalid family identifier format.', 400, 'INVALID_ID');
+  }
+  const family = await FamilyModel.findOne({ _id: trimmed, tripId: params.tripId });
+  if (!family) {
+    throw new AppError(
+      'Specified family group does not exist in this trip.',
+      404,
+      'FAMILY_NOT_FOUND'
+    );
+  }
+  const belongsToParticipant =
+    Boolean(params.participant.familyId && params.participant.familyId.equals(family._id)) ||
+    Boolean(family.representativeId && family.representativeId.equals(params.participant._id));
+  if (!belongsToParticipant) {
+    throw new AppError(
+      'Specified family group does not match the settlement participant.',
+      400,
+      'SETTLEMENT_FAMILY_MISMATCH'
+    );
+  }
+  return family._id;
+}
 
 export const getBalancesAndSuggestions = asyncHandler(
   async (req: Request, res: Response) => {
@@ -72,17 +105,26 @@ export const createSettlement = asyncHandler(async (req: Request, res: Response)
     status = 'REPORTED';
   }
 
+  const [fromFamilyId, toFamilyId] = await Promise.all([
+    resolveValidatedSettlementFamilyId({
+      tripId: trip._id,
+      explicitFamilyId: parsed.fromFamilyId,
+      participant: sender,
+    }),
+    resolveValidatedSettlementFamilyId({
+      tripId: trip._id,
+      explicitFamilyId: parsed.toFamilyId,
+      participant: receiver,
+    }),
+  ]);
+
   const settlement = await SettlementModel.create({
     tripId: trip._id,
     settlementMode: parsed.settlementMode,
     fromParticipantId: sender._id,
     toParticipantId: receiver._id,
-    fromFamilyId: parsed.fromFamilyId
-      ? new mongoose.Types.ObjectId(parsed.fromFamilyId)
-      : sender.familyId ?? null,
-    toFamilyId: parsed.toFamilyId
-      ? new mongoose.Types.ObjectId(parsed.toFamilyId)
-      : receiver.familyId ?? null,
+    fromFamilyId,
+    toFamilyId,
     amountPaisa: parsed.amountPaisa,
     paymentMethod: parsed.paymentMethod,
     status,
@@ -139,14 +181,28 @@ export const updateSettlementStatus = asyncHandler(
       throw new AppError('Settlement record not found.', 404, 'SETTLEMENT_NOT_FOUND');
     }
 
-    // Only Organizer, Receiver, or Receiver's Family Rep can confirm/reject a settlement
+    // Only Organizer, Receiver, or verified Receiver's Family Rep can confirm/reject a settlement
     const isOrganizer = actor.role === 'ORGANIZER';
     const isReceiver = settlement.toParticipantId.equals(actor._id);
-    const isReceiverFamilyRep =
+    let isReceiverFamilyRep = false;
+    if (
+      !isOrganizer &&
+      !isReceiver &&
       actor.role === 'FAMILY_REP' &&
       actor.familyId &&
       settlement.toFamilyId &&
-      actor.familyId.equals(settlement.toFamilyId);
+      actor.familyId.equals(settlement.toFamilyId)
+    ) {
+      const [toFamily, receiverParticipant] = await Promise.all([
+        FamilyModel.findOne({ _id: settlement.toFamilyId, tripId: trip._id }),
+        ParticipantModel.findOne({ _id: settlement.toParticipantId, tripId: trip._id }),
+      ]);
+      if (toFamily && receiverParticipant) {
+        isReceiverFamilyRep =
+          Boolean(receiverParticipant.familyId?.equals(toFamily._id)) ||
+          Boolean(toFamily.representativeId?.equals(receiverParticipant._id));
+      }
+    }
 
     if (!isOrganizer && !isReceiver && !isReceiverFamilyRep) {
       throw new AppError(

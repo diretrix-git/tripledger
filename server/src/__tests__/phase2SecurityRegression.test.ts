@@ -7,7 +7,7 @@ import { connectDatabase, disconnectDatabase } from '../config/database.js';
 import { buildEnvConfig } from '../config/env.js';
 import { errorHandler } from '../middleware/errorHandler.js';
 import { requireAuth, requireVerifiedEmail } from '../middleware/auth.js';
-import { ParticipantModel, TripModel, UserModel } from '../models/index.js';
+import { FamilyModel, ParticipantModel, SettlementModel, TripModel, UserModel } from '../models/index.js';
 import {
   clearTestEmailOutbox,
   EmailDeliveryService,
@@ -509,5 +509,210 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       .get('/api/v1/verified-only')
       .set('Authorization', `Bearer ${access}`);
     expect(allowedVerifiedRoute.status).toBe(200);
+  });
+
+  it('M-01: validates family representativeId and settlement family references against active trip-scoped entities', async () => {
+    const orgReg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Fam Org',
+      email: 'fam.org@example.com',
+      password: 'Password123',
+    });
+    const orgToken = orgReg.body.data.accessToken as string;
+
+    const tripARes = await request(app)
+      .post('/api/v1/trips')
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ name: 'Trip A', mode: 'FAMILY', organizerFamilyName: 'Org Fam' });
+    const tripAId = tripARes.body.data.trip.id as string;
+    const orgParticipantId = tripARes.body.data.myParticipant.id as string;
+    const orgFamilyId = tripARes.body.data.families[0].id as string;
+
+    const tripBRes = await request(app)
+      .post('/api/v1/trips')
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ name: 'Trip B', mode: 'FAMILY', organizerFamilyName: 'Foreign Fam' });
+    const foreignParticipantId = tripBRes.body.data.myParticipant.id as string;
+    const foreignFamilyId = tripBRes.body.data.families[0].id as string;
+
+    const activeGuestRes = await request(app)
+      .post(`/api/v1/trips/${tripAId}/participants`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ name: 'Active Rep Candidate', role: 'PARTICIPANT' });
+    const activeGuestId = activeGuestRes.body.data.participant.id as string;
+
+    const inactiveGuestRes = await request(app)
+      .post(`/api/v1/trips/${tripAId}/participants`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ name: 'Inactive Candidate', role: 'PARTICIPANT' });
+    const inactiveGuestId = inactiveGuestRes.body.data.participant.id as string;
+    await request(app)
+      .patch(`/api/v1/trips/${tripAId}/participants/${inactiveGuestId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ isActive: false });
+
+    const nonexistentParticipantId = new mongoose.Types.ObjectId().toString();
+    const nonexistentFamilyId = new mongoose.Types.ObjectId().toString();
+
+    // 1. createFamily rejections (malformed, nonexistent, cross-trip, inactive)
+    const badCreateCases = [
+      {
+        name: 'Malformed Rep',
+        representativeId: 'not-an-objectid',
+        expectedStatus: 400,
+        expectedCode: 'INVALID_ID',
+      },
+      {
+        name: 'Nonexistent Rep',
+        representativeId: nonexistentParticipantId,
+        expectedStatus: 404,
+        expectedCode: 'PARTICIPANT_NOT_FOUND',
+      },
+      {
+        name: 'Cross-Trip Rep',
+        representativeId: foreignParticipantId,
+        expectedStatus: 404,
+        expectedCode: 'PARTICIPANT_NOT_FOUND',
+      },
+      {
+        name: 'Inactive Rep',
+        representativeId: inactiveGuestId,
+        expectedStatus: 400,
+        expectedCode: 'PARTICIPANT_INACTIVE',
+      },
+    ];
+
+    for (const tc of badCreateCases) {
+      const res = await request(app)
+        .post(`/api/v1/trips/${tripAId}/families`)
+        .set('Authorization', `Bearer ${orgToken}`)
+        .send({ name: tc.name, representativeId: tc.representativeId });
+      expect(res.status).toBe(tc.expectedStatus);
+      expect(res.body.error.code).toBe(tc.expectedCode);
+    }
+    expect(await FamilyModel.countDocuments({ tripId: tripAId })).toBe(1);
+
+    // Valid active rep succeeds on createFamily
+    const validCreate = await request(app)
+      .post(`/api/v1/trips/${tripAId}/families`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ name: 'Second Family', representativeId: activeGuestId });
+    expect(validCreate.status).toBe(201);
+    const secondFamilyId = validCreate.body.data.family.id as string;
+    expect(validCreate.body.data.family.representativeId).toBe(activeGuestId);
+    expect((await ParticipantModel.findById(activeGuestId))?.familyId?.toString()).toBe(
+      secondFamilyId
+    );
+
+    // 2. updateFamily rejections preserve original representativeId
+    for (const tc of badCreateCases) {
+      const res = await request(app)
+        .patch(`/api/v1/trips/${tripAId}/families/${secondFamilyId}`)
+        .set('Authorization', `Bearer ${orgToken}`)
+        .send({ representativeId: tc.representativeId });
+      expect(res.status).toBe(tc.expectedStatus);
+      expect(res.body.error.code).toBe(tc.expectedCode);
+      expect((await FamilyModel.findById(secondFamilyId))?.representativeId?.toString()).toBe(
+        activeGuestId
+      );
+    }
+
+    // Valid updateFamily to unassign and reassign succeeds
+    const unassignRes = await request(app)
+      .patch(`/api/v1/trips/${tripAId}/families/${secondFamilyId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ representativeId: null });
+    expect(unassignRes.status).toBe(200);
+    expect(unassignRes.body.data.family.representativeId).toBeNull();
+
+    // 3. Settlement fromFamilyId / toFamilyId cross-trip & forged family rejection
+    const rep2Reg = await request(app).post('/api/v1/auth/register').send({
+      name: 'Second Fam Rep',
+      email: 'fam2rep@example.com',
+      password: 'Password123',
+    });
+    const rep2Token = rep2Reg.body.data.accessToken as string;
+    const inviteCodeA = tripARes.body.data.trip.inviteCode as string;
+    const rep2Join = await request(app)
+      .post(`/api/v1/trips/join/${inviteCodeA}`)
+      .set('Authorization', `Bearer ${rep2Token}`);
+    const rep2ParticipantId = rep2Join.body.data.participantId as string;
+
+    await request(app)
+      .patch(`/api/v1/trips/${tripAId}/participants/${rep2ParticipantId}`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({ role: 'FAMILY_REP', familyId: secondFamilyId });
+
+    // Cross-trip, nonexistent, malformed, and mismatched toFamilyId rejected cleanly
+    const badSettlements = [
+      { toFamilyId: 'bad-fam-id', expectedStatus: 400, expectedCode: 'INVALID_ID' },
+      { toFamilyId: nonexistentFamilyId, expectedStatus: 404, expectedCode: 'FAMILY_NOT_FOUND' },
+      { toFamilyId: foreignFamilyId, expectedStatus: 404, expectedCode: 'FAMILY_NOT_FOUND' },
+      {
+        toFamilyId: secondFamilyId, // Receiver belongs to orgFamilyId, not secondFamilyId
+        expectedStatus: 400,
+        expectedCode: 'SETTLEMENT_FAMILY_MISMATCH',
+      },
+    ];
+
+    for (const bs of badSettlements) {
+      const res = await request(app)
+        .post(`/api/v1/trips/${tripAId}/settlements`)
+        .set('Authorization', `Bearer ${rep2Token}`)
+        .send({
+          settlementMode: 'FAMILY',
+          fromParticipantId: rep2ParticipantId,
+          toParticipantId: orgParticipantId,
+          toFamilyId: bs.toFamilyId,
+          amountPaisa: 50000,
+          paymentMethod: 'CASH',
+        });
+      expect(res.status).toBe(bs.expectedStatus);
+      expect(res.body.error.code).toBe(bs.expectedCode);
+    }
+    expect(await SettlementModel.countDocuments({ tripId: tripAId })).toBe(0);
+
+    // Even if a pre-existing DB row had a forged/mismatched toFamilyId, FAMILY_REP of that unrelated family cannot confirm it
+    const forgedSettlement = await SettlementModel.create({
+      tripId: tripAId,
+      settlementMode: 'FAMILY',
+      fromParticipantId: activeGuestId,
+      toParticipantId: orgParticipantId,
+      fromFamilyId: orgFamilyId,
+      toFamilyId: secondFamilyId, // Receiver orgParticipantId is NOT in secondFamilyId
+      amountPaisa: 25000,
+      paymentMethod: 'CASH',
+      status: 'REPORTED',
+      reportedByParticipantId: activeGuestId,
+    });
+
+    const forgedConfirmAttempt = await request(app)
+      .patch(`/api/v1/trips/${tripAId}/settlements/${forgedSettlement._id.toString()}/status`)
+      .set('Authorization', `Bearer ${rep2Token}`)
+      .send({ status: 'CONFIRMED' });
+    expect(forgedConfirmAttempt.status).toBe(403);
+    expect(forgedConfirmAttempt.body.error.code).toBe('FORBIDDEN_SETTLEMENT_CONFIRMATION');
+
+    // Legitimate settlement to secondFamilyId CAN be confirmed by rep2 (FAMILY_REP of secondFamilyId)
+    const validSettlementRes = await request(app)
+      .post(`/api/v1/trips/${tripAId}/settlements`)
+      .set('Authorization', `Bearer ${orgToken}`)
+      .send({
+        settlementMode: 'FAMILY',
+        fromParticipantId: orgParticipantId,
+        toParticipantId: activeGuestId,
+        toFamilyId: secondFamilyId,
+        amountPaisa: 10000,
+        paymentMethod: 'CASH',
+        status: 'REPORTED',
+      });
+    expect(validSettlementRes.status).toBe(201);
+    const validSettlementId = validSettlementRes.body.data.settlement.id as string;
+
+    const validRepConfirm = await request(app)
+      .patch(`/api/v1/trips/${tripAId}/settlements/${validSettlementId}/status`)
+      .set('Authorization', `Bearer ${rep2Token}`)
+      .send({ status: 'CONFIRMED' });
+    expect(validRepConfirm.status).toBe(200);
+    expect(validRepConfirm.body.data.settlement.status).toBe('CONFIRMED');
   });
 });

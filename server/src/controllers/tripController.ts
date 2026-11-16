@@ -340,26 +340,66 @@ export const joinTripByInviteCode = asyncHandler(async (req: Request, res: Respo
   });
 });
 
+async function assertValidFamilyInTrip(
+  tripId: mongoose.Types.ObjectId,
+  familyId: string
+): Promise<mongoose.Types.ObjectId> {
+  if (!mongoose.Types.ObjectId.isValid(familyId)) {
+    throw new AppError('Invalid family identifier format.', 400, 'INVALID_ID');
+  }
+  const family = await FamilyModel.findOne({ _id: familyId, tripId });
+  if (!family) {
+    throw new AppError(
+      'Specified family group does not exist in this trip.',
+      404,
+      'FAMILY_NOT_FOUND'
+    );
+  }
+  return family._id;
+}
+
+async function assertActiveRepresentativeInTrip(
+  tripId: mongoose.Types.ObjectId,
+  participantId: string
+): Promise<mongoose.Types.ObjectId> {
+  if (!mongoose.Types.ObjectId.isValid(participantId)) {
+    throw new AppError('Invalid representative participant identifier format.', 400, 'INVALID_ID');
+  }
+  const participant = await ParticipantModel.findOne({
+    _id: participantId,
+    tripId,
+  });
+  if (!participant) {
+    throw new AppError(
+      'Specified representative participant does not belong to this trip.',
+      404,
+      'PARTICIPANT_NOT_FOUND'
+    );
+  }
+  if (!participant.isActive) {
+    throw new AppError(
+      'Inactive participants cannot be assigned as a family representative.',
+      400,
+      'PARTICIPANT_INACTIVE'
+    );
+  }
+  return participant._id;
+}
+
 export const addParticipant = asyncHandler(async (req: Request, res: Response) => {
   const trip = req.trip!;
   const actor = req.participant!;
   const parsed = createParticipantSchema.parse(req.body);
 
-  if (parsed.familyId) {
-    const family = await FamilyModel.findOne({
-      _id: parsed.familyId,
-      tripId: trip._id,
-    });
-    if (!family) {
-      throw new AppError('Specified family group does not exist in this trip.', 404, 'FAMILY_NOT_FOUND');
-    }
-  }
+  const familyObjectId = parsed.familyId
+    ? await assertValidFamilyInTrip(trip._id, parsed.familyId)
+    : null;
 
   // Organizers always create unlinked guest records (userId: null); never auto-link by email.
   const participant = await ParticipantModel.create({
     tripId: trip._id,
     userId: null,
-    familyId: parsed.familyId ? new mongoose.Types.ObjectId(parsed.familyId) : null,
+    familyId: familyObjectId,
     name: parsed.name,
     email: parsed.email || undefined,
     phone: parsed.phone,
@@ -423,18 +463,11 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
     throw new AppError('Participant not found in this trip.', 404, 'PARTICIPANT_NOT_FOUND');
   }
 
-  if (parsed.familyId) {
-    const family = await FamilyModel.findOne({
-      _id: parsed.familyId,
-      tripId: trip._id,
-    });
-    if (!family) {
-      throw new AppError(
-        'Specified family group does not exist in this trip.',
-        404,
-        'FAMILY_NOT_FOUND'
-      );
-    }
+  let validatedFamilyId: mongoose.Types.ObjectId | null | undefined;
+  if (parsed.familyId !== undefined) {
+    validatedFamilyId = parsed.familyId
+      ? await assertValidFamilyInTrip(trip._id, parsed.familyId)
+      : null;
   }
 
   if (parsed.email !== undefined) {
@@ -475,10 +508,8 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
   if (parsed.memberType !== undefined) participant.memberType = parsed.memberType;
   if (parsed.defaultWeight !== undefined) participant.defaultWeight = parsed.defaultWeight;
   if (parsed.isActive !== undefined) participant.isActive = parsed.isActive;
-  if (parsed.familyId !== undefined) {
-    participant.familyId = parsed.familyId
-      ? new mongoose.Types.ObjectId(parsed.familyId)
-      : null;
+  if (validatedFamilyId !== undefined) {
+    participant.familyId = validatedFamilyId;
   }
 
   await participant.save();
@@ -566,6 +597,11 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
   const actor = req.participant!;
   const parsed = createFamilySchema.parse(req.body);
 
+  const trimmedRepId = parsed.representativeId?.trim() || null;
+  const representativeObjectId = trimmedRepId
+    ? await assertActiveRepresentativeInTrip(trip._id, trimmedRepId)
+    : null;
+
   const existing = await FamilyModel.findOne({
     tripId: trip._id,
     name: parsed.name,
@@ -577,16 +613,14 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
   const family = await FamilyModel.create({
     tripId: trip._id,
     name: parsed.name,
-    representativeId: parsed.representativeId
-      ? new mongoose.Types.ObjectId(parsed.representativeId)
-      : null,
+    representativeId: representativeObjectId,
     defaultWeight: parsed.defaultWeight,
     notes: parsed.notes,
   });
 
-  if (parsed.representativeId) {
+  if (representativeObjectId) {
     await ParticipantModel.findOneAndUpdate(
-      { _id: parsed.representativeId, tripId: trip._id },
+      { _id: representativeObjectId, tripId: trip._id },
       { $set: { familyId: family._id } }
     );
   }
@@ -632,19 +666,23 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
   if (parsed.defaultWeight !== undefined) family.defaultWeight = parsed.defaultWeight;
   if (parsed.notes !== undefined) family.notes = parsed.notes;
   if (parsed.representativeId !== undefined) {
-    family.representativeId = parsed.representativeId
-      ? new mongoose.Types.ObjectId(parsed.representativeId)
+    const trimmedRepId = parsed.representativeId?.trim() || null;
+    const representativeObjectId = trimmedRepId
+      ? await assertActiveRepresentativeInTrip(trip._id, trimmedRepId)
       : null;
 
-    if (parsed.representativeId) {
+    family.representativeId = representativeObjectId;
+    await family.save();
+
+    if (representativeObjectId) {
       await ParticipantModel.findOneAndUpdate(
-        { _id: parsed.representativeId, tripId: trip._id },
+        { _id: representativeObjectId, tripId: trip._id },
         { $set: { familyId: family._id } }
       );
     }
+  } else {
+    await family.save();
   }
-
-  await family.save();
 
   sendSuccess(res, {
     family: {
