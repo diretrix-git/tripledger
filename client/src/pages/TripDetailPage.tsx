@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   FileSpreadsheet,
+  KeyRound,
   Package,
   Plus,
   Share2,
@@ -18,8 +19,10 @@ import {
   XCircle,
 } from 'lucide-react';
 import {
+  DEFAULT_PARTICIPANT_INVITE_TTL_HOURS,
   EXPENSE_CATEGORY_LABELS,
   formatPaisaToNPR,
+  isPrivilegedTripRole,
   MEMBER_TYPES,
   nprToPaisa,
   paisaToNprString,
@@ -27,6 +30,7 @@ import {
   PAYMENT_METHOD_LABELS,
   TRIP_ROLES,
   type ChecklistItem,
+  type CreateParticipantInviteResponse,
   type ExpenseCategory,
   type ExpenseRecord,
   type FamilyBalanceSummary,
@@ -34,6 +38,7 @@ import {
   type IndividualBalanceSummary,
   type MemberType,
   type ParticipantEntity,
+  type ParticipantInviteEntity,
   type PaymentMethod,
   type SettlementMode,
   type SettlementRecord,
@@ -78,8 +83,10 @@ interface TripDetailResponse {
 export function TripDetailPage(): React.ReactElement {
   const { tripId } = useParams<{ tripId: string }>();
   const queryClient = useQueryClient();
-  const offlineQueue = useOfflineQueueStore((s) =>
-    s.queue.filter((q) => q.tripId === tripId)
+  const allOfflineQueue = useOfflineQueueStore((s) => s.queue);
+  const offlineQueue = useMemo(
+    () => allOfflineQueue.filter((q) => q.tripId === tripId),
+    [allOfflineQueue, tripId]
   );
 
   const [activeTab, setActiveTab] = useState<
@@ -89,13 +96,27 @@ export function TripDetailPage(): React.ReactElement {
   const [copiedBanner, setCopiedBanner] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  // Add Participant state
+  // Add Participant state (guests are strictly restricted to PARTICIPANT)
   const [newParticipantName, setNewParticipantName] = useState('');
   const [newParticipantEmail, setNewParticipantEmail] = useState('');
-  const [newParticipantRole, setNewParticipantRole] = useState<TripRole>('PARTICIPANT');
   const [newParticipantType, setNewParticipantType] = useState<MemberType>('ADULT');
   const [newParticipantFamilyId, setNewParticipantFamilyId] = useState('');
   const [newParticipantWeight, setNewParticipantWeight] = useState('1');
+
+  // Organizer Role Invitations state
+  const [inviteParticipantId, setInviteParticipantId] = useState('');
+  const [inviteRole, setInviteRole] = useState<TripRole>('ORGANIZER');
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteTtlHours, setInviteTtlHours] = useState<number>(DEFAULT_PARTICIPANT_INVITE_TTL_HOURS);
+  const [issuingInvite, setIssuingInvite] = useState(false);
+  const [issuedInviteSecret, setIssuedInviteSecret] = useState<{
+    participantName: string;
+    grantedRole: TripRole;
+    intendedEmail: string | null;
+    claimUrl: string;
+    rawToken: string;
+    emailSent: boolean;
+  } | null>(null);
 
   // Add Family state
   const [newFamilyName, setNewFamilyName] = useState('');
@@ -113,6 +134,12 @@ export function TripDetailPage(): React.ReactElement {
     queryKey: ['trip', tripId],
     queryFn: () => apiRequest<TripDetailResponse>(`/trips/${tripId}`),
     enabled: Boolean(tripId),
+  });
+
+  const invitesQuery = useQuery({
+    queryKey: ['trip-invites', tripId],
+    queryFn: () => apiRequest<{ invites: ParticipantInviteEntity[] }>(`/trips/${tripId}/invites`),
+    enabled: Boolean(tripId && data?.myParticipant?.role === 'ORGANIZER'),
   });
 
   if (isLoading) {
@@ -167,7 +194,7 @@ export function TripDetailPage(): React.ReactElement {
         body: JSON.stringify({
           name: newParticipantName,
           email: newParticipantEmail || undefined,
-          role: newParticipantRole,
+          role: 'PARTICIPANT',
           memberType: newParticipantType,
           familyId: newParticipantFamilyId || null,
           defaultWeight: Number.parseFloat(newParticipantWeight) || 1,
@@ -178,6 +205,58 @@ export function TripDetailPage(): React.ReactElement {
       await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Failed to add participant');
+    }
+  };
+
+  const handleIssueParticipantInvite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inviteParticipantId) {
+      setActionError('Select a participant to issue an invitation for.');
+      return;
+    }
+    if (isPrivilegedTripRole(inviteRole) && !inviteEmail.trim()) {
+      setActionError(`An intended email address is required for ${inviteRole} invitations.`);
+      return;
+    }
+
+    setActionError(null);
+    setIssuingInvite(true);
+    try {
+      const res = await apiRequest<CreateParticipantInviteResponse>(
+        `/trips/${trip.id}/participants/${inviteParticipantId}/invites`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            grantedRole: inviteRole,
+            intendedEmail: inviteEmail.trim() || undefined,
+            expiresInHours: inviteTtlHours,
+          }),
+        }
+      );
+      setIssuedInviteSecret({
+        participantName: participantNameMap.get(res.invite.participantId) ?? 'Participant',
+        grantedRole: res.invite.grantedRole,
+        intendedEmail: res.invite.intendedEmail,
+        claimUrl: res.claimUrl,
+        rawToken: res.rawToken,
+        emailSent: Boolean(res.emailDelivery?.sent),
+      });
+      setInviteEmail('');
+      await queryClient.invalidateQueries({ queryKey: ['trip-invites', trip.id] });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to issue invitation');
+    } finally {
+      setIssuingInvite(false);
+    }
+  };
+
+  const handleRevokeInvite = async (inviteId: string) => {
+    setActionError(null);
+    try {
+      await apiRequest(`/trips/${trip.id}/invites/${inviteId}/revoke`, { method: 'POST' });
+      await queryClient.invalidateQueries({ queryKey: ['trip-invites', trip.id] });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to revoke invitation');
     }
   };
 
@@ -840,7 +919,7 @@ export function TripDetailPage(): React.ReactElement {
                 {participants.map((p) => (
                   <div
                     key={p.id}
-                    className="py-2.5 flex items-center justify-between text-xs"
+                    className="py-2.5 flex items-center justify-between gap-2 text-xs"
                   >
                     <div>
                       <span className="font-bold text-slate-900">{p.name}</span>
@@ -849,11 +928,28 @@ export function TripDetailPage(): React.ReactElement {
                           Guest
                         </span>
                       )}
+                      {!p.isActive && (
+                        <span className="ml-1.5 px-1.5 py-0.5 rounded bg-rose-50 text-rose-600 text-[10px]">
+                          Inactive
+                        </span>
+                      )}
                       <div className="text-[11px] text-slate-500 mt-0.5">
                         Role: {p.role} • Type: {p.memberType} • Weight: {p.defaultWeight}x
                         {p.familyId && ` • ${familyNameMap.get(p.familyId) ?? 'Family'}`}
                       </div>
                     </div>
+                    {isOrganizer && p.isActive && trip.status !== 'CLOSED' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setInviteParticipantId(p.id);
+                          setInviteEmail(p.email ?? '');
+                        }}
+                        className="px-2.5 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-[11px] font-semibold text-slate-700 shrink-0"
+                      >
+                        Invite / Promote
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -884,17 +980,12 @@ export function TripDetailPage(): React.ReactElement {
                     />
                   </div>
                   <div className="grid grid-cols-3 gap-2">
-                    <select
-                      value={newParticipantRole}
-                      onChange={(e) => setNewParticipantRole(e.target.value as TripRole)}
-                      className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs bg-white"
+                    <div
+                      className="rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-semibold text-slate-600 flex items-center"
+                      title="Guest participants always start as PARTICIPANT. Grant higher roles via Role Invitations."
                     >
-                      {TRIP_ROLES.map((r) => (
-                        <option key={r} value={r}>
-                          {r}
-                        </option>
-                      ))}
-                    </select>
+                      PARTICIPANT
+                    </div>
                     <select
                       value={newParticipantType}
                       onChange={(e) => setNewParticipantType(e.target.value as MemberType)}
@@ -908,14 +999,18 @@ export function TripDetailPage(): React.ReactElement {
                     </select>
                     <input
                       type="number"
-                      step="0.25"
-                      min="0.1"
+                      step="any"
+                      min="0.01"
                       value={newParticipantWeight}
                       onChange={(e) => setNewParticipantWeight(e.target.value)}
                       placeholder="Weight (1.0)"
                       className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs font-mono"
                     />
                   </div>
+                  <p className="text-[11px] text-slate-500">
+                    Guests are created as PARTICIPANT. Issue a verified-email role invitation below
+                    to grant ORGANIZER or FAMILY_REP access.
+                  </p>
                   {trip.mode === 'FAMILY' && families.length > 0 && (
                     <select
                       value={newParticipantFamilyId}
@@ -937,6 +1032,190 @@ export function TripDetailPage(): React.ReactElement {
                     Add Participant
                   </button>
                 </form>
+              </div>
+            )}
+
+            {isOrganizer && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm space-y-4">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+                  <KeyRound className="w-4 h-4 text-blue-600" />
+                  <span>Role Invitations &amp; Verified Promotions</span>
+                </h3>
+
+                {issuedInviteSecret && (
+                  <div className="rounded-xl bg-emerald-50 border border-emerald-200 p-3.5 text-xs text-emerald-900 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-bold">
+                        Issued {issuedInviteSecret.grantedRole} invitation for{' '}
+                        {issuedInviteSecret.participantName}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setIssuedInviteSecret(null)}
+                        className="text-emerald-700 font-semibold hover:underline"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                    {issuedInviteSecret.emailSent && issuedInviteSecret.intendedEmail && (
+                      <p className="text-[11px] text-emerald-800">
+                        Verification-bound invitation email dispatched to{' '}
+                        <strong>{issuedInviteSecret.intendedEmail}</strong>.
+                      </p>
+                    )}
+                    <p className="text-[11px] text-emerald-800">
+                      This one-time invite link will not be shown again once dismissed.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyToClipboard(issuedInviteSecret.claimUrl, 'Invitation link copied!')
+                        }
+                        className="px-2.5 py-1 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white font-semibold text-[11px] inline-flex items-center gap-1"
+                      >
+                        <Copy className="w-3 h-3" />
+                        <span>Copy Invite Link</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyToClipboard(issuedInviteSecret.rawToken, 'Invitation token copied!')
+                        }
+                        className="px-2.5 py-1 rounded-lg border border-emerald-300 bg-white text-emerald-900 font-semibold text-[11px]"
+                      >
+                        Copy Token
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {trip.status !== 'CLOSED' && (
+                  <form onSubmit={handleIssueParticipantInvite} className="space-y-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <select
+                        required
+                        aria-label="Target Participant"
+                        value={inviteParticipantId}
+                        onChange={(e) => {
+                          const selected = participants.find((pt) => pt.id === e.target.value);
+                          setInviteParticipantId(e.target.value);
+                          if (selected?.email) setInviteEmail(selected.email);
+                        }}
+                        className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs bg-white"
+                      >
+                        <option value="">-- Select Participant * --</option>
+                        {participants
+                          .filter((p) => p.isActive)
+                          .map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name} ({p.role}
+                              {p.userId ? '' : ' • Guest'})
+                            </option>
+                          ))}
+                      </select>
+
+                      <select
+                        aria-label="Invitation Role"
+                        value={inviteRole}
+                        onChange={(e) => setInviteRole(e.target.value as TripRole)}
+                        className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs bg-white"
+                      >
+                        {TRIP_ROLES.map((r) => (
+                          <option key={r} value={r}>
+                            {r}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                      <input
+                        type="email"
+                        required={isPrivilegedTripRole(inviteRole)}
+                        value={inviteEmail}
+                        onChange={(e) => setInviteEmail(e.target.value)}
+                        placeholder={
+                          isPrivilegedTripRole(inviteRole)
+                            ? 'Verified Email Required *'
+                            : 'Intended Email (Optional)'
+                        }
+                        className="sm:col-span-2 rounded-xl border border-slate-300 px-3 py-2 text-xs"
+                      />
+                      <select
+                        aria-label="Invite Expiration"
+                        value={inviteTtlHours}
+                        onChange={(e) => setInviteTtlHours(Number.parseInt(e.target.value, 10))}
+                        className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs bg-white"
+                      >
+                        <option value={24}>24 hours</option>
+                        <option value={48}>48 hours</option>
+                        <option value={72}>72 hours</option>
+                        <option value={168}>7 days</option>
+                      </select>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={issuingInvite}
+                      className="w-full py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold disabled:opacity-50"
+                    >
+                      {issuingInvite ? 'Issuing Invitation...' : 'Issue Role Invitation'}
+                    </button>
+                  </form>
+                )}
+
+                <div className="pt-2 border-t border-slate-100 space-y-2">
+                  <div className="text-[11px] font-semibold text-slate-500">
+                    Invitation History ({invitesQuery.data?.invites.length ?? 0})
+                  </div>
+                  {(invitesQuery.data?.invites ?? []).length === 0 ? (
+                    <p className="text-xs text-slate-400">No role invitations issued yet.</p>
+                  ) : (
+                    <div className="divide-y divide-slate-100">
+                      {(invitesQuery.data?.invites ?? []).map((inv) => {
+                        const isExpired =
+                          !inv.usedAt &&
+                          !inv.revokedAt &&
+                          new Date(inv.expiresAt).getTime() <= Date.now();
+                        const statusLabel = inv.usedAt
+                          ? 'Redeemed'
+                          : inv.revokedAt
+                            ? 'Revoked'
+                            : isExpired
+                              ? 'Expired'
+                              : 'Pending';
+
+                        return (
+                          <div
+                            key={inv.id}
+                            className="py-2 flex items-center justify-between gap-2 text-xs"
+                          >
+                            <div>
+                              <div className="font-semibold text-slate-900">
+                                {participantNameMap.get(inv.participantId) ?? 'Participant'} →{' '}
+                                <span className="text-blue-700">{inv.grantedRole}</span>
+                              </div>
+                              <div className="text-[11px] text-slate-500">
+                                {inv.intendedEmail ?? 'Email-less claim'} • Status:{' '}
+                                <strong>{statusLabel}</strong>
+                              </div>
+                            </div>
+                            {statusLabel === 'Pending' && (
+                              <button
+                                type="button"
+                                onClick={() => void handleRevokeInvite(inv.id)}
+                                className="px-2.5 py-1 rounded-lg border border-rose-200 text-rose-700 hover:bg-rose-50 text-[11px] font-semibold shrink-0"
+                              >
+                                Revoke
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>

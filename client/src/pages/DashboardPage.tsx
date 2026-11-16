@@ -5,13 +5,20 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   Plus,
+  ShieldCheck,
   Ticket,
   Users,
   UsersRound,
   Wallet,
 } from 'lucide-react';
-import { formatPaisaToNPR, type TripMode, type TripStatus } from '@tripledger/shared';
+import {
+  formatPaisaToNPR,
+  type PendingParticipantInviteEntity,
+  type TripMode,
+  type TripStatus,
+} from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
+import { useAuthStore } from '../stores/authStore.js';
 
 export interface DashboardTripSummary {
   id: string;
@@ -52,6 +59,8 @@ interface DashboardResponse {
 export function DashboardPage(): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const user = useAuthStore((s) => s.user);
+  const accessToken = useAuthStore((s) => s.accessToken);
   const [inviteCode, setInviteCode] = useState('');
   const [joinError, setJoinError] = useState<string | null>(null);
 
@@ -59,6 +68,15 @@ export function DashboardPage(): React.ReactElement {
     queryKey: ['dashboard'],
     queryFn: () => apiRequest<DashboardResponse>('/dashboard/summary'),
   });
+
+  const { data: pendingInvitesData } = useQuery({
+    queryKey: ['pending-invites', user?.id],
+    queryFn: () =>
+      apiRequest<{ invites: PendingParticipantInviteEntity[] }>('/trips/invites/pending'),
+    enabled: Boolean(accessToken && user?.emailVerified === true),
+  });
+
+  const pendingInvites = pendingInvitesData?.invites ?? [];
 
   const handleJoinTrip = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -307,6 +325,39 @@ export function DashboardPage(): React.ReactElement {
               <p className="text-xs text-rose-600 mt-1.5 font-medium">{joinError}</p>
             )}
           </div>
+
+          {pendingInvites.length > 0 && (
+            <div className="bg-white rounded-2xl border border-blue-200 p-4 shadow-sm space-y-2.5">
+              <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-blue-700">
+                <ShieldCheck className="w-4 h-4 text-blue-600" />
+                <span>Pending Role Invitations ({pendingInvites.length})</span>
+              </div>
+              <div className="space-y-2">
+                {pendingInvites.map((inv) => (
+                  <div
+                    key={inv.id}
+                    className="rounded-xl bg-blue-50/70 border border-blue-100 p-3 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-bold text-slate-900">{inv.tripName}</span>
+                      <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 font-semibold text-[10px]">
+                        {inv.grantedRole}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-600">
+                      For {inv.participantName} ({inv.intendedEmail})
+                    </p>
+                    <Link
+                      to="/invites/claim"
+                      className="inline-block text-[11px] font-semibold text-blue-700 hover:underline"
+                    >
+                      Redeem Invitation Token →
+                    </Link>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
             <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
