@@ -48,11 +48,14 @@ export function VerifyEmailPage(): React.ReactElement {
 
       const currentUser = useAuthStore.getState().user;
       if (currentUser && res.userId && currentUser.id === res.userId) {
-        updateUser({
-          ...currentUser,
-          emailVerified: res.emailVerified,
-          emailVerifiedAt: res.emailVerifiedAt,
-        });
+        updateUser(
+          {
+            ...currentUser,
+            emailVerified: res.emailVerified,
+            emailVerifiedAt: res.emailVerifiedAt,
+          },
+          res.userId
+        );
       } else if (currentUser && currentUser.id !== res.userId) {
         setSessionMismatchNotice(
           'This link verified a different TripLedger account. Your currently signed-in account was left unchanged.'
@@ -96,6 +99,7 @@ export function VerifyEmailPage(): React.ReactElement {
   };
 
   const handleResendVerification = async () => {
+    const actingUserId = useAuthStore.getState().user?.id;
     setResending(true);
     setResendNotice(null);
     try {
@@ -106,8 +110,8 @@ export function VerifyEmailPage(): React.ReactElement {
       }>('/auth/resend-verification', { method: 'POST' });
 
       const currentUser = useAuthStore.getState().user;
-      if (res.alreadyVerified && currentUser) {
-        updateUser({ ...currentUser, emailVerified: true });
+      if (res.alreadyVerified && currentUser && (!actingUserId || currentUser.id === actingUserId)) {
+        updateUser({ ...currentUser, emailVerified: true }, actingUserId);
         setStatus('verified');
         setMessage('Your email address is already verified.');
       } else {

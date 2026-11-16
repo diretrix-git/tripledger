@@ -5,6 +5,7 @@ import { useAuthStore, type AuthUser } from '../stores/authStore.js';
 
 export function SettingsPage(): React.ReactElement {
   const user = useAuthStore((s) => s.user);
+  const accessToken = useAuthStore((s) => s.accessToken);
   const updateUser = useAuthStore((s) => s.updateUser);
 
   const [name, setName] = useState(user?.name ?? '');
@@ -17,11 +18,29 @@ export function SettingsPage(): React.ReactElement {
   const [resending, setResending] = useState(false);
 
   useEffect(() => {
+    setName(user?.name ?? '');
+    setPhone(user?.phone ?? '');
+  }, [user?.id, user?.name, user?.phone]);
+
+  useEffect(() => {
+    if (!accessToken || !user?.id) return;
     let active = true;
+    const expectedUserId = user.id;
+    const requestGeneration = useAuthStore.getState().sessionGeneration;
+
     void apiRequest<{ user: AuthUser }>('/auth/me')
       .then((res) => {
         if (!active) return;
-        updateUser(res.user);
+        const current = useAuthStore.getState();
+        if (
+          !current.accessToken ||
+          current.sessionGeneration !== requestGeneration ||
+          current.user?.id !== expectedUserId ||
+          res.user.id !== expectedUserId
+        ) {
+          return;
+        }
+        updateUser(res.user, expectedUserId);
         setName(res.user.name);
         setPhone(res.user.phone ?? '');
       })
@@ -31,10 +50,11 @@ export function SettingsPage(): React.ReactElement {
     return () => {
       active = false;
     };
-  }, [updateUser]);
+  }, [accessToken, user?.id, updateUser]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    const actingUserId = useAuthStore.getState().user?.id;
     setSaving(true);
     setStatusBanner(null);
     try {
@@ -42,7 +62,7 @@ export function SettingsPage(): React.ReactElement {
         method: 'PATCH',
         body: JSON.stringify({ name, phone }),
       });
-      updateUser(res.user);
+      updateUser(res.user, actingUserId);
       setStatusBanner({ type: 'info', text: 'Profile updated successfully.' });
     } catch (err) {
       setStatusBanner({
@@ -55,6 +75,7 @@ export function SettingsPage(): React.ReactElement {
   };
 
   const handleResendVerification = async () => {
+    const actingUserId = useAuthStore.getState().user?.id;
     setResending(true);
     setStatusBanner(null);
     try {
@@ -64,8 +85,9 @@ export function SettingsPage(): React.ReactElement {
         emailVerified: boolean;
       }>('/auth/resend-verification', { method: 'POST' });
 
-      if (res.alreadyVerified && user) {
-        updateUser({ ...user, emailVerified: true });
+      const currentUser = useAuthStore.getState().user;
+      if (res.alreadyVerified && currentUser && (!actingUserId || currentUser.id === actingUserId)) {
+        updateUser({ ...currentUser, emailVerified: true }, actingUserId);
         setStatusBanner({ type: 'info', text: 'Your email address is already verified.' });
       } else {
         setStatusBanner({

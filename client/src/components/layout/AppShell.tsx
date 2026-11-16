@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useContext, useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { QueryClientContext } from '@tanstack/react-query';
 import {
   Compass,
   FolderClock,
@@ -26,18 +27,39 @@ export function AppShell(): React.ReactElement {
   const updateUser = useAuthStore((s) => s.updateUser);
   const clearAuth = useAuthStore((s) => s.clearAuth);
   const navigate = useNavigate();
+  const queryClient = useContext(QueryClientContext);
   const { isOnline, isSyncing, queue, flushOfflineQueue } = useOfflineSync();
   const [showQueueDrawer, setShowQueueDrawer] = useState(false);
 
+  const prevSessionKeyRef = useRef<string | null>(
+    user?.id ? `${user.id}:${Boolean(accessToken)}` : null
+  );
+
   useEffect(() => {
-    if (!accessToken) return;
+    const nextSessionKey = user?.id ? `${user.id}:${Boolean(accessToken)}` : null;
+    if (prevSessionKeyRef.current !== null && prevSessionKeyRef.current !== nextSessionKey) {
+      queryClient?.clear();
+    }
+    prevSessionKeyRef.current = nextSessionKey;
+  }, [accessToken, queryClient, user?.id]);
+
+  useEffect(() => {
+    if (!accessToken || !user?.id) return;
     let active = true;
+    const expectedUserId = user.id;
 
     const syncAuthProfile = () => {
+      const requestGeneration = useAuthStore.getState().sessionGeneration;
       void apiRequest<{ user: AuthUser }>('/auth/me')
         .then((res) => {
-          if (active) {
-            updateUser(res.user);
+          const current = useAuthStore.getState();
+          if (
+            active &&
+            current.accessToken &&
+            current.sessionGeneration === requestGeneration &&
+            current.user?.id === expectedUserId
+          ) {
+            updateUser(res.user, expectedUserId);
           }
         })
         .catch(() => {
@@ -51,7 +73,7 @@ export function AppShell(): React.ReactElement {
       active = false;
       window.removeEventListener('focus', syncAuthProfile);
     };
-  }, [accessToken, updateUser]);
+  }, [accessToken, user?.id, updateUser]);
 
   const handleLogout = async () => {
     try {
@@ -59,6 +81,7 @@ export function AppShell(): React.ReactElement {
     } catch {
       // ignore network error on logout
     }
+    queryClient?.clear();
     clearAuth();
     navigate('/login');
   };
