@@ -38,7 +38,18 @@ const participantSchema = new Schema<IParticipant>(
   { timestamps: true }
 );
 
+export const PARTICIPANT_TRIP_USER_INDEX_NAME = 'tripId_1_userId_partial_unique';
+
 participantSchema.index({ tripId: 1, isActive: 1 });
-participantSchema.index({ tripId: 1, userId: 1 });
+participantSchema.index(
+  { tripId: 1, userId: 1 },
+  {
+    name: PARTICIPANT_TRIP_USER_INDEX_NAME,
+    unique: true,
+    // Enforce uniqueness only when linked to a User ObjectId so multiple guest rows
+    // (`userId: null`) can coexist in the same trip.
+    partialFilterExpression: { userId: { $type: 'objectId' } },
+  }
+);
 
 export const ParticipantModel = mongoose.model<IParticipant>('Participant', participantSchema);

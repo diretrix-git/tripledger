@@ -40,11 +40,17 @@ Stores registered platform accounts. Note that trip participants do not need a `
 - `_id`: `ObjectId`
 - `name`: `String` (required, trimmed)
 - `email`: `String` (required, unique, lowercase, indexed)
+- `emailVerified`: `Boolean` (default: `false`; legacy unverified users remain `false`)
+- `emailVerifiedAt`: `Date` (nullable)
+- `emailVerificationTokenHash`: `String` (`select: false`, nullable, 64-char SHA-256 hex digest)
+- `emailVerificationExpiresAt`: `Date` (`select: false`, nullable)
 - `passwordHash`: `String` (required, `select: false`)
 - `phone`: `String` (optional)
 - `defaultCurrency`: `String` (default: `'NPR'`)
 - `refreshTokenHash`: `String` (optional, `select: false`)
 - `createdAt`, `updatedAt`: `Date`
+
+**Indexes:** `{ email: 1 }` (unique), `{ emailVerificationTokenHash: 1 }` (`emailVerificationTokenHash_partial_unique` — unique when `$type: 'string' && $gt: ''`)
 
 ### 3.2 `Trips` (`trips`)
 Represents a Friends Mode or Family Mode trip container.
@@ -59,6 +65,10 @@ Represents a Friends Mode or Family Mode trip container.
 - `endDate`: `Date` (optional)
 - `createdBy`: `ObjectId` (ref: `'User'`, required)
 - `inviteCode`: `String` (unique, indexed)
+- `inviteEnabled`: `Boolean` (default: `true`)
+- `inviteExpiresAt`: `Date` (nullable, optional)
+- `inviteCodeRotatedAt`: `Date` (nullable, optional)
+- `defaultInviteRole`: `Enum ['PARTICIPANT']` (default: `'PARTICIPANT'`, immutable — open invite-code joins never default to `CONTRIBUTOR` or privileged roles)
 - `shareToken`: `String` (unique, indexed, for read-only public summary sharing)
 - `shareEnabled`: `Boolean` (default: `true`)
 - `checklist`: Array of `{ category: String, label: String, checked: Boolean, notApplicable: Boolean, verifiedAt: Date }` (Forgotten Expense Protection checklist state)
@@ -86,7 +96,7 @@ Represents an individual person in a trip (either a guest managed by the organiz
 - `userId`: `ObjectId` (ref: `'User'`, nullable/optional — supports Guest Participants)
 - `familyId`: `ObjectId` (ref: `'Family'`, nullable/optional)
 - `name`: `String` (required, trimmed)
-- `email`: `String` (optional, lowercase — used to auto-link or invite)
+- `email`: `String` (optional, lowercase)
 - `phone`: `String` (optional)
 - `role`: `Enum ['ORGANIZER', 'CONTRIBUTOR', 'FAMILY_REP', 'PARTICIPANT']` (default: `'PARTICIPANT'`)
 - `memberType`: `Enum ['ADULT', 'CHILD', 'DEPENDENT']` (default: `'ADULT'`)
@@ -94,7 +104,27 @@ Represents an individual person in a trip (either a guest managed by the organiz
 - `isActive`: `Boolean` (default: `true`)
 - `createdAt`, `updatedAt`: `Date`
 
-**Indexes:** `{ tripId: 1, isActive: 1 }`, `{ tripId: 1, userId: 1 }`, `{ tripId: 1, familyId: 1 }`
+**Indexes:** `{ tripId: 1, isActive: 1 }`, `{ tripId: 1, userId: 1 }` (`tripId_1_userId_partial_unique` — unique when `userId` is `$type: 'objectId'`, allowing multiple guest rows per trip while preventing duplicate user memberships across active and deactivated slots), `{ tripId: 1, familyId: 1 }`
+
+### 3.4a `ParticipantInvites` (`participantinvites`)
+Stores organizer-issued, participant-scoped, single-use claim invitations. Raw claim secrets are never stored in MongoDB (only SHA-256 digests).
+- `_id`: `ObjectId`
+- `tripId`: `ObjectId` (ref: `'Trip'`, required, immutable, indexed)
+- `participantId`: `ObjectId` (ref: `'Participant'`, required, immutable, indexed)
+- `invitedByUserId`: `ObjectId` (ref: `'User'`, required, immutable)
+- `invitedByParticipantId`: `ObjectId` (ref: `'Participant'`, required, immutable)
+- `tokenHash`: `String` (`select: false`, required, immutable, 64-char SHA-256 hex digest)
+- `intendedEmail`: `String` (nullable, lowercase, immutable — required whenever `grantedRole` is `ORGANIZER` or `FAMILY_REP`)
+- `grantedRole`: `Enum ['ORGANIZER', 'CONTRIBUTOR', 'FAMILY_REP', 'PARTICIPANT']` (required, immutable)
+- `requireVerifiedEmail`: `Boolean` (required, immutable — enforced `true` for privileged roles and any email-bound invite)
+- `expiresAt`: `Date` (required, immutable — must be a valid future timestamp on creation)
+- `usedAt`: `Date` (nullable; set together with `usedByUserId`)
+- `usedByUserId`: `ObjectId` (ref: `'User'`, nullable)
+- `revokedAt`: `Date` (nullable; mutually exclusive with `usedAt`)
+- `revokedByParticipantId`: `ObjectId` (ref: `'Participant'`, nullable)
+- `createdAt`, `updatedAt`: `Date`
+
+**Indexes:** `{ tokenHash: 1 }` (`tokenHash_unique` — unique), `{ participantId: 1, usedAt: 1, revokedAt: 1 }`, `{ intendedEmail: 1, usedAt: 1, revokedAt: 1, expiresAt: 1 }` (`intendedEmail_pending_idx`), `{ tripId: 1, participantId: 1, createdAt: -1 }`
 
 ### 3.5 `Expenses` (`expenses`)
 Stores the master expense header. Individual payments and participant shares are stored in `ExpensePayments` and `ExpenseShares`.
@@ -177,8 +207,35 @@ Immutable audit trail of important financial and structural actions within a tri
 - `actorParticipantId`: `ObjectId` (ref: `'Participant'`, optional)
 - `actorName`: `String` (required)
 - `actionType`: `String` (e.g., `'TRIP_CREATED'`, `'EXPENSE_ADDED'`, `'EXPENSE_EDITED'`, `'EXPENSE_APPROVED'`, `'SETTLEMENT_REPORTED'`, `'SETTLEMENT_CONFIRMED'`, `'TRIP_CLOSED'`)
-- `entityType`: `Enum ['TRIP', 'PARTICIPANT', 'FAMILY', 'EXPENSE', 'SETTLEMENT']`
+- `entityType`: `Enum ['TRIP', 'PARTICIPANT', 'PARTICIPANT_INVITE', 'FAMILY', 'EXPENSE', 'SETTLEMENT']`
 - `entityId`: `ObjectId`
 - `summary`: `String` (human-readable audit message)
 - `metadata`: `Mixed` (JSON snapshot of before/after values in paisa)
 - `createdAt`: `Date` (indexed)
+
+---
+
+## 4. Database Migrations & Safe Deployment Procedure
+
+### Guarantee Boundaries
+- **Database-enforced (MongoDB indexes):** uniqueness of `users.email`, `users.emailVerificationTokenHash_partial_unique`, `trips.inviteCode`, `trips.shareToken`, `participants.tripId_1_userId_partial_unique`, and `participantinvites.tokenHash_unique`. Collections do not currently install MongoDB `$jsonSchema` validators.
+- **Application-enforced (`@tripledger/shared` & Mongoose models):** `ParticipantInvite` privileged-role verified-email requirements, expiration checks, SHA-256 hash format checks, immutable policy-field guards on document/query updates, single-use/revocation consistency, and `Trip.defaultInviteRole = 'PARTICIPANT'`. Direct MongoDB shell/driver writes bypass Mongoose validation and hooks.
+
+### Registered Migration Commands (`migrateParticipantUserIndex`)
+All migration CLI runs connect with `autoIndex: false` so read-only audits never create indexes and duplicate/malformed audits execute strictly prior to index DDL.
+
+- **Production (requires prior `npm run build`):**
+  - Read-only pre-flight audit: `npm run migrate:participant-audit` (`node dist/migrations/migrateParticipantUserIndex.js --audit-only`)
+  - Execute migration & default backfill: `npm run migrate:participant-user-index` (`node dist/migrations/migrateParticipantUserIndex.js`)
+- **Development (`tsx`):**
+  - Read-only pre-flight audit: `npm run migrate:participant-audit:dev`
+  - Execute migration & default backfill: `npm run migrate:participant-user-index:dev`
+
+### Required Production Rollout Sequence
+1. **Audit (read-only):** Build the server (`npm run build:shared && npm run build:server`) and run `npm run migrate:participant-audit` against the target `MONGODB_URI`. Review `unverifiedUsersCount`, `unlinkedPrivilegedGuestsWithEmailCount`, and `nonCreatorUnverifiedPrivilegedLinks`.
+2. **Resolve duplicate or malformed records manually:** If a dry/migration run reports duplicate `(tripId, userId)` `Participant` pairs or malformed non-ObjectId `userId` entries, it **aborts before changing indexes** and never automatically deletes or merges participant rows. Operators must manually inspect and reconcile any `ExpensePayment`, `ExpenseShare`, `Settlement`, `Family.representativeId`, and `ActivityLog` references before removing or consolidating duplicate rows.
+3. **Run migration:** Execute `npm run migrate:participant-user-index`. This safely creates `tripId_1_userId_partial_unique`, verifies readiness, drops only the legacy non-unique `tripId_1_userId_1` index, normalizes empty-string `userId` fields to `null`, initializes missing `User.emailVerified: false` (never auto-verifying legacy accounts), and initializes missing `Trip.inviteEnabled: true` / `Trip.defaultInviteRole: 'PARTICIPANT'`.
+4. **Verify indexes & state:** Re-run `npm run migrate:participant-audit` and confirm `tripId_1_userId_partial_unique` exists and `tripId_1_userId_1` is absent (repeating the migration is idempotent).
+5. **Deploy application code:** Start/roll out the updated server processes (`npm start`).
+
+*(Note for Phases 3–4: `TripSummaryEntity.inviteCode` remains required during Phase 1 for client compatibility; when Phase 3 restricts `inviteCode` visibility to `ORGANIZER` responses, narrow `TripSummaryEntity.inviteCode` to optional alongside guarding client UI callers.)*

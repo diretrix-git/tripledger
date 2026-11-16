@@ -2,6 +2,7 @@ export * from './User.js';
 export * from './Trip.js';
 export * from './Family.js';
 export * from './Participant.js';
+export * from './ParticipantInvite.js';
 export * from './Expense.js';
 export * from './ExpensePayment.js';
 export * from './ExpenseShare.js';

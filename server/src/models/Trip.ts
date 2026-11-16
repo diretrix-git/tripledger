@@ -1,5 +1,6 @@
 import mongoose, { Schema, type Document } from 'mongoose';
 import {
+  DEFAULT_OPEN_INVITE_ROLE,
   EXPENSE_CATEGORIES,
   TRIP_MODES,
   TRIP_STATUSES,
@@ -7,6 +8,11 @@ import {
   type TripMode,
   type TripStatus,
 } from '@tripledger/shared';
+import {
+  assertAllowedQueryOptions,
+  assertQueryUpdatePreservesImmutableFields,
+  isPlainObjectRecord,
+} from './updateGuards.js';
 
 export interface IChecklistItem {
   category: ExpenseCategory;
@@ -28,6 +34,10 @@ export interface ITrip extends Document {
   endDate?: Date;
   createdBy: mongoose.Types.ObjectId;
   inviteCode: string;
+  inviteEnabled: boolean;
+  inviteExpiresAt?: Date | null;
+  inviteCodeRotatedAt?: Date | null;
+  defaultInviteRole: 'PARTICIPANT';
   shareToken: string;
   shareEnabled: boolean;
   checklist: IChecklistItem[];
@@ -66,6 +76,15 @@ const tripSchema = new Schema<ITrip>(
     endDate: { type: Date },
     createdBy: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     inviteCode: { type: String, required: true, unique: true, index: true },
+    inviteEnabled: { type: Boolean, default: true },
+    inviteExpiresAt: { type: Date, default: null },
+    inviteCodeRotatedAt: { type: Date, default: null },
+    defaultInviteRole: {
+      type: String,
+      enum: [DEFAULT_OPEN_INVITE_ROLE],
+      default: DEFAULT_OPEN_INVITE_ROLE,
+      immutable: true,
+    },
     shareToken: { type: String, required: true, unique: true, index: true },
     shareEnabled: { type: Boolean, default: true },
     checklist: { type: [checklistItemSchema], default: [] },
@@ -75,5 +94,80 @@ const tripSchema = new Schema<ITrip>(
 );
 
 tripSchema.index({ createdBy: 1, status: 1 });
+
+const IMMUTABLE_TRIP_SECURITY_FIELDS = new Set<string>(['defaultInviteRole']);
+
+tripSchema.pre(['updateOne', 'findOneAndUpdate', 'updateMany'], function (next) {
+  try {
+    assertQueryUpdatePreservesImmutableFields(
+      this as unknown as mongoose.Query<unknown, unknown>,
+      IMMUTABLE_TRIP_SECURITY_FIELDS,
+      'Trip'
+    );
+    next();
+  } catch (err) {
+    next(err instanceof Error ? err : new Error('Invalid Trip update'));
+  }
+});
+
+tripSchema.pre(['replaceOne', 'findOneAndReplace'], function (next) {
+  try {
+    const query = this as unknown as mongoose.Query<unknown, unknown>;
+    assertAllowedQueryOptions(query, 'Trip');
+    const replacement = query.getUpdate();
+    if (!isPlainObjectRecord(replacement)) {
+      throw new Error('Invalid Trip replacement payload.');
+    }
+    if (replacement.defaultInviteRole === undefined) {
+      query.setUpdate({
+        ...replacement,
+        defaultInviteRole: DEFAULT_OPEN_INVITE_ROLE,
+      });
+    } else if (replacement.defaultInviteRole !== DEFAULT_OPEN_INVITE_ROLE) {
+      throw new Error(
+        `Trip defaultInviteRole must remain ${DEFAULT_OPEN_INVITE_ROLE}.`
+      );
+    }
+    next();
+  } catch (err) {
+    next(err instanceof Error ? err : new Error('Invalid Trip replacement'));
+  }
+});
+
+tripSchema.pre('save', async function () {
+  if (!this.isNew && this.isModified('defaultInviteRole')) {
+    throw new Error(
+      `Trip defaultInviteRole is immutable and must remain ${DEFAULT_OPEN_INVITE_ROLE}.`
+    );
+  }
+  if (
+    (this.isNew || this.isSelected('defaultInviteRole') || this.isModified('defaultInviteRole')) &&
+    this.defaultInviteRole !== DEFAULT_OPEN_INVITE_ROLE
+  ) {
+    throw new Error(`Trip defaultInviteRole must remain ${DEFAULT_OPEN_INVITE_ROLE}.`);
+  }
+});
+
+tripSchema.pre('insertMany', function (next, docs: unknown[]) {
+  try {
+    if (!Array.isArray(docs)) {
+      throw new Error('Invalid insertMany payload for Trip.');
+    }
+    for (const doc of docs) {
+      if (isPlainObjectRecord(doc) && doc.defaultInviteRole !== undefined) {
+        if (doc.defaultInviteRole !== DEFAULT_OPEN_INVITE_ROLE) {
+          throw new Error(
+            `Trip defaultInviteRole must be ${DEFAULT_OPEN_INVITE_ROLE}, received ${String(
+              doc.defaultInviteRole
+            )}.`
+          );
+        }
+      }
+    }
+    next();
+  } catch (err) {
+    next(err instanceof Error ? err : new Error('Invalid Trip insertMany'));
+  }
+});
 
 export const TripModel = mongoose.model<ITrip>('Trip', tripSchema);

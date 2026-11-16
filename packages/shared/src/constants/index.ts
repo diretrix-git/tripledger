@@ -7,6 +7,22 @@ export type TripStatus = (typeof TRIP_STATUSES)[number];
 export const TRIP_ROLES = ['ORGANIZER', 'CONTRIBUTOR', 'FAMILY_REP', 'PARTICIPANT'] as const;
 export type TripRole = (typeof TRIP_ROLES)[number];
 
+export const PRIVILEGED_TRIP_ROLES = ['ORGANIZER', 'FAMILY_REP'] as const;
+export type PrivilegedTripRole = (typeof PRIVILEGED_TRIP_ROLES)[number];
+
+export const DEFAULT_OPEN_INVITE_ROLE = 'PARTICIPANT' as const satisfies TripRole;
+
+export function isPrivilegedTripRole(role: TripRole): role is PrivilegedTripRole {
+  return (PRIVILEGED_TRIP_ROLES as readonly string[]).includes(role);
+}
+
+export const DEFAULT_PARTICIPANT_INVITE_TTL_HOURS = 48;
+export const MAX_PARTICIPANT_INVITE_TTL_HOURS = 168;
+export const EMAIL_VERIFICATION_TTL_MINUTES = 30;
+
+export const EMAIL_DELIVERY_PROVIDERS = ['DISABLED', 'MEMORY', 'SMTP', 'WEBHOOK'] as const;
+export type EmailDeliveryProvider = (typeof EMAIL_DELIVERY_PROVIDERS)[number];
+
 export const MEMBER_TYPES = ['ADULT', 'CHILD', 'DEPENDENT'] as const;
 export type MemberType = (typeof MEMBER_TYPES)[number];
 

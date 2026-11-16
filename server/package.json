@@ -9,7 +9,11 @@
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --no-file-parallelism"
+    "test": "vitest run --no-file-parallelism",
+    "migrate:participant-user-index": "node dist/migrations/migrateParticipantUserIndex.js",
+    "migrate:participant-user-index:dev": "tsx src/migrations/migrateParticipantUserIndex.ts",
+    "migrate:participant-audit": "node dist/migrations/migrateParticipantUserIndex.js --audit-only",
+    "migrate:participant-audit:dev": "tsx src/migrations/migrateParticipantUserIndex.ts --audit-only"
   },
   "dependencies": {
     "@tripledger/shared": "*",

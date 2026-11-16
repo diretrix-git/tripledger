@@ -6,17 +6,27 @@ import { env } from './env.js';
 
 let localMongodProcess: ChildProcess | null = null;
 
+export interface ConnectDatabaseOptions {
+  autoIndex?: boolean;
+}
+
 /**
  * Connects to MongoDB. If the local MongoDB service is stopped on Windows,
  * automatically starts a local mongod.exe subprocess using `.data/mongodb` in the workspace
  * (or falls back to mongodb-memory-server if configured).
  */
-export async function connectDatabase(uriOverride?: string): Promise<void> {
+export async function connectDatabase(
+  uriOverride?: string,
+  options?: ConnectDatabaseOptions
+): Promise<void> {
   const targetUri = uriOverride ?? env.MONGODB_URI;
+  const autoIndexOpt =
+    options?.autoIndex !== undefined ? { autoIndex: options.autoIndex } : {};
 
   try {
     await mongoose.connect(targetUri, {
       serverSelectionTimeoutMS: 2500,
+      ...autoIndexOpt,
     });
     return;
   } catch (initialError) {
@@ -43,7 +53,10 @@ export async function connectDatabase(uriOverride?: string): Promise<void> {
       for (let attempt = 0; attempt < 15; attempt++) {
         await new Promise((r) => setTimeout(r, 400));
         try {
-          await mongoose.connect(targetUri, { serverSelectionTimeoutMS: 1000 });
+          await mongoose.connect(targetUri, {
+            serverSelectionTimeoutMS: 1000,
+            ...autoIndexOpt,
+          });
           return;
         } catch {
           // continue waiting

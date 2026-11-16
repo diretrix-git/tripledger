@@ -24,7 +24,11 @@
     "test:shared": "npm --workspace=@tripledger/shared run test",
     "test:server": "npm --workspace=@tripledger/server run test",
     "test:client": "npm --workspace=@tripledger/client run test",
-    "test": "npm run test:shared && npm run test:server && npm run test:client"
+    "test": "npm run test:shared && npm run test:server && npm run test:client",
+    "migrate:participant-audit": "npm --workspace=@tripledger/server run migrate:participant-audit",
+    "migrate:participant-audit:dev": "npm --workspace=@tripledger/server run migrate:participant-audit:dev",
+    "migrate:participant-user-index": "npm --workspace=@tripledger/server run migrate:participant-user-index",
+    "migrate:participant-user-index:dev": "npm --workspace=@tripledger/server run migrate:participant-user-index:dev"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

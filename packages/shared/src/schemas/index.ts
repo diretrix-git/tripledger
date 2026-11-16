@@ -1,7 +1,10 @@
 import { z } from 'zod';
 import {
+  DEFAULT_PARTICIPANT_INVITE_TTL_HOURS,
   EXPENSE_APPROVAL_STATUSES,
   EXPENSE_CATEGORIES,
+  isPrivilegedTripRole,
+  MAX_PARTICIPANT_INVITE_TTL_HOURS,
   MEMBER_TYPES,
   PAYMENT_METHODS,
   SETTLEMENT_MODES,
@@ -10,6 +13,7 @@ import {
   TRIP_MODES,
   TRIP_ROLES,
   TRIP_STATUSES,
+  type TripRole,
 } from '../constants/index.js';
 
 export const registerUserSchema = z.object({
@@ -52,6 +56,16 @@ export const updateTripSchema = z.object({
   startDate: z.string().optional(),
   endDate: z.string().optional(),
   shareEnabled: z.boolean().optional(),
+  inviteEnabled: z.boolean().optional(),
+  inviteExpiresAt: z
+    .string()
+    .trim()
+    .datetime({
+      offset: true,
+      message: 'inviteExpiresAt must be an ISO-8601 datetime with timezone offset (e.g. Z or +05:45)',
+    })
+    .nullable()
+    .optional(),
 });
 
 export const updateChecklistItemSchema = z.object({
@@ -169,3 +183,82 @@ export const updateSettlementStatusSchema = z.object({
   status: z.enum(['CONFIRMED', 'REJECTED']),
   referenceNote: z.string().trim().max(300).optional(),
 });
+
+const optionalNormalizedEmailSchema = z
+  .string()
+  .trim()
+  .email('Please enter a valid email address')
+  .toLowerCase()
+  .optional()
+  .or(z.literal(''))
+  .transform((value) => (value && value.length > 0 ? value : undefined));
+
+export const verifyEmailSchema = z.object({
+  token: z.string().trim().min(16, 'Verification token is required').max(256),
+});
+
+export const createParticipantInviteSchema = z.object({
+  intendedEmail: optionalNormalizedEmailSchema,
+  expiresInHours: z
+    .number()
+    .int()
+    .min(1, 'Invite expiration must be at least 1 hour')
+    .max(
+      MAX_PARTICIPANT_INVITE_TTL_HOURS,
+      `Invite expiration cannot exceed ${MAX_PARTICIPANT_INVITE_TTL_HOURS} hours`
+    )
+    .default(DEFAULT_PARTICIPANT_INVITE_TTL_HOURS),
+});
+
+export const claimParticipantInviteSchema = z.object({
+  token: z.string().trim().min(16, 'Invite token is required').max(256),
+});
+
+export const joinTripSchema = z.object({}).strict();
+
+export interface ParticipantInvitePolicyResult {
+  intendedEmail: string | null;
+  requireVerifiedEmail: boolean;
+}
+
+const strictEmailSchema = z.string().trim().email('Please enter a valid intendedEmail').toLowerCase();
+
+/**
+ * Enforces participant invite security invariants across shared contracts and DB models:
+ * - Privileged roles (`ORGANIZER`, `FAMILY_REP`) MUST specify a valid `intendedEmail` and
+ *   require verified email ownership (`requireVerifiedEmail: true`).
+ * - Any email-bound invite (for any role) MUST enforce `requireVerifiedEmail: true`.
+ */
+export function resolveParticipantInvitePolicy(params: {
+  role: TripRole;
+  intendedEmail?: string | null;
+  requireVerifiedEmail?: boolean;
+}): ParticipantInvitePolicyResult {
+  const rawEmail = typeof params.intendedEmail === 'string' ? params.intendedEmail.trim() : '';
+  const normalizedEmail = rawEmail.length > 0 ? strictEmailSchema.parse(rawEmail) : null;
+  const privileged = isPrivilegedTripRole(params.role);
+
+  if (privileged && !normalizedEmail) {
+    throw new Error(
+      `Privileged role ${params.role} invitations require an intendedEmail bound to a verified account.`
+    );
+  }
+
+  if (privileged && params.requireVerifiedEmail === false) {
+    throw new Error(
+      `Privileged role ${params.role} invitations require email verification and cannot disable requireVerifiedEmail.`
+    );
+  }
+
+  if (normalizedEmail !== null && params.requireVerifiedEmail === false) {
+    throw new Error(
+      'Invitations specifying an intendedEmail must require verified email ownership.'
+    );
+  }
+
+  return {
+    intendedEmail: normalizedEmail,
+    requireVerifiedEmail:
+      privileged || normalizedEmail !== null ? true : Boolean(params.requireVerifiedEmail),
+  };
+}

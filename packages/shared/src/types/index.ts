@@ -163,8 +163,53 @@ export interface TripSummaryEntity {
   budgetPaisa?: number;
   startDate?: string;
   endDate?: string;
+  /**
+   * Required on TripSummaryEntity during Phase 1 for backward compatibility with existing
+   * client callers (`TripDetailPage.tsx`). Phase 3/4 must narrow this to `inviteCode?: string`
+   * when restricting inviteCode visibility to `ORGANIZER` responses alongside UI updates.
+   */
   inviteCode: string;
+  inviteEnabled?: boolean;
+  inviteExpiresAt?: string | null;
+  inviteCodeRotatedAt?: string | null;
+  defaultInviteRole?: 'PARTICIPANT';
   shareToken: string;
   shareEnabled: boolean;
   checklist: ChecklistItem[];
+}
+
+export interface AuthUserEntity {
+  id: string;
+  name: string;
+  email: string;
+  emailVerified: boolean;
+  emailVerifiedAt?: string | null;
+  phone?: string;
+  defaultCurrency: string;
+}
+
+export interface ParticipantInviteEntity {
+  id: string;
+  tripId: string;
+  participantId: string;
+  intendedEmail: string | null;
+  grantedRole: TripRole;
+  requireVerifiedEmail: boolean;
+  expiresAt: string;
+  usedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+export interface PendingParticipantInviteEntity {
+  id: string;
+  tripId: string;
+  tripName: string;
+  tripMode: TripMode;
+  participantId: string;
+  participantName: string;
+  grantedRole: TripRole;
+  intendedEmail: string;
+  requireVerifiedEmail: boolean;
+  expiresAt: string;
 }

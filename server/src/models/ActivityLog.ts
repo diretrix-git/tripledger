@@ -7,7 +7,7 @@ export interface IActivityLog extends Document {
   actorParticipantId?: mongoose.Types.ObjectId | null;
   actorName: string;
   actionType: string;
-  entityType: 'TRIP' | 'PARTICIPANT' | 'FAMILY' | 'EXPENSE' | 'SETTLEMENT';
+  entityType: 'TRIP' | 'PARTICIPANT' | 'PARTICIPANT_INVITE' | 'FAMILY' | 'EXPENSE' | 'SETTLEMENT';
   entityId: mongoose.Types.ObjectId;
   summary: string;
   metadata?: Record<string, unknown>;
@@ -23,7 +23,7 @@ const activityLogSchema = new Schema<IActivityLog>(
     actionType: { type: String, required: true },
     entityType: {
       type: String,
-      enum: ['TRIP', 'PARTICIPANT', 'FAMILY', 'EXPENSE', 'SETTLEMENT'],
+      enum: ['TRIP', 'PARTICIPANT', 'PARTICIPANT_INVITE', 'FAMILY', 'EXPENSE', 'SETTLEMENT'],
       required: true,
     },
     entityId: { type: Schema.Types.ObjectId, required: true },
