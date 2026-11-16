@@ -31,12 +31,14 @@ Base URL: `/api/v1`
 
 | Method | Endpoint | Auth | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/auth/register` | Public | Register a new user account; sets HTTP-only refresh cookie & returns access token |
-| `POST` | `/auth/login` | Public | Authenticate with email/password; returns access token & user profile |
-| `POST` | `/auth/refresh` | Cookie / Token | Rotate refresh token and issue new short-lived access token |
+| `POST` | `/auth/register` | Public (Rate-Limited) | Register a new unverified user account (`emailVerified: false`), send email verification token, set HTTP-only refresh cookie & return access token. Returns `409 EMAIL_EXISTS` on duplicate email. On email delivery failure (`503 EMAIL_DELIVERY_FAILED`), preserves the unverified account and hashed token so the user can log in and resend verification. |
+| `POST` | `/auth/login` | Public (Rate-Limited) | Authenticate with email/password (permitted for unverified accounts); returns access token & `AuthUserEntity` (`emailVerified`, `emailVerifiedAt`). Never auto-links guest participants. |
+| `POST` | `/auth/verify-email` | Public (Token + Rate-Limited) | Verify account email ownership with single-use 30-minute `{ token }`. Marks `emailVerified: true` atomically without touching any `Participant` records. |
+| `POST` | `/auth/resend-verification` | Authenticated (Rate-Limited) | Rotate and resend the authenticated user's email verification link (invalidating previous unredeemed tokens). |
+| `POST` | `/auth/refresh` | Cookie / Token | Rotate refresh token and issue new short-lived access token with updated `AuthUserEntity`. |
 | `POST` | `/auth/logout` | Authenticated | Clear refresh token hash and expire HTTP-only cookie |
-| `GET` | `/auth/me` | Authenticated | Get current authenticated user profile and cross-trip balance summary |
-| `PATCH` | `/auth/me` | Authenticated | Update user profile (name, phone) |
+| `GET` | `/auth/me` | Authenticated | Get current authenticated user profile (`emailVerified`, `emailVerifiedAt`, currency) |
+| `PATCH` | `/auth/me` | Authenticated | Update user profile (`name`, `phone`). Account `email` is immutable. |
 
 ---
 
@@ -55,8 +57,8 @@ Base URL: `/api/v1`
 | `POST` | `/trips` | Authenticated | Create a new trip (`FRIENDS` or `FAMILY` mode) and auto-enroll creator as `ORGANIZER` |
 | `GET` | `/trips` | Authenticated | List trips where the user is a participant (filterable by `mode`, `status`) |
 | `GET` | `/trips/:tripId` | Participant | Get full trip details, participants, families, checklist, and financial summary |
-| `PATCH` | `/trips/:tripId` | Organizer | Update trip metadata, dates, budget, or status (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`) |
-| `POST` | `/trips/join/:inviteCode` | Authenticated | Join a trip via invite code (or link to an existing guest participant slot) |
+| `PATCH` | `/trips/:tripId` | Organizer | Update trip metadata, dates, budget, `inviteEnabled`, `inviteExpiresAt`, or status (`PLANNING`, `ACTIVE`, `REVIEW`, `CLOSED`) |
+| `POST` | `/trips/join/:inviteCode` | Authenticated | Join a trip as low-privilege `PARTICIPANT` (`DEFAULT_OPEN_INVITE_ROLE`) via an enabled, unexpired invite code. Strictly rejects guest-slot claiming (`guestParticipantId`), deactivated participant reactivation, or email matching. |
 | `PATCH` | `/trips/:tripId/checklist` | Organizer | Update Forgotten Expense Protection checklist items before closing trip |
 | `POST` | `/trips/:tripId/close` | Organizer | Verify checklist completion, check pending expenses, and finalize/close trip |
 
@@ -66,8 +68,8 @@ Base URL: `/api/v1`
 
 | Method | Endpoint | Minimum Role | Description |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/trips/:tripId/participants` | Organizer | Add a guest or linked participant (with `role`, `memberType`, `familyId`, `defaultWeight`) |
-| `PATCH` | `/trips/:tripId/participants/:participantId` | Organizer | Update participant details, role, weight, family assignment, or link a registered user |
+| `POST` | `/trips/:tripId/participants` | Organizer | Create an unlinked guest participant (`userId: null` always; never auto-links existing accounts by email) |
+| `PATCH` | `/trips/:tripId/participants/:participantId` | Organizer | Update participant details, role, weight, family assignment, or active status (blocks changing email on linked participants and demoting/deactivating the sole active `ORGANIZER`) |
 | `DELETE` | `/trips/:tripId/participants/:participantId` | Organizer | Deactivate/remove participant (blocked if participant has active financial records) |
 | `POST` | `/trips/:tripId/families` | Organizer | Create a family group in Family Mode and optionally assign representative |
 | `PATCH` | `/trips/:tripId/families/:familyId` | Organizer | Update family name, representative (`representativeId`), or default weight |

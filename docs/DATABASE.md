@@ -213,6 +213,15 @@ Immutable audit trail of important financial and structural actions within a tri
 - `metadata`: `Mixed` (JSON snapshot of before/after values in paisa)
 - `createdAt`: `Date` (indexed)
 
+### 3.10 `RateLimitBuckets` (`rate_limit_buckets`)
+Shared fixed-window HTTP rate-limit counter buckets when `RATE_LIMIT_STORE=mongo` (default in production for multi-instance topologies).
+- `_id`: `ObjectId`
+- `key`: `String` (required, unique — `<limiter-prefix><client-key>:<windowStartMs>`)
+- `hits`: `Number` (default: `0`, integer counter)
+- `expiresAt`: `Date` (required — window expiration timestamp for MongoDB TTL cleanup)
+
+**Indexes:** `{ key: 1 }` (unique), `{ expiresAt: 1 }` (TTL with `expireAfterSeconds: 0`)
+
 ---
 
 ## 4. Database Migrations & Safe Deployment Procedure
