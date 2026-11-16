@@ -183,12 +183,14 @@ export async function issueParticipantInvite(params: {
         }
       }
 
+      let boundFamilyId: mongoose.Types.ObjectId | null = null;
       if (parsed.grantedRole === 'FAMILY_REP') {
-        await assertParticipantEligibleForFamilyRepInvite({
+        const eligibleFamily = await assertParticipantEligibleForFamilyRepInvite({
           trip: liveTrip,
           participant: targetParticipant,
           session,
         });
+        boundFamilyId = eligibleFamily._id;
       }
 
       const now = new Date();
@@ -223,6 +225,7 @@ export async function issueParticipantInvite(params: {
           {
             tripId: trip._id,
             participantId: targetParticipant._id,
+            familyId: boundFamilyId,
             invitedByUserId: inviterObjectId,
             invitedByParticipantId: actorParticipant._id,
             tokenHash,
@@ -352,7 +355,7 @@ export async function listPendingInvitesForVerifiedUser(
 
   const [trips, participants] = await Promise.all([
     TripModel.find({ _id: { $in: tripIds } }).select('name mode status'),
-    ParticipantModel.find({ _id: { $in: participantIds } }).select('name userId isActive'),
+    ParticipantModel.find({ _id: { $in: participantIds } }).select('name userId isActive familyId'),
   ]);
 
   const tripMap = new Map(trips.map((t) => [t._id.toString(), t]));
@@ -366,6 +369,13 @@ export async function listPendingInvitesForVerifiedUser(
       continue;
     }
     if (participant.userId && participant.userId.toString() !== user._id.toString()) {
+      continue;
+    }
+    if (
+      inv.grantedRole === 'FAMILY_REP' &&
+      inv.familyId &&
+      (!participant.familyId || participant.familyId.toString() !== inv.familyId.toString())
+    ) {
       continue;
     }
     results.push({
@@ -548,6 +558,19 @@ export async function claimParticipantInviteForUser(params: {
             })
           : null;
 
+      if (
+        liveInvite.grantedRole === 'FAMILY_REP' &&
+        liveInvite.familyId &&
+        eligibleFamily &&
+        !liveInvite.familyId.equals(eligibleFamily._id)
+      ) {
+        throw new AppError(
+          'This FAMILY_REP invitation was issued for a different family group and is no longer valid.',
+          409,
+          'INVITE_FAMILY_MISMATCH'
+        );
+      }
+
       // Atomically mark the invitation used before mutating the participant so replay/concurrent
       // claims fail closed immediately at single-use transition.
       const claimedInvite = await ParticipantInviteModel.findOneAndUpdate(
@@ -577,7 +600,8 @@ export async function claimParticipantInviteForUser(params: {
         );
       }
 
-      txState.rollbackSnapshot = captureParticipantUpdateSnapshot(participant);
+      const participantSnap = captureParticipantUpdateSnapshot(participant);
+      txState.rollbackSnapshot = participantSnap;
 
       if (!participant.userId) {
         participant.userId = user._id;
@@ -587,6 +611,7 @@ export async function claimParticipantInviteForUser(params: {
 
       try {
         await participant.save(session ? { session } : undefined);
+        participantSnap.expectedUpdatedAt = participant.updatedAt;
       } catch (err) {
         if (isDuplicateKeyError(err)) {
           throw new AppError(
@@ -599,8 +624,11 @@ export async function claimParticipantInviteForUser(params: {
       }
 
       if (claimedInvite.grantedRole === 'FAMILY_REP' && eligibleFamily) {
-        if (!eligibleFamily.representativeId) {
-          txState.familySnapshots.push(captureFamilySnapshot(eligibleFamily));
+        const famSnap = !eligibleFamily.representativeId
+          ? captureFamilySnapshot(eligibleFamily)
+          : null;
+        if (famSnap) {
+          txState.familySnapshots.push(famSnap);
         }
         const boundFamily = await FamilyModel.findOneAndUpdate(
           {
@@ -618,15 +646,20 @@ export async function claimParticipantInviteForUser(params: {
             'FAMILY_ALREADY_HAS_REPRESENTATIVE'
           );
         }
+        if (famSnap) {
+          famSnap.expectedUpdatedAt = boundFamily.updatedAt;
+        }
       } else if (wasFamilyRep && !isPrivilegedTripRole(claimedInvite.grantedRole)) {
         const affectedFamilies = await FamilyModel.find({
           tripId: trip._id,
           representativeId: participant._id,
         }).session(session);
         for (const fam of affectedFamilies) {
-          txState.familySnapshots.push(captureFamilySnapshot(fam));
+          const famSnap = captureFamilySnapshot(fam);
+          txState.familySnapshots.push(famSnap);
           fam.representativeId = null;
           await fam.save(session ? { session } : undefined);
+          famSnap.expectedUpdatedAt = fam.updatedAt;
         }
       }
 
@@ -651,7 +684,12 @@ export async function claimParticipantInviteForUser(params: {
       await restoreFamilySnapshots(txState.familySnapshots);
       if (!txState.rollbackSnapshot) return;
       await ParticipantModel.updateOne(
-        { _id: txState.rollbackSnapshot._id },
+        {
+          _id: txState.rollbackSnapshot._id,
+          ...(txState.rollbackSnapshot.expectedUpdatedAt
+            ? { updatedAt: txState.rollbackSnapshot.expectedUpdatedAt }
+            : {}),
+        },
         buildParticipantUpdateRestoreOp(txState.rollbackSnapshot)
       );
     },

@@ -16,6 +16,7 @@ export interface IParticipantInvite extends Document {
   _id: mongoose.Types.ObjectId;
   tripId: mongoose.Types.ObjectId;
   participantId: mongoose.Types.ObjectId;
+  familyId?: mongoose.Types.ObjectId | null;
   invitedByUserId: mongoose.Types.ObjectId;
   invitedByParticipantId: mongoose.Types.ObjectId;
   tokenHash: string;
@@ -37,6 +38,7 @@ export const PARTICIPANT_INVITE_EMAIL_PENDING_INDEX_NAME = 'intendedEmail_pendin
 const IMMUTABLE_INVITE_FIELDS = new Set<string>([
   'tripId',
   'participantId',
+  'familyId',
   'invitedByUserId',
   'invitedByParticipantId',
   'tokenHash',
@@ -110,6 +112,12 @@ const participantInviteSchema = new Schema<IParticipantInvite>(
       required: true,
       immutable: true,
       index: true,
+    },
+    familyId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Family',
+      default: null,
+      immutable: true,
     },
     invitedByUserId: {
       type: Schema.Types.ObjectId,
@@ -347,6 +355,7 @@ participantInviteSchema.pre('save', async function () {
   const objectIdImmutableFields = [
     'tripId',
     'participantId',
+    'familyId',
     'invitedByUserId',
     'invitedByParticipantId',
   ] as const;

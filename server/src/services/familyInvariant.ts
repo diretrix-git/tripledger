@@ -29,6 +29,7 @@ export interface FamilyUpdateSnapshot {
   representativeId: mongoose.Types.ObjectId | null | undefined;
   defaultWeight: number;
   notes: string | undefined;
+  expectedUpdatedAt?: Date;
 }
 
 export function captureFamilySnapshot(family: IFamily): FamilyUpdateSnapshot {
@@ -59,16 +60,57 @@ export function buildFamilyRestoreOp(snapshot: FamilyUpdateSnapshot) {
 export async function restoreFamilySnapshots(
   snapshots: readonly FamilyUpdateSnapshot[]
 ): Promise<void> {
-  for (const snap of snapshots) {
-    await FamilyModel.updateOne({ _id: snap._id }, buildFamilyRestoreOp(snap));
+  for (let i = snapshots.length - 1; i >= 0; i--) {
+    const snap = snapshots[i]!;
+    await FamilyModel.updateOne(
+      {
+        _id: snap._id,
+        ...(snap.expectedUpdatedAt ? { updatedAt: snap.expectedUpdatedAt } : {}),
+      },
+      buildFamilyRestoreOp(snap)
+    );
   }
 }
 
 export async function restoreParticipantSnapshots(
   snapshots: readonly ParticipantUpdateSnapshot[]
 ): Promise<void> {
-  for (const snap of snapshots) {
-    await ParticipantModel.updateOne({ _id: snap._id }, buildParticipantUpdateRestoreOp(snap));
+  for (let i = snapshots.length - 1; i >= 0; i--) {
+    const snap = snapshots[i]!;
+    await ParticipantModel.updateOne(
+      {
+        _id: snap._id,
+        ...(snap.expectedUpdatedAt ? { updatedAt: snap.expectedUpdatedAt } : {}),
+      },
+      buildParticipantUpdateRestoreOp(snap)
+    );
+  }
+}
+
+export interface RevokedInviteRollbackRecord {
+  inviteIds: mongoose.Types.ObjectId[];
+  revokedAt: Date;
+}
+
+export async function restoreRevokedInviteRecords(
+  records: readonly RevokedInviteRollbackRecord[]
+): Promise<void> {
+  for (let i = records.length - 1; i >= 0; i--) {
+    const rec = records[i]!;
+    if (rec.inviteIds.length === 0) continue;
+    await ParticipantInviteModel.collection.updateMany(
+      {
+        _id: { $in: rec.inviteIds },
+        revokedAt: rec.revokedAt,
+        usedAt: null,
+      },
+      {
+        $set: {
+          revokedAt: null,
+          revokedByParticipantId: null,
+        },
+      }
+    );
   }
 }
 
@@ -168,11 +210,12 @@ export async function assertParticipantEligibleAsFamilyRepresentative(params: {
 
   if (
     participant.role === 'FAMILY_REP' &&
-    participant.familyId &&
-    (!targetFamilyId || !participant.familyId.equals(targetFamilyId))
+    (!participant.familyId || !targetFamilyId || !participant.familyId.equals(targetFamilyId))
   ) {
     throw new AppError(
-      'Participant currently holds FAMILY_REP role in another family. Demote or move them from their current family first.',
+      !participant.familyId
+        ? 'Participant holds a legacy FAMILY_REP role without a family assignment and cannot be assigned directly. Demote them to PARTICIPANT first.'
+        : 'Participant currently holds FAMILY_REP role in another family. Demote or move them from their current family first.',
       409,
       'PARTICIPANT_FAMILY_REP_CONFLICT'
     );
@@ -258,23 +301,41 @@ export async function revokePendingParticipantInvites(params: {
   actorParticipantId: mongoose.Types.ObjectId;
   grantedRole?: 'FAMILY_REP';
   session: ClientSession | null;
-}): Promise<void> {
-  if (params.participantIds.length === 0) return;
+}): Promise<RevokedInviteRollbackRecord | null> {
+  if (params.participantIds.length === 0) return null;
+
+  const pendingDocs = await ParticipantInviteModel.find({
+    tripId: params.tripId,
+    participantId: { $in: params.participantIds },
+    ...(params.grantedRole ? { grantedRole: params.grantedRole } : {}),
+    usedAt: null,
+    revokedAt: null,
+  })
+    .select('_id')
+    .session(params.session)
+    .lean();
+
+  if (pendingDocs.length === 0) {
+    return null;
+  }
+
+  const inviteIds = pendingDocs.map((doc) => doc._id);
+  const revokedAt = new Date();
 
   await ParticipantInviteModel.updateMany(
     {
-      tripId: params.tripId,
-      participantId: { $in: params.participantIds },
-      ...(params.grantedRole ? { grantedRole: params.grantedRole } : {}),
+      _id: { $in: inviteIds },
       usedAt: null,
       revokedAt: null,
     },
     {
       $set: {
-        revokedAt: new Date(),
+        revokedAt,
         revokedByParticipantId: params.actorParticipantId,
       },
     },
     params.session ? { session: params.session } : undefined
   );
+
+  return { inviteIds, revokedAt };
 }

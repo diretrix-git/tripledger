@@ -35,9 +35,11 @@ import {
   collectParticipantSnapshots,
   restoreFamilySnapshots,
   restoreParticipantSnapshots,
+  restoreRevokedInviteRecords,
   revokePendingParticipantInvites,
   sameObjectId,
   type FamilyUpdateSnapshot,
+  type RevokedInviteRollbackRecord,
 } from '../services/familyInvariant.js';
 import { loadTripLedgerData, logTripActivity } from '../services/ledgerService.js';
 import {
@@ -621,9 +623,11 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
     updatedParticipant?: IParticipant;
     participantSnapshots: ParticipantUpdateSnapshot[];
     familySnapshots: FamilyUpdateSnapshot[];
+    revokedInvites: RevokedInviteRollbackRecord[];
   } = {
     participantSnapshots: [],
     familySnapshots: [],
+    revokedInvites: [],
   };
 
   await runSerializedTripOrganizerMutation({
@@ -632,6 +636,7 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
       txState.updatedParticipant = undefined;
       txState.participantSnapshots = [];
       txState.familySnapshots = [];
+      txState.revokedInvites = [];
 
       await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
@@ -758,20 +763,30 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
         }
       }
 
-      txState.participantSnapshots.push(captureParticipantUpdateSnapshot(participant));
+      const participantSnap = captureParticipantUpdateSnapshot(participant);
+      txState.participantSnapshots.push(participantSnap);
 
-      // Clear stale Family.representativeId links when deactivating or moving out of a family.
-      if (isDeactivating || familyChanged) {
+      // Clear stale Family.representativeId links when deactivating, moving out of a family,
+      // or explicitly demoting an in-place FAMILY_REP to PARTICIPANT/CONTRIBUTOR.
+      const isDemotingFromFamilyRep =
+        participant.role === 'FAMILY_REP' && resolvedNextRole !== 'FAMILY_REP';
+      if (isDeactivating || familyChanged || isDemotingFromFamilyRep) {
         const affectedFamilies = await FamilyModel.find({
           tripId: trip._id,
           representativeId: participant._id,
         }).session(session);
 
         for (const fam of affectedFamilies) {
-          if (isDeactivating || !sameObjectId(fam._id, validatedFamilyId ?? null)) {
-            txState.familySnapshots.push(captureFamilySnapshot(fam));
+          if (
+            isDeactivating ||
+            isDemotingFromFamilyRep ||
+            !sameObjectId(fam._id, validatedFamilyId ?? null)
+          ) {
+            const famSnap = captureFamilySnapshot(fam);
+            txState.familySnapshots.push(famSnap);
             fam.representativeId = null;
             await fam.save(session ? { session } : undefined);
+            famSnap.expectedUpdatedAt = fam.updatedAt;
           }
         }
       }
@@ -788,26 +803,26 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
       }
 
       await participant.save(session ? { session } : undefined);
+      participantSnap.expectedUpdatedAt = participant.updatedAt;
 
       // Revoke pending invites when deactivated, or pending FAMILY_REP invites when moved/demoted.
       if (isDeactivating) {
-        await revokePendingParticipantInvites({
+        const revoked = await revokePendingParticipantInvites({
           tripId: trip._id,
           participantIds: [participant._id],
           actorParticipantId: actor._id,
           session,
         });
-      } else if (
-        familyChanged ||
-        (txState.participantSnapshots[0]?.role === 'FAMILY_REP' && resolvedNextRole !== 'FAMILY_REP')
-      ) {
-        await revokePendingParticipantInvites({
+        if (revoked) txState.revokedInvites.push(revoked);
+      } else if (familyChanged || isDemotingFromFamilyRep) {
+        const revoked = await revokePendingParticipantInvites({
           tripId: trip._id,
           participantIds: [participant._id],
           actorParticipantId: actor._id,
           grantedRole: 'FAMILY_REP',
           session,
         });
+        if (revoked) txState.revokedInvites.push(revoked);
       }
 
       // Post-write invariant assertion (belt-and-suspenders) inside serialized scope
@@ -827,6 +842,7 @@ export const updateParticipant = asyncHandler(async (req: Request, res: Response
       txState.updatedParticipant = participant;
     },
     rollback: async () => {
+      await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreFamilySnapshots(txState.familySnapshots);
       await restoreParticipantSnapshots(txState.participantSnapshots);
     },
@@ -992,8 +1008,10 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
   const txState: {
     createdFamily?: IFamily;
     participantSnapshots: ParticipantUpdateSnapshot[];
+    revokedInvites: RevokedInviteRollbackRecord[];
   } = {
     participantSnapshots: [],
+    revokedInvites: [],
   };
 
   await runSerializedTripOrganizerMutation({
@@ -1001,6 +1019,7 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
     work: async (session) => {
       txState.createdFamily = undefined;
       txState.participantSnapshots = [];
+      txState.revokedInvites = [];
 
       await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
@@ -1058,12 +1077,27 @@ export const createFamily = asyncHandler(async (req: Request, res: Response) => 
       txState.createdFamily = family;
 
       if (repParticipant) {
-        txState.participantSnapshots.push(captureParticipantUpdateSnapshot(repParticipant));
+        const hadDifferentFamily = !sameObjectId(repParticipant.familyId ?? null, family._id);
+        const repSnap = captureParticipantUpdateSnapshot(repParticipant);
+        txState.participantSnapshots.push(repSnap);
         repParticipant.familyId = family._id;
         await repParticipant.save(session ? { session } : undefined);
+        repSnap.expectedUpdatedAt = repParticipant.updatedAt;
+
+        if (hadDifferentFamily) {
+          const revoked = await revokePendingParticipantInvites({
+            tripId: trip._id,
+            participantIds: [repParticipant._id],
+            actorParticipantId: actor._id,
+            grantedRole: 'FAMILY_REP',
+            session,
+          });
+          if (revoked) txState.revokedInvites.push(revoked);
+        }
       }
     },
     rollback: async () => {
+      await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreParticipantSnapshots(txState.participantSnapshots);
       if (txState.createdFamily) {
         await FamilyModel.deleteOne({ _id: txState.createdFamily._id });
@@ -1117,9 +1151,11 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
     updatedFamily?: IFamily;
     familySnapshots: FamilyUpdateSnapshot[];
     participantSnapshots: ParticipantUpdateSnapshot[];
+    revokedInvites: RevokedInviteRollbackRecord[];
   } = {
     familySnapshots: [],
     participantSnapshots: [],
+    revokedInvites: [],
   };
 
   await runSerializedTripOrganizerMutation({
@@ -1128,6 +1164,7 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
       txState.updatedFamily = undefined;
       txState.familySnapshots = [];
       txState.participantSnapshots = [];
+      txState.revokedInvites = [];
 
       await assertFreshActiveOrganizerActor(trip._id, actor._id, session);
 
@@ -1149,7 +1186,8 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
         throw new AppError('Family group not found.', 404, 'FAMILY_NOT_FOUND');
       }
 
-      txState.familySnapshots.push(captureFamilySnapshot(family));
+      const famSnap = captureFamilySnapshot(family);
+      txState.familySnapshots.push(famSnap);
 
       if (parsed.name !== undefined) family.name = parsed.name;
       if (parsed.defaultWeight !== undefined) family.defaultWeight = parsed.defaultWeight;
@@ -1176,6 +1214,9 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
 
         const newRepObjectId = newRepParticipant ? newRepParticipant._id : null;
         const isRepChanging = !sameObjectId(previousRepId, newRepObjectId);
+        const isRehomingNewRep =
+          Boolean(newRepParticipant) &&
+          !sameObjectId(newRepParticipant!.familyId ?? null, family._id);
 
         if (isRepChanging) {
           const repIdsToDemote: mongoose.Types.ObjectId[] = [];
@@ -1189,9 +1230,11 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
             if (prevRep) {
               touchedRepIds.add(prevRep._id.toString());
               if (prevRep.role === 'FAMILY_REP') {
-                txState.participantSnapshots.push(captureParticipantUpdateSnapshot(prevRep));
+                const prevSnap = captureParticipantUpdateSnapshot(prevRep);
+                txState.participantSnapshots.push(prevSnap);
                 prevRep.role = DEFAULT_OPEN_INVITE_ROLE;
                 await prevRep.save(session ? { session } : undefined);
+                prevSnap.expectedUpdatedAt = prevRep.updatedAt;
               }
               repIdsToDemote.push(prevRep._id);
             }
@@ -1206,14 +1249,18 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
           }).session(session);
           for (const extraRep of lingeringFamilyReps) {
             if (!touchedRepIds.has(extraRep._id.toString())) {
-              txState.participantSnapshots.push(captureParticipantUpdateSnapshot(extraRep));
+              const extraSnap = captureParticipantUpdateSnapshot(extraRep);
+              txState.participantSnapshots.push(extraSnap);
               extraRep.role = DEFAULT_OPEN_INVITE_ROLE;
               await extraRep.save(session ? { session } : undefined);
+              extraSnap.expectedUpdatedAt = extraRep.updatedAt;
             }
             repIdsToDemote.push(extraRep._id);
           }
 
           // Revoke pending FAMILY_REP invites for replaced members (and existing non-selected candidates).
+          // Also revoke stale pending FAMILY_REP invites if the newly designated representative is being
+          // re-homed from another family, while preserving valid invites issued in this current family.
           const familyMembers = await ParticipantModel.find({
             tripId: trip._id,
             familyId: family._id,
@@ -1225,31 +1272,49 @@ export const updateFamily = asyncHandler(async (req: Request, res: Response) => 
           for (const fm of familyMembers) {
             revokeTargets.add(fm._id.toString());
           }
-          await revokePendingParticipantInvites({
+          if (isRehomingNewRep && newRepObjectId) {
+            revokeTargets.add(newRepObjectId.toString());
+          }
+          const revoked = await revokePendingParticipantInvites({
             tripId: trip._id,
             participantIds: Array.from(revokeTargets).map((id) => new mongoose.Types.ObjectId(id)),
             actorParticipantId: actor._id,
             grantedRole: 'FAMILY_REP',
             session,
           });
+          if (revoked) txState.revokedInvites.push(revoked);
+        } else if (isRehomingNewRep && newRepObjectId) {
+          const revoked = await revokePendingParticipantInvites({
+            tripId: trip._id,
+            participantIds: [newRepObjectId],
+            actorParticipantId: actor._id,
+            grantedRole: 'FAMILY_REP',
+            session,
+          });
+          if (revoked) txState.revokedInvites.push(revoked);
         }
 
         // Preserve existing role on newRepParticipant (do NOT auto-grant FAMILY_REP on family PATCH).
         family.representativeId = newRepObjectId;
         await family.save(session ? { session } : undefined);
+        famSnap.expectedUpdatedAt = family.updatedAt;
 
-        if (newRepParticipant && !sameObjectId(newRepParticipant.familyId ?? null, family._id)) {
-          txState.participantSnapshots.push(captureParticipantUpdateSnapshot(newRepParticipant));
+        if (newRepParticipant && isRehomingNewRep) {
+          const repSnap = captureParticipantUpdateSnapshot(newRepParticipant);
+          txState.participantSnapshots.push(repSnap);
           newRepParticipant.familyId = family._id;
           await newRepParticipant.save(session ? { session } : undefined);
+          repSnap.expectedUpdatedAt = newRepParticipant.updatedAt;
         }
       } else {
         await family.save(session ? { session } : undefined);
+        famSnap.expectedUpdatedAt = family.updatedAt;
       }
 
       txState.updatedFamily = family;
     },
     rollback: async () => {
+      await restoreRevokedInviteRecords(txState.revokedInvites);
       await restoreParticipantSnapshots(txState.participantSnapshots);
       await restoreFamilySnapshots(txState.familySnapshots);
     },

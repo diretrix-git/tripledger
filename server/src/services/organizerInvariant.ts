@@ -50,6 +50,7 @@ export interface ParticipantUpdateSnapshot {
   defaultWeight: number;
   isActive: boolean;
   familyId: mongoose.Types.ObjectId | null | undefined;
+  expectedUpdatedAt?: Date;
 }
 
 export function captureParticipantUpdateSnapshot(
