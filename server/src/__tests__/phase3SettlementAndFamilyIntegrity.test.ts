@@ -209,6 +209,7 @@ async function startReplicaSet(): Promise<{ cleanup: () => Promise<void> }> {
 
 describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-01 / L-02)', () => {
   const app = createApp();
+  const appB = createApp();
 
   describe('Standalone MongoDB suite', () => {
     beforeAll(async () => {
@@ -1060,6 +1061,479 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
       expect(prodUpdateFam.status).toBe(503);
       expect(prodUpdateFam.body.error.code).toBe('TRANSACTIONS_UNAVAILABLE');
     });
+
+    it('4b. enforces in-place FAMILY_REP demotion cleanup, cross-family stale invite revocation, legacy ungrouped rep rejection, 409 duplicate family guard, and atomic ActivityLog rollback in standalone', async () => {
+      const org = await registerUser(app, { name: 'F2 Org', email: 'f2org@example.com' });
+      const rep1 = await registerUser(app, { name: 'F2 Rep1', email: 'f2rep1@example.com' });
+      const rep2 = await registerUser(app, { name: 'F2 Rep2', email: 'f2rep2@example.com' });
+      const rep3 = await registerUser(app, { name: 'F2 Rep3', email: 'f2rep3@example.com' });
+      const legacyUnverified = await registerUser(
+        app,
+        { name: 'Unverified Rep', email: 'unverrep@example.com' },
+        false
+      );
+
+      const tripRes = await request(app)
+        .post('/api/v1/trips')
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Mustang Family Ops', mode: 'FAMILY', organizerFamilyName: 'Host Fam' });
+      const tripId = tripRes.body.data.trip.id as string;
+      const inviteCode = tripRes.body.data.trip.inviteCode as string;
+      const orgPartId = tripRes.body.data.myParticipant.id as string;
+
+      const famAId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Alpha Family' })
+      ).body.data.family.id as string;
+
+      const famBId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Beta Family' })
+      ).body.data.family.id as string;
+
+      const rep1PartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${rep1.accessToken}`)
+      ).body.data.participantId as string;
+      const rep2PartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${rep2.accessToken}`)
+      ).body.data.participantId as string;
+      const rep3PartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${rep3.accessToken}`)
+      ).body.data.participantId as string;
+
+      for (const pid of [rep1PartId, rep2PartId]) {
+        await request(app)
+          .patch(`/api/v1/trips/${tripId}/participants/${pid}`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ familyId: famAId });
+      }
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${rep3PartId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ familyId: famBId });
+
+      // Legacy active unverified FAMILY_REP in DB cannot confirm settlement (Finding Audit Check)
+      const unverPart = await ParticipantModel.create({
+        tripId,
+        userId: legacyUnverified.userId,
+        familyId: famBId,
+        name: 'Unverified Legacy Rep',
+        email: legacyUnverified.email,
+        role: 'FAMILY_REP',
+        isActive: true,
+      });
+      const famBKidId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Beta Child', familyId: famBId })
+      ).body.data.participant.id as string;
+      await FamilyModel.updateOne({ _id: famBId }, { $set: { representativeId: unverPart._id } });
+
+      const settleFamB = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({
+            settlementMode: 'FAMILY',
+            fromParticipantId: orgPartId,
+            toParticipantId: famBKidId,
+            toFamilyId: famBId,
+            amountPaisa: 3000,
+            status: 'REPORTED',
+          })
+      ).body.data.settlement.id as string;
+
+      const unverConfirm = await request(app)
+        .patch(`/api/v1/trips/${tripId}/settlements/${settleFamB}/status`)
+        .set('Authorization', `Bearer ${legacyUnverified.accessToken}`)
+        .send({ status: 'CONFIRMED' });
+      expect(unverConfirm.status).toBe(403);
+      expect(unverConfirm.body.error.code).toBe('FORBIDDEN_SETTLEMENT_CONFIRMATION');
+
+      // Clean up famB legacy anomaly before testing normal famB operations
+      await ParticipantModel.updateOne({ _id: unverPart._id }, { $set: { role: 'PARTICIPANT' } });
+      await FamilyModel.updateOne({ _id: famBId }, { $set: { representativeId: null } });
+
+      // Finding 2 (#5, #6, #7): Promote rep1 -> FAMILY_REP on famA, then demote IN-PLACE to PARTICIPANT and CONTRIBUTOR
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: org.accessToken,
+        tripId,
+        participantId: rep1PartId,
+        targetToken: rep1.accessToken,
+        targetEmail: rep1.email,
+        grantedRole: 'FAMILY_REP',
+      });
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep1PartId);
+
+      // Demote in-place -> PARTICIPANT clears Family.representativeId!
+      const demoteToPart = await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${rep1PartId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ role: 'PARTICIPANT' });
+      expect(demoteToPart.status).toBe(200);
+      expect(demoteToPart.body.data.participant.role).toBe('PARTICIPANT');
+      expect((await FamilyModel.findById(famAId))?.representativeId).toBeNull();
+
+      // Re-promote rep1, then demote in-place -> CONTRIBUTOR clears Family.representativeId!
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: org.accessToken,
+        tripId,
+        participantId: rep1PartId,
+        targetToken: rep1.accessToken,
+        targetEmail: rep1.email,
+        grantedRole: 'FAMILY_REP',
+      });
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep1PartId);
+
+      const demoteToContrib = await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${rep1PartId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ role: 'CONTRIBUTOR' });
+      expect(demoteToContrib.status).toBe(200);
+      expect(demoteToContrib.body.data.participant.role).toBe('CONTRIBUTOR');
+      expect((await FamilyModel.findById(famAId))?.representativeId).toBeNull();
+
+      // (#7) Another eligible member in famA (rep2) can immediately receive & claim a verified FAMILY_REP invite
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: org.accessToken,
+        tripId,
+        participantId: rep2PartId,
+        targetToken: rep2.accessToken,
+        targetEmail: rep2.email,
+        grantedRole: 'FAMILY_REP',
+      });
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep2PartId);
+
+      // Clear rep2 cleanly via PARTICIPANT demotion and reset rep1 to PARTICIPANT
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${rep2PartId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ role: 'PARTICIPANT' });
+      expect((await FamilyModel.findById(famAId))?.representativeId).toBeNull();
+
+      // Finding 3 (#8): Re-homing rep2 via createFamily revokes stale pending FAMILY_REP invite issued in famA
+      const invBeforeCreateFam = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants/${rep2PartId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'FAMILY_REP', intendedEmail: rep2.email });
+      expect(invBeforeCreateFam.status).toBe(201);
+      const staleCreateTok = invBeforeCreateFam.body.data.rawToken as string;
+
+      const createFamC = await request(app)
+        .post(`/api/v1/trips/${tripId}/families`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Gamma Family', representativeId: rep2PartId });
+      expect(createFamC.status).toBe(201);
+      const famCId = createFamC.body.data.family.id as string;
+
+      const claimAfterCreateFam = await request(app)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep2.accessToken}`)
+        .send({ token: staleCreateTok });
+      expect(claimAfterCreateFam.status).toBe(409);
+      expect(claimAfterCreateFam.body.error.code).toBe('INVITE_REVOKED');
+
+      // Also verify defense-in-depth familyId mismatch guard if an unrevoked legacy/bypassed invite targets famA while participant moved to famC
+      const mismatchedFamilyTok = generateParticipantInviteToken(24);
+      await ParticipantInviteModel.collection.insertOne({
+        tripId: new mongoose.Types.ObjectId(tripId),
+        participantId: new mongoose.Types.ObjectId(rep2PartId),
+        familyId: new mongoose.Types.ObjectId(famAId),
+        invitedByUserId: new mongoose.Types.ObjectId(org.userId),
+        invitedByParticipantId: new mongoose.Types.ObjectId(orgPartId),
+        tokenHash: mismatchedFamilyTok.tokenHash,
+        intendedEmail: rep2.email,
+        grantedRole: 'FAMILY_REP',
+        requireVerifiedEmail: true,
+        expiresAt: mismatchedFamilyTok.expiresAt,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await expect(
+        claimParticipantInviteForUser({
+          userId: rep2.userId,
+          body: { token: mismatchedFamilyTok.rawToken },
+        })
+      ).rejects.toMatchObject({ statusCode: 409, code: 'INVITE_FAMILY_MISMATCH' });
+
+      // Finding 3 (#9): Re-homing rep3 via updateFamily revokes stale pending FAMILY_REP invite issued in famB,
+      // while designating same-family candidate rep1 on famA preserves valid current-family pending invite!
+      const invBeforeUpdateFam = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants/${rep3PartId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'FAMILY_REP', intendedEmail: rep3.email });
+      expect(invBeforeUpdateFam.status).toBe(201);
+      const staleUpdateTok = invBeforeUpdateFam.body.data.rawToken as string;
+
+      const rehomeViaUpdateFam = await request(app)
+        .patch(`/api/v1/trips/${tripId}/families/${famCId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ representativeId: rep3PartId });
+      expect(rehomeViaUpdateFam.status).toBe(200);
+      expect((await ParticipantModel.findById(rep3PartId))?.familyId?.toString()).toBe(famCId);
+
+      const claimAfterUpdateFam = await request(app)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep3.accessToken}`)
+        .send({ token: staleUpdateTok });
+      expect(claimAfterUpdateFam.status).toBe(409);
+      expect(claimAfterUpdateFam.body.error.code).toBe('INVITE_REVOKED');
+
+      // Current-family valid invite preserved: issue invite for rep1 (currently in famA, rep=null), then nominate rep1 in famA -> rep1 can still claim!
+      const validSameFamInv = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants/${rep1PartId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'FAMILY_REP', intendedEmail: rep1.email });
+      expect(validSameFamInv.status).toBe(201);
+      const sameFamTok = validSameFamInv.body.data.rawToken as string;
+
+      const setNominalSameFam = await request(app)
+        .patch(`/api/v1/trips/${tripId}/families/${famAId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ representativeId: rep1PartId });
+      expect(setNominalSameFam.status).toBe(200);
+
+      const claimValidSameFam = await request(app)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep1.accessToken}`)
+        .send({ token: sameFamTok });
+      expect(claimValidSameFam.status).toBe(200);
+      expect(claimValidSameFam.body.data.role).toBe('FAMILY_REP');
+
+      // Finding 3 (#10): Legacy ungrouped FAMILY_REP (familyId: null) CANNOT be accepted by createFamily or updateFamily
+      const legacyUngroupedRep = await ParticipantModel.create({
+        tripId,
+        userId: null,
+        familyId: null,
+        name: 'Corrupt Ungrouped Rep',
+        role: 'FAMILY_REP',
+        isActive: true,
+      });
+      const badLegacyCreate = await request(app)
+        .post(`/api/v1/trips/${tripId}/families`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Delta Family', representativeId: legacyUngroupedRep._id.toString() });
+      expect(badLegacyCreate.status).toBe(409);
+      expect(badLegacyCreate.body.error.code).toBe('PARTICIPANT_FAMILY_REP_CONFLICT');
+
+      const badLegacyUpdate = await request(app)
+        .patch(`/api/v1/trips/${tripId}/families/${famBId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ representativeId: legacyUngroupedRep._id.toString() });
+      expect(badLegacyUpdate.status).toBe(409);
+      expect(badLegacyUpdate.body.error.code).toBe('PARTICIPANT_FAMILY_REP_CONFLICT');
+
+      // Finding 5 (#12): Duplicate family name in updateFamily returns clean 409 FAMILY_EXISTS without mutating rep or revoking pending invites
+      const famBMemberInv = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants/${famBKidId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'FAMILY_REP', intendedEmail: 'kidbeta@example.com' });
+      expect(famBMemberInv.status).toBe(201);
+      const famBMemberInvId = famBMemberInv.body.data.invite.id as string;
+
+      const dupUpdateFam = await request(app)
+        .patch(`/api/v1/trips/${tripId}/families/${famAId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Beta Family', representativeId: null });
+      expect(dupUpdateFam.status).toBe(409);
+      expect(dupUpdateFam.body.error.code).toBe('FAMILY_EXISTS');
+      expect((await FamilyModel.findById(famAId))?.name).toBe('Alpha Family');
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep1PartId);
+      expect((await ParticipantModel.findById(rep1PartId))?.role).toBe('FAMILY_REP');
+      expect((await ParticipantInviteModel.findById(famBMemberInvId))?.revokedAt).toBeNull();
+
+      // Also verify duplicate name pre-check aborts BEFORE revoking a candidate's pending FAMILY_REP invite when re-homing
+      const dupUpdateFamRehome = await request(app)
+        .patch(`/api/v1/trips/${tripId}/families/${famAId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Beta Family', representativeId: famBKidId });
+      expect(dupUpdateFamRehome.status).toBe(409);
+      expect(dupUpdateFamRehome.body.error.code).toBe('FAMILY_EXISTS');
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep1PartId);
+      expect((await ParticipantModel.findById(famBKidId))?.familyId?.toString()).toBe(famBId);
+      expect((await ParticipantInviteModel.findById(famBMemberInvId))?.revokedAt).toBeNull();
+
+      // Finding 5 (#13): ActivityLog failures rollback ALL writes cleanly (including revoked invites) and never send 200 before failure
+      const logsCountBefore = await ActivityLogModel.countDocuments({ tripId });
+
+      // 13a. updateParticipant ActivityLog failure
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(new Error('Log fail updateParticipant'));
+      const failUpdPart = await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${rep1PartId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ role: 'PARTICIPANT' });
+      expect(failUpdPart.status).toBe(500);
+      expect((await ParticipantModel.findById(rep1PartId))?.role).toBe('FAMILY_REP');
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep1PartId);
+
+      // 13b. addParticipant ActivityLog failure
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(new Error('Log fail addParticipant'));
+      const failAddPart = await request(app)
+        .post(`/api/v1/trips/${tripId}/participants`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Should Rollback Guest', familyId: famBId });
+      expect(failAddPart.status).toBe(500);
+      expect(await ParticipantModel.findOne({ tripId, name: 'Should Rollback Guest' })).toBeNull();
+
+      // 13c. updateFamily ActivityLog failure -> rolls back Family, Participant role, AND revoked invite!
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(new Error('Log fail updateFamily'));
+      const failUpdFam = await request(app)
+        .patch(`/api/v1/trips/${tripId}/families/${famAId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Rolled Back Name', representativeId: null });
+      expect(failUpdFam.status).toBe(500);
+      expect((await FamilyModel.findById(famAId))?.name).toBe('Alpha Family');
+      expect((await FamilyModel.findById(famAId))?.representativeId?.toString()).toBe(rep1PartId);
+      expect((await ParticipantModel.findById(rep1PartId))?.role).toBe('FAMILY_REP');
+
+      // Test standalone revoke rollback explicitly on famB (pending famBMemberInvId revoked then rolled back by ActivityLog error)
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(new Error('Log fail deleteFamily'));
+      const failDelFam = await request(app)
+        .delete(`/api/v1/trips/${tripId}/families/${famBId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`);
+      expect(failDelFam.status).toBe(500);
+      expect(await FamilyModel.findById(famBId)).not.toBeNull();
+      expect((await ParticipantModel.findById(famBKidId))?.familyId?.toString()).toBe(famBId);
+      expect((await ParticipantInviteModel.findById(famBMemberInvId))?.revokedAt).toBeNull();
+
+      // 13d. createSettlement & updateSettlementStatus ActivityLog failure in standalone
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(new Error('Log fail createSettlement'));
+      const failCreateSettle = await request(app)
+        .post(`/api/v1/trips/${tripId}/settlements`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({
+          settlementMode: 'FAMILY',
+          fromParticipantId: orgPartId,
+          toParticipantId: famBKidId,
+          toFamilyId: famBId,
+          amountPaisa: 4500,
+        });
+      expect(failCreateSettle.status).toBe(500);
+      expect(await SettlementModel.countDocuments({ tripId, amountPaisa: 4500 })).toBe(0);
+
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(new Error('Log fail updateSettlement'));
+      const failUpdSettle = await request(app)
+        .patch(`/api/v1/trips/${tripId}/settlements/${settleFamB}/status`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ status: 'CONFIRMED' });
+      expect(failUpdSettle.status).toBe(500);
+      expect((await SettlementModel.findById(settleFamB))?.status).toBe('REPORTED');
+
+      expect(await ActivityLogModel.countDocuments({ tripId })).toBe(logsCountBefore);
+    });
+
+    it('5b. serializes addParticipant vs deleteFamily in standalone and enforces createSettlement status & live-actor normalization', async () => {
+      const org = await registerUser(app, { name: 'Race Org S5', email: 'raceorg.s5@example.com' });
+      const rep = await registerUser(app, { name: 'Race Rep S5', email: 'racerep.s5@example.com' });
+
+      const tripRes = await request(app)
+        .post('/api/v1/trips')
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Standalone Serialize Trip', mode: 'FAMILY', organizerFamilyName: 'Org Fam' });
+      const tripId = tripRes.body.data.trip.id as string;
+      const inviteCode = tripRes.body.data.trip.inviteCode as string;
+      const orgPartId = tripRes.body.data.myParticipant.id as string;
+
+      const famId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Target Del Fam' })
+      ).body.data.family.id as string;
+
+      const repPartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${rep.accessToken}`)
+      ).body.data.participantId as string;
+
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${repPartId}`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ familyId: famId });
+
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: org.accessToken,
+        tripId,
+        participantId: repPartId,
+        targetToken: rep.accessToken,
+        targetEmail: rep.email,
+        grantedRole: 'FAMILY_REP',
+      });
+
+      const famChildId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Child Keep', familyId: famId })
+      ).body.data.participant.id as string;
+
+      // Reject initial PENDING / REJECTED statuses in createSettlement
+      for (const badStatus of ['PENDING', 'REJECTED']) {
+        const res = await request(app)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({
+            settlementMode: 'FAMILY',
+            fromParticipantId: orgPartId,
+            toParticipantId: famChildId,
+            amountPaisa: 1000,
+            status: badStatus,
+          });
+        expect(res.status).toBe(400);
+        expect(res.body.error.code).toBe('INVALID_SETTLEMENT_STATUS');
+      }
+
+      // FAMILY_REP passing status: 'CONFIRMED' on POST /settlements for non-self receiver normalizes to REPORTED
+      const repCreateConfirmed = await request(app)
+        .post(`/api/v1/trips/${tripId}/settlements`)
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({
+          settlementMode: 'FAMILY',
+          fromParticipantId: orgPartId,
+          toParticipantId: famChildId,
+          toFamilyId: famId,
+          amountPaisa: 2500,
+          status: 'CONFIRMED',
+        });
+      expect(repCreateConfirmed.status).toBe(201);
+      expect(repCreateConfirmed.body.data.settlement.status).toBe('REPORTED');
+
+      // Concurrent addParticipant vs deleteFamily across two instances in standalone mode -> zero dangling familyId!
+      const [addRes, delRes] = await Promise.all([
+        request(app)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Racing Child', familyId: famId }),
+        request(appB)
+          .delete(`/api/v1/trips/${tripId}/families/${famId}`)
+          .set('Authorization', `Bearer ${org.accessToken}`),
+      ]);
+
+      expect(delRes.status).toBe(200);
+      expect([201, 404]).toContain(addRes.status);
+      expect(await FamilyModel.findById(famId)).toBeNull();
+      expect(await ParticipantModel.countDocuments({ tripId, familyId: famId })).toBe(0);
+    });
   });
 
   describe('Real MongoDB Replica Set ACID atomicity for settlements and family rep updates', () => {
@@ -1202,5 +1676,340 @@ describe('Phase 3.1: FAMILY_REP Settlement Authorization & Family Integrity (H-0
       expect((await FamilyModel.findById(famId))?.representativeId?.toString()).toBe(rep2PartId);
       expect([200, 403]).toContain(confirmRes.status);
     });
+
+    it('5. serializes concurrent settlement creation, trip closure, demotion/deactivation, family deletion, addParticipant, dual settlement status updates, and dual rep swaps on real replica set', async () => {
+      expect(await supportsTransactions()).toBe(true);
+
+      const lead = await registerUser(app, { name: 'RS Lead', email: 'rslead@example.com' });
+      const coOrg1 = await registerUser(app, { name: 'RS CoOrg1', email: 'rscoorg1@example.com' });
+      const coOrg2 = await registerUser(app, { name: 'RS CoOrg2', email: 'rscoorg2@example.com' });
+      const repA = await registerUser(app, { name: 'RS RepA', email: 'rsrepa@example.com' });
+      const repB = await registerUser(app, { name: 'RS RepB', email: 'rsrepb@example.com' });
+
+      const tripRes = await request(app)
+        .post('/api/v1/trips')
+        .set('Authorization', `Bearer ${lead.accessToken}`)
+        .send({ name: 'Repl Concurrency Trip', mode: 'FAMILY', organizerFamilyName: 'Lead Fam' });
+      const tripId = tripRes.body.data.trip.id as string;
+      const inviteCode = tripRes.body.data.trip.inviteCode as string;
+      const leadPartId = tripRes.body.data.myParticipant.id as string;
+
+      const famAId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ name: 'Repl Fam A' })
+      ).body.data.family.id as string;
+      const famBId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ name: 'Repl Fam B' })
+      ).body.data.family.id as string;
+
+      const coOrg1PartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${coOrg1.accessToken}`)
+      ).body.data.participantId as string;
+      const coOrg2PartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${coOrg2.accessToken}`)
+      ).body.data.participantId as string;
+      const repAPartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${repA.accessToken}`)
+      ).body.data.participantId as string;
+      const repBPartId = (
+        await request(app)
+          .post(`/api/v1/trips/join/${inviteCode}`)
+          .set('Authorization', `Bearer ${repB.accessToken}`)
+      ).body.data.participantId as string;
+
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: lead.accessToken,
+        tripId,
+        participantId: coOrg1PartId,
+        targetToken: coOrg1.accessToken,
+        targetEmail: coOrg1.email,
+        grantedRole: 'ORGANIZER',
+      });
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: lead.accessToken,
+        tripId,
+        participantId: coOrg2PartId,
+        targetToken: coOrg2.accessToken,
+        targetEmail: coOrg2.email,
+        grantedRole: 'ORGANIZER',
+      });
+
+      const famAChildId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ name: 'Repl FamA Child', familyId: famAId })
+      ).body.data.participant.id as string;
+
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${repAPartId}`)
+        .set('Authorization', `Bearer ${lead.accessToken}`)
+        .send({ familyId: famAId });
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${repBPartId}`)
+        .set('Authorization', `Bearer ${lead.accessToken}`)
+        .send({ familyId: famAId });
+
+      // (#1) Organizer demotion racing with createSettlement (status: CONFIRMED)
+      const [demoteCo1Res, co1CreateSettleRes] = await Promise.all([
+        request(app)
+          .patch(`/api/v1/trips/${tripId}/participants/${coOrg1PartId}`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ role: 'PARTICIPANT' }),
+        request(appB)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${coOrg1.accessToken}`)
+          .send({
+            settlementMode: 'INDIVIDUAL',
+            fromParticipantId: coOrg1PartId,
+            toParticipantId: leadPartId,
+            amountPaisa: 1111,
+            status: 'CONFIRMED',
+          }),
+      ]);
+      expect(demoteCo1Res.status).toBe(200);
+      expect(co1CreateSettleRes.status).toBe(201);
+      // Verify consistency with serialized log ordering: if createSettlement ran AFTER demotion it was normalized to REPORTED
+      const settle1Logs = await ActivityLogModel.find({
+        tripId,
+        actionType: { $in: ['PARTICIPANT_UPDATED', 'SETTLEMENT_REPORTED', 'SETTLEMENT_CONFIRMED'] },
+      })
+        .sort({ _id: 1 })
+        .lean();
+      const s1Obj = await SettlementModel.findById(co1CreateSettleRes.body.data.settlement.id);
+      if (s1Obj?.status === 'CONFIRMED') {
+        expect(co1CreateSettleRes.body.data.settlement.confirmedByParticipantId).toBe(coOrg1PartId);
+      } else {
+        expect(s1Obj?.status).toBe('REPORTED');
+      }
+      expect(settle1Logs.length).toBeGreaterThanOrEqual(2);
+
+      // Verify post-demotion live check strictly normalizes coOrg1 CONFIRMED -> REPORTED
+      const afterDemoteSettle = await request(app)
+        .post(`/api/v1/trips/${tripId}/settlements`)
+        .set('Authorization', `Bearer ${coOrg1.accessToken}`)
+        .send({
+          settlementMode: 'INDIVIDUAL',
+          fromParticipantId: coOrg1PartId,
+          toParticipantId: leadPartId,
+          amountPaisa: 1212,
+          status: 'CONFIRMED',
+        });
+      expect(afterDemoteSettle.status).toBe(201);
+      expect(afterDemoteSettle.body.data.settlement.status).toBe('REPORTED');
+
+      // (#2) Organizer deactivation racing with createSettlement
+      const [deactCo2Res, co2SettleRes] = await Promise.all([
+        request(app)
+          .patch(`/api/v1/trips/${tripId}/participants/${coOrg2PartId}`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ isActive: false }),
+        request(appB)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${coOrg2.accessToken}`)
+          .send({
+            settlementMode: 'INDIVIDUAL',
+            fromParticipantId: coOrg2PartId,
+            toParticipantId: leadPartId,
+            amountPaisa: 2222,
+            status: 'CONFIRMED',
+          }),
+      ]);
+      expect(deactCo2Res.status).toBe(200);
+      expect([201, 403]).toContain(co2SettleRes.status);
+      if (co2SettleRes.status === 403) {
+        expect(co2SettleRes.body.error.code).toBe('FORBIDDEN_TRIP_ACCESS');
+        expect(await SettlementModel.countDocuments({ tripId, amountPaisa: 2222 })).toBe(0);
+      }
+
+      // (#11 & #4) Simultaneous addParticipant + deleteFamily + createSettlement with famA
+      const [addFamChildRes, delFamARes, settleExplicitFamARes] = await Promise.all([
+        request(app)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ name: 'Repl Racing Kid', familyId: famAId }),
+        request(appB)
+          .delete(`/api/v1/trips/${tripId}/families/${famAId}`)
+          .set('Authorization', `Bearer ${lead.accessToken}`),
+        request(app)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({
+            settlementMode: 'FAMILY',
+            fromParticipantId: leadPartId,
+            toParticipantId: famAChildId,
+            toFamilyId: famAId,
+            amountPaisa: 3333,
+            status: 'REPORTED',
+          }),
+      ]);
+      expect(delFamARes.status).toBe(200);
+      expect([201, 404]).toContain(addFamChildRes.status);
+      expect([201, 404]).toContain(settleExplicitFamARes.status);
+      expect(await FamilyModel.findById(famAId)).toBeNull();
+      expect(await ParticipantModel.countDocuments({ tripId, familyId: famAId })).toBe(0);
+
+      // (#4 continued) Participant move across families racing with createSettlement (explicit stale familyId)
+      const famCId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ name: 'Repl Fam C' })
+      ).body.data.family.id as string;
+      const moveTargetId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ name: 'Move Target', familyId: famBId })
+      ).body.data.participant.id as string;
+
+      const [moveRes, explicitFamBSettleRes] = await Promise.all([
+        request(app)
+          .patch(`/api/v1/trips/${tripId}/participants/${moveTargetId}`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ familyId: famCId }),
+        request(appB)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({
+            settlementMode: 'FAMILY',
+            fromParticipantId: leadPartId,
+            toParticipantId: moveTargetId,
+            toFamilyId: famBId,
+            amountPaisa: 4444,
+            status: 'REPORTED',
+          }),
+      ]);
+      expect(moveRes.status).toBe(200);
+      expect([201, 400]).toContain(explicitFamBSettleRes.status);
+      if (explicitFamBSettleRes.status === 400) {
+        expect(explicitFamBSettleRes.body.error.code).toBe('SETTLEMENT_FAMILY_MISMATCH');
+      }
+
+      // Dual simultaneous PATCH /families/:famCId representative swaps across two instances
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${repAPartId}`)
+        .set('Authorization', `Bearer ${lead.accessToken}`)
+        .send({ familyId: famCId });
+      await request(app)
+        .patch(`/api/v1/trips/${tripId}/participants/${repBPartId}`)
+        .set('Authorization', `Bearer ${lead.accessToken}`)
+        .send({ familyId: famCId });
+
+      const [swapA, swapB] = await Promise.all([
+        request(app)
+          .patch(`/api/v1/trips/${tripId}/families/${famCId}`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ representativeId: repAPartId }),
+        request(appB)
+          .patch(`/api/v1/trips/${tripId}/families/${famCId}`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ representativeId: repBPartId }),
+      ]);
+      expect(swapA.status).toBe(200);
+      expect(swapB.status).toBe(200);
+      const finalRepId = (await FamilyModel.findById(famCId))?.representativeId?.toString();
+      expect([repAPartId, repBPartId]).toContain(finalRepId);
+
+      // Promote final designated rep via verified invite, then test dual simultaneous PATCH /settlements/:id/status
+      const winnerRep = finalRepId === repAPartId ? repA : repB;
+      await promoteParticipantViaVerifiedInvite({
+        app,
+        organizerToken: lead.accessToken,
+        tripId,
+        participantId: finalRepId!,
+        targetToken: winnerRep.accessToken,
+        targetEmail: winnerRep.email,
+        grantedRole: 'FAMILY_REP',
+      });
+      const raceSettleId = (
+        await request(app)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({
+            settlementMode: 'FAMILY',
+            fromParticipantId: leadPartId,
+            toParticipantId: moveTargetId,
+            toFamilyId: famCId,
+            amountPaisa: 5555,
+            status: 'REPORTED',
+          })
+      ).body.data.settlement.id as string;
+
+      const logsBeforeDualConfirm = await ActivityLogModel.countDocuments({
+        tripId,
+        entityId: raceSettleId,
+        actionType: { $in: ['SETTLEMENT_CONFIRMED', 'SETTLEMENT_REJECTED'] },
+      });
+      const [statusRace1, statusRace2] = await Promise.all([
+        request(app)
+          .patch(`/api/v1/trips/${tripId}/settlements/${raceSettleId}/status`)
+          .set('Authorization', `Bearer ${winnerRep.accessToken}`)
+          .send({ status: 'CONFIRMED' }),
+        request(appB)
+          .patch(`/api/v1/trips/${tripId}/settlements/${raceSettleId}/status`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ status: 'REJECTED' }),
+      ]);
+      expect([statusRace1.status, statusRace2.status].sort((a, b) => a - b)).toEqual([200, 409]);
+      expect(
+        await ActivityLogModel.countDocuments({
+          tripId,
+          entityId: raceSettleId,
+          actionType: { $in: ['SETTLEMENT_CONFIRMED', 'SETTLEMENT_REJECTED'] },
+        })
+      ).toBe(logsBeforeDualConfirm + 1);
+
+      // (#3) closeTrip racing with createSettlement across two instances
+      const [closeTripRes, closeRaceSettleRes] = await Promise.all([
+        request(app)
+          .post(`/api/v1/trips/${tripId}/close`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({ forceClose: true }),
+        request(appB)
+          .post(`/api/v1/trips/${tripId}/settlements`)
+          .set('Authorization', `Bearer ${lead.accessToken}`)
+          .send({
+            settlementMode: 'INDIVIDUAL',
+            fromParticipantId: leadPartId,
+            toParticipantId: repAPartId,
+            amountPaisa: 6666,
+            status: 'CONFIRMED',
+          }),
+      ]);
+      expect(closeTripRes.status).toBe(200);
+      expect((await TripModel.findById(tripId))?.status).toBe('CLOSED');
+      expect([201, 403]).toContain(closeRaceSettleRes.status);
+      if (closeRaceSettleRes.status === 403) {
+        expect(closeRaceSettleRes.body.error.code).toBe('TRIP_CLOSED');
+        expect(await SettlementModel.countDocuments({ tripId, amountPaisa: 6666 })).toBe(0);
+      }
+
+      // Immediately after close, createSettlement is deterministically blocked
+      const postCloseSettle = await request(app)
+        .post(`/api/v1/trips/${tripId}/settlements`)
+        .set('Authorization', `Bearer ${lead.accessToken}`)
+        .send({
+          settlementMode: 'INDIVIDUAL',
+          fromParticipantId: leadPartId,
+          toParticipantId: repAPartId,
+          amountPaisa: 7777,
+        });
+      expect(postCloseSettle.status).toBe(403);
+      expect(postCloseSettle.body.error.code).toBe('TRIP_CLOSED');
+    }, 30000);
   });
 });

@@ -116,6 +116,7 @@ Stores organizer-issued, participant-scoped, single-use claim invitations. Raw c
 - `_id`: `ObjectId`
 - `tripId`: `ObjectId` (ref: `'Trip'`, required, immutable, indexed)
 - `participantId`: `ObjectId` (ref: `'Participant'`, required, immutable, indexed)
+- `familyId`: `ObjectId | null` (ref: `'Family'`, default `null`, immutable — binds `FAMILY_REP` invitations to the target family so cross-family re-homing cannot consume stale `FAMILY_REP` invitations)
 - `invitedByUserId`: `ObjectId` (ref: `'User'`, required, immutable)
 - `invitedByParticipantId`: `ObjectId` (ref: `'Participant'`, required, immutable)
 - `tokenHash`: `String` (`select: false`, required, immutable, 64-char SHA-256 hex digest)

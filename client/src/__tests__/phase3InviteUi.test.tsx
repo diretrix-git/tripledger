@@ -469,4 +469,478 @@ describe('Phase 3 UI: Guest PARTICIPANT restriction, organizer-only invite manag
       '/invites/claim'
     );
   });
+
+  it('scopes designated FAMILY_REP settlement actions, preserves organizer & direct-receiver flows, exposes Family mode toggle, and shows unassigned rep state cleanly', async () => {
+    const buildFamilyTripPayload = (options: {
+      tripStatus?: 'ACTIVE' | 'CLOSED';
+      myRole: 'FAMILY_REP' | 'ORGANIZER' | 'PARTICIPANT';
+      myParticipantId: string;
+      myFamilyId: string | null;
+      fam1RepId: string | null;
+      fam2RepId?: string | null;
+      includeExtendedSettlements?: boolean;
+    }) => ({
+      trip: {
+        id: 'trip-1',
+        name: 'Mustang Family Trek',
+        mode: 'FAMILY',
+        status: options.tripStatus ?? 'ACTIVE',
+        currency: 'NPR',
+        shareToken: 'share-fam',
+        shareEnabled: true,
+        checklist: [],
+      },
+      myParticipant: {
+        id: options.myParticipantId,
+        name:
+          options.myParticipantId === 'p-org'
+            ? 'Aarav Organizer'
+            : options.myParticipantId === 'p-rep1'
+              ? 'Rep Alpha'
+              : 'Fam1 Member',
+        role: options.myRole,
+        familyId: options.myFamilyId,
+      },
+      participants: [
+        {
+          id: 'p-org',
+          tripId: 'trip-1',
+          userId: 'user-org',
+          familyId: null,
+          name: 'Aarav Organizer',
+          email: 'org@example.com',
+          role: 'ORGANIZER',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+        {
+          id: 'p-rep1',
+          tripId: 'trip-1',
+          userId: 'user-rep1',
+          familyId: 'fam-1',
+          name: 'Rep Alpha',
+          email: 'rep1@example.com',
+          role: options.myParticipantId === 'p-rep1' ? options.myRole : 'FAMILY_REP',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+        {
+          id: 'p-mem1',
+          tripId: 'trip-1',
+          userId: 'user-mem1',
+          familyId: 'fam-1',
+          name: 'Fam1 Member',
+          email: 'mem1@example.com',
+          role: 'PARTICIPANT',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+        {
+          id: 'p-inact',
+          tripId: 'trip-1',
+          userId: null,
+          familyId: 'fam-1',
+          name: 'Inactive Alpha Member',
+          email: null,
+          role: 'PARTICIPANT',
+          memberType: 'CHILD',
+          defaultWeight: 0.5,
+          isActive: false,
+        },
+        {
+          id: 'p-rep2',
+          tripId: 'trip-1',
+          userId: 'user-rep2',
+          familyId: 'fam-2',
+          name: 'Rep Beta',
+          email: 'rep2@example.com',
+          role: 'FAMILY_REP',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+      ],
+      families: [
+        {
+          id: 'fam-1',
+          tripId: 'trip-1',
+          name: 'Alpha Family',
+          representativeId: options.fam1RepId,
+          defaultWeight: 1,
+        },
+        {
+          id: 'fam-2',
+          tripId: 'trip-1',
+          name: 'Beta Family',
+          representativeId: options.fam2RepId ?? 'p-rep2',
+          defaultWeight: 1,
+        },
+      ],
+      expenses: [],
+      settlements: [
+        {
+          id: 's-eligible',
+          tripId: 'trip-1',
+          settlementMode: 'FAMILY',
+          fromParticipantId: 'p-org',
+          toParticipantId: 'p-mem1',
+          fromFamilyId: null,
+          toFamilyId: 'fam-1',
+          amountPaisa: 50000,
+          status: 'REPORTED',
+          note: 'Hotel split',
+          createdAt: '2026-11-16T07:00:00.000Z',
+          updatedAt: '2026-11-16T07:00:00.000Z',
+        },
+        ...(options.includeExtendedSettlements
+          ? [
+              {
+                id: 's-indiv',
+                tripId: 'trip-1',
+                settlementMode: 'INDIVIDUAL',
+                fromParticipantId: 'p-org',
+                toParticipantId: 'p-mem1',
+                fromFamilyId: null,
+                toFamilyId: 'fam-1',
+                amountPaisa: 12000,
+                status: 'REPORTED',
+                note: 'Individual coffee',
+                createdAt: '2026-11-16T07:05:00.000Z',
+                updatedAt: '2026-11-16T07:05:00.000Z',
+              },
+              {
+                id: 's-other-fam',
+                tripId: 'trip-1',
+                settlementMode: 'FAMILY',
+                fromParticipantId: 'p-org',
+                toParticipantId: 'p-rep2',
+                fromFamilyId: null,
+                toFamilyId: 'fam-2',
+                amountPaisa: 25000,
+                status: 'REPORTED',
+                note: 'Other family',
+                createdAt: '2026-11-16T07:10:00.000Z',
+                updatedAt: '2026-11-16T07:10:00.000Z',
+              },
+              {
+                id: 's-confirmed',
+                tripId: 'trip-1',
+                settlementMode: 'FAMILY',
+                fromParticipantId: 'p-org',
+                toParticipantId: 'p-mem1',
+                fromFamilyId: null,
+                toFamilyId: 'fam-1',
+                amountPaisa: 15000,
+                status: 'CONFIRMED',
+                note: 'Already confirmed',
+                createdAt: '2026-11-16T07:15:00.000Z',
+                updatedAt: '2026-11-16T07:15:00.000Z',
+              },
+              {
+                id: 's-inactive-recv',
+                tripId: 'trip-1',
+                settlementMode: 'FAMILY',
+                fromParticipantId: 'p-org',
+                toParticipantId: 'p-inact',
+                fromFamilyId: null,
+                toFamilyId: 'fam-1',
+                amountPaisa: 10000,
+                status: 'REPORTED',
+                note: 'Inactive receiver',
+                createdAt: '2026-11-16T07:20:00.000Z',
+                updatedAt: '2026-11-16T07:20:00.000Z',
+              },
+            ]
+          : []),
+      ],
+      ledger: {
+        totalApprovedExpensePaisa: 0,
+        totalPackageExpensePaisa: 0,
+        totalAdditionalExpensePaisa: 0,
+        totalPendingExpensePaisa: 0,
+        totalConfirmedSettlementPaisa: 0,
+        individualBalances: [],
+        familyBalances: [
+          {
+            familyId: 'fam-1',
+            familyName: 'Alpha Family',
+            representativeId: options.fam1RepId,
+            representativeName: 'Fallback Adult Should Not Leak',
+            memberCount: 2,
+            totalWeight: 1.5,
+            totalPaidPaisa: 0,
+            totalSharePaisa: 0,
+            settledPaidPaisa: 0,
+            settledReceivedPaisa: 0,
+            outstandingBalancePaisa: 0,
+            paidPaisa: 0,
+            sharePaisa: 0,
+            settlementSentPaisa: 0,
+            settlementReceivedPaisa: 0,
+            netBalancePaisa: 0,
+          },
+        ],
+        ungroupedParticipantBalances: [],
+      },
+      individualSettlementSuggestions: [],
+      familySettlementSuggestions: [],
+    });
+
+    // 1. Designated active FAMILY_REP: sees controls ONLY for REPORTED FAMILY settlement in own family with active receiver
+    useAuthStore
+      .getState()
+      .setAuth(makeUser({ id: 'user-rep1', name: 'Rep Alpha', email: 'rep1@example.com' }), 'tok-rep1', 'ref-rep1');
+
+    let familyTripPayload = buildFamilyTripPayload({
+      myRole: 'FAMILY_REP',
+      myParticipantId: 'p-rep1',
+      myFamilyId: 'fam-1',
+      fam1RepId: 'p-rep1',
+      includeExtendedSettlements: true,
+    });
+
+    const repFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/trips/trip-1') && method === 'GET') {
+        return jsonResponse({ success: true, data: familyTripPayload });
+      }
+      if (url.endsWith('/trips/trip-1/settlements/s-eligible/status') && method === 'PATCH') {
+        familyTripPayload = {
+          ...familyTripPayload,
+          settlements: familyTripPayload.settlements.map((s) =>
+            s.id === 's-eligible' ? { ...s, status: 'CONFIRMED' } : s
+          ),
+        };
+        return jsonResponse({
+          success: true,
+          data: { settlement: { ...familyTripPayload.settlements[0]!, status: 'CONFIRMED' } },
+        });
+      }
+      throw new Error(`Unexpected rep fetch: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', repFetch);
+
+    const qc1 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc1}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Family Trek/i)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Confirm settlement s-eligible' })).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Reject settlement s-eligible' })).toBeInTheDocument();
+
+    for (const disallowedId of ['s-indiv', 's-other-fam', 's-confirmed', 's-inactive-recv']) {
+      expect(screen.queryByRole('button', { name: `Confirm settlement ${disallowedId}` })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: `Reject settlement ${disallowedId}` })).not.toBeInTheDocument();
+    }
+
+    // Settlement Mode toggle exposes Individual and Family controls on FAMILY trips
+    const familyModeBtn = screen.getByRole('button', { name: /^Family$/i });
+    const indivModeBtn = screen.getByRole('button', { name: /^Individual$/i });
+    expect(familyModeBtn).toBeInTheDocument();
+    expect(indivModeBtn).toBeInTheDocument();
+    expect(indivModeBtn.className).toContain('bg-white');
+    expect(familyModeBtn.className).not.toContain('bg-white');
+    fireEvent.click(familyModeBtn);
+    expect(familyModeBtn.className).toContain('bg-white');
+    expect(indivModeBtn.className).not.toContain('bg-white');
+
+    // Confirm sends PATCH /settlements/:id/status { status: 'CONFIRMED' }
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm settlement s-eligible' }));
+    await waitFor(() => {
+      expect(repFetch).toHaveBeenCalledWith(
+        expect.stringContaining('/trips/trip-1/settlements/s-eligible/status'),
+        expect.objectContaining({
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'CONFIRMED' }),
+        })
+      );
+    });
+
+    // 2. Non-designated FAMILY_REP (fam1RepId points to p-mem1) sees zero confirm/reject buttons
+    cleanup();
+    const nonDesignatedPayload = buildFamilyTripPayload({
+      myRole: 'FAMILY_REP',
+      myParticipantId: 'p-rep1',
+      myFamilyId: 'fam-1',
+      fam1RepId: 'p-mem1',
+      includeExtendedSettlements: false,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).endsWith('/trips/trip-1')) {
+          return jsonResponse({ success: true, data: nonDesignatedPayload });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      })
+    );
+    const qc2 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc2}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Family Trek/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    await waitFor(() => {
+      expect(screen.getByText('REPORTED')).toBeInTheDocument();
+    });
+    expect(screen.queryByRole('button', { name: /Confirm settlement/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Reject settlement/i })).not.toBeInTheDocument();
+
+    // 3. Closed trip hides confirm/reject buttons even for designated FAMILY_REP
+    cleanup();
+    const closedPayload = buildFamilyTripPayload({
+      tripStatus: 'CLOSED',
+      myRole: 'FAMILY_REP',
+      myParticipantId: 'p-rep1',
+      myFamilyId: 'fam-1',
+      fam1RepId: 'p-rep1',
+      includeExtendedSettlements: false,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).endsWith('/trips/trip-1')) {
+          return jsonResponse({ success: true, data: closedPayload });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      })
+    );
+    const qc3 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc3}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Family Trek/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    await waitFor(() => {
+      expect(screen.getByText('REPORTED')).toBeInTheDocument();
+    });
+    expect(screen.queryByRole('button', { name: /Confirm settlement/i })).not.toBeInTheDocument();
+
+    // 4. Direct receiver (PARTICIPANT where toParticipantId === myParticipant.id) still sees confirm/reject on REPORTED open-trip settlement
+    cleanup();
+    useAuthStore
+      .getState()
+      .setAuth(makeUser({ id: 'user-mem1', name: 'Fam1 Member', email: 'mem1@example.com' }), 'tok-mem1', 'ref-mem1');
+    const receiverPayload = buildFamilyTripPayload({
+      myRole: 'PARTICIPANT',
+      myParticipantId: 'p-mem1',
+      myFamilyId: 'fam-1',
+      fam1RepId: null,
+      includeExtendedSettlements: false,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).endsWith('/trips/trip-1')) {
+          return jsonResponse({ success: true, data: receiverPayload });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      })
+    );
+    const qc4 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc4}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Family Trek/i)).toBeInTheDocument();
+    });
+    // Also verify unassigned representative display on Overview & Participants tabs
+    expect(screen.getByText(/Rep: Unassigned/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Fallback Adult Should Not Leak/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Auto-assigned primary adult/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Families .* Members/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Representative:\s*Not designated/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Auto-assigned primary adult/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Confirm settlement s-eligible' })).toBeInTheDocument();
+    });
+
+    // 5. Organizer still sees confirm/reject on REPORTED open-trip settlement
+    cleanup();
+    useAuthStore
+      .getState()
+      .setAuth(makeUser({ id: 'user-org', name: 'Aarav Organizer', email: 'org@example.com' }), 'tok-org', 'ref-org');
+    const orgPayload = buildFamilyTripPayload({
+      myRole: 'ORGANIZER',
+      myParticipantId: 'p-org',
+      myFamilyId: null,
+      fam1RepId: 'p-rep1',
+      includeExtendedSettlements: false,
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).endsWith('/trips/trip-1')) {
+          return jsonResponse({ success: true, data: orgPayload });
+        }
+        if (String(input).includes('/invites')) {
+          return jsonResponse({ success: true, data: { invites: [] } });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      })
+    );
+    const qc5 = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc5}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Family Trek/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Confirm settlement s-eligible' })).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Reject settlement s-eligible' })).toBeInTheDocument();
+  });
 });
