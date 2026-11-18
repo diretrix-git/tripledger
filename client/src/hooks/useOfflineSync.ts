@@ -23,6 +23,7 @@ export function useOfflineSync(queueStore: OfflineQueueStore = useOfflineQueueSt
   const queryClient = useQueryClient();
   const isMountedRef = useRef(true);
   const inFlightFlushRef = useRef(false);
+  const isHoldingSyncLockRef = useRef(false);
   const recoveryWatchKeyRef = useRef<string | null>(null);
   const accessToken = useAuthStore((s) => s.accessToken);
   const currentUserId = useAuthStore((s) => s.user?.id ?? null);
@@ -81,6 +82,7 @@ export function useOfflineSync(queueStore: OfflineQueueStore = useOfflineQueueSt
       let didStartSyncing = false;
       let flushedAnySuccess = false;
       const attemptedIds = new Set<string>();
+      isHoldingSyncLockRef.current = true;
 
       try {
         while (
@@ -170,6 +172,7 @@ export function useOfflineSync(queueStore: OfflineQueueStore = useOfflineQueueSt
           }
         }
       } finally {
+        isHoldingSyncLockRef.current = false;
         if (didStartSyncing && isSameAuthSession(startSession)) {
           setSyncing(false);
         }
@@ -265,7 +268,7 @@ export function useOfflineSync(queueStore: OfflineQueueStore = useOfflineQueueSt
       !currentUserId ||
       activeUserId !== currentUserId ||
       !hasSyncingItem ||
-      inFlightFlushRef.current ||
+      isHoldingSyncLockRef.current ||
       !hasWebLocksSupport()
     ) {
       return;

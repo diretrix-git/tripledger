@@ -390,7 +390,9 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
     initialAuthUserId !== null ? discardLegacyUnscopedQueue() : 0;
   const initialQueue =
     initialAuthUserId !== null
-      ? readUserQueueFromStorage(initialAuthUserId, { recoverStuckSyncing: true })
+      ? readUserQueueFromStorage(initialAuthUserId, {
+          recoverStuckSyncing: !hasWebLocksSupport(),
+        })
       : [];
 
   const store = create<OfflineQueueState>()((set, get) => ({
@@ -432,7 +434,9 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
       }
 
       if (prevState.activeUserId !== nextUserId) {
-        const nextQueue = readUserQueueFromStorage(nextUserId, { recoverStuckSyncing: true });
+        const nextQueue = readUserQueueFromStorage(nextUserId, {
+          recoverStuckSyncing: !hasWebLocksSupport(),
+        });
         set({
           activeUserId: nextUserId,
           queue: nextQueue,
