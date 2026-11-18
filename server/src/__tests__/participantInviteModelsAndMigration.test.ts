@@ -1596,10 +1596,236 @@ describe('Phase 1: Security Contracts, Models & Participant User Index Migration
     const migReport2 = await migrateLegacyFamilyRepInvites(db);
     expect(migReport2.scannedPendingCount).toBe(0);
     expect(migReport2.revokedLegacyFamilyRepInvitesCount).toBe(0);
+    expect(migReport2.recoveredAuditLogsCount).toBe(0);
     expect(
       await ActivityLogModel.countDocuments({
         actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
       })
     ).toBe(2);
+  });
+
+  it('catches malformed non-ObjectId familyId values and recovers missing ActivityLogs cleanly after failure between revocation and logging', async () => {
+    const db = mongoose.connection.db!;
+    await db.dropDatabase();
+
+    const tripId = new mongoose.Types.ObjectId();
+    const validFamilyId = new mongoose.Types.ObjectId();
+    const adminUserId = new mongoose.Types.ObjectId();
+    const adminPartId = new mongoose.Types.ObjectId();
+    const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const pastUsedAt = new Date(Date.now() - 7200 * 1000);
+
+    const invitesCol = db.collection(ParticipantInviteModel.collection.collectionName);
+    const idEmptyStr = new mongoose.Types.ObjectId();
+    const idBadStr = new mongoose.Types.ObjectId();
+    const idNumber = new mongoose.Types.ObjectId();
+    const idArray = new mongoose.Types.ObjectId();
+    const idNull = new mongoose.Types.ObjectId();
+    const idValid = new mongoose.Types.ObjectId();
+    const idUsedMalformed = new mongoose.Types.ObjectId();
+
+    await invitesCol.insertMany([
+      {
+        _id: idEmptyStr,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-empty-str'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'empty@example.com',
+        requireVerifiedEmail: true,
+        familyId: '',
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: idBadStr,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-bad-str'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'badstr@example.com',
+        requireVerifiedEmail: true,
+        familyId: 'not-a-valid-object-id',
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: idNumber,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-num'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'num@example.com',
+        requireVerifiedEmail: true,
+        familyId: 12345,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: idArray,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-arr'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'arr@example.com',
+        requireVerifiedEmail: true,
+        familyId: [validFamilyId],
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: idNull,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-null'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'null@example.com',
+        requireVerifiedEmail: true,
+        familyId: null,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: idValid,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-valid'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'valid@example.com',
+        requireVerifiedEmail: true,
+        familyId: validFamilyId,
+        expiresAt: future,
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+      {
+        _id: idUsedMalformed,
+        tripId,
+        participantId: new mongoose.Types.ObjectId(),
+        invitedByUserId: adminUserId,
+        invitedByParticipantId: adminPartId,
+        tokenHash: sha256('mal-used-historical'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'usedmal@example.com',
+        requireVerifiedEmail: true,
+        familyId: 'historical-bad-string',
+        expiresAt: future,
+        usedAt: pastUsedAt,
+        usedByUserId: new mongoose.Types.ObjectId(),
+        revokedAt: null,
+        revokedByParticipantId: null,
+      },
+    ]);
+
+    const preAudit = await auditParticipantLinkingRisks(db);
+    expect(preAudit.pendingLegacyFamilyRepInvitesMissingFamilyIdCount).toBe(5);
+    expect(preAudit.pendingMigrationAuditLogsCount).toBe(0);
+
+    // Fault injection: succeed revoking + logging #1, succeed revoking #2 (with migrationAuditPending),
+    // then fail right before inserting #2's ActivityLog.
+    const realCollection = db.collection.bind(db);
+    let insertAttempt = 0;
+    vi.spyOn(db, 'collection').mockImplementation(((name: string) => {
+      const col = realCollection(name);
+      if (name === ActivityLogModel.collection.collectionName) {
+        return new Proxy(col, {
+          get(target, prop, receiver) {
+            if (prop === 'insertOne') {
+              return async (...args: unknown[]) => {
+                insertAttempt += 1;
+                if (insertAttempt === 2) {
+                  throw new Error('Simulated crash between invite revocation and ActivityLog write');
+                }
+                return (target.insertOne as (...a: unknown[]) => Promise<unknown>)(...args);
+              };
+            }
+            return Reflect.get(target, prop, receiver);
+          },
+        });
+      }
+      return col;
+    }) as typeof db.collection);
+
+    await expect(migrateLegacyFamilyRepInvites(db)).rejects.toThrow(
+      /Simulated crash between invite revocation and ActivityLog write/i
+    );
+    vi.restoreAllMocks();
+
+    // Intermediate state: invite #1 is logged & clean; invite #2 is fail-closed revoked awaiting log recovery; #3-#5 remain pending
+    const midAudit = await auditParticipantLinkingRisks(db);
+    expect(midAudit.pendingLegacyFamilyRepInvitesMissingFamilyIdCount).toBe(3);
+    expect(midAudit.pendingMigrationAuditLogsCount).toBe(1);
+    expect((await invitesCol.findOne({ _id: idBadStr }))?.revokedAt).toBeInstanceOf(Date);
+    expect((await invitesCol.findOne({ _id: idBadStr }))?.migrationAuditPending).toBe(true);
+    expect(
+      await ActivityLogModel.countDocuments({ actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION' })
+    ).toBe(1);
+
+    // Also verify case where ActivityLog succeeded BEFORE $unset marker was cleared: retry must NOT create duplicate log
+    await invitesCol.updateOne({ _id: idEmptyStr }, { $set: { migrationAuditPending: true } });
+
+    // Retry completes cleanly: recovers #2's missing log, clears #1's marker without duplicating #1's log, revokes & logs #3-#5
+    const retryReport = await migrateLegacyFamilyRepInvites(db);
+    expect(retryReport.recoveredAuditLogsCount).toBe(1);
+    expect(retryReport.scannedPendingCount).toBe(3);
+    expect(retryReport.revokedLegacyFamilyRepInvitesCount).toBe(3);
+
+    const postAudit = await auditParticipantLinkingRisks(db);
+    expect(postAudit.pendingLegacyFamilyRepInvitesMissingFamilyIdCount).toBe(0);
+    expect(postAudit.pendingMigrationAuditLogsCount).toBe(0);
+
+    for (const invalidId of [idEmptyStr, idBadStr, idNumber, idArray, idNull]) {
+      const doc = await invitesCol.findOne({ _id: invalidId });
+      expect(doc?.revokedAt).toBeInstanceOf(Date);
+      expect(doc?.migrationAuditPending).toBeUndefined();
+    }
+
+    expect((await invitesCol.findOne({ _id: idValid }))?.revokedAt).toBeNull();
+    const usedHist = await invitesCol.findOne({ _id: idUsedMalformed });
+    expect(usedHist?.revokedAt).toBeNull();
+    expect((usedHist?.usedAt as Date).getTime()).toBe(pastUsedAt.getTime());
+
+    const allMigLogs = await ActivityLogModel.find({
+      actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+    }).lean();
+    expect(allMigLogs).toHaveLength(5);
+    expect(allMigLogs.map((l) => l.entityId.toString()).sort()).toEqual(
+      [idEmptyStr, idBadStr, idNumber, idArray, idNull].map((x) => x.toString()).sort()
+    );
+
+    // Third run is completely idempotent
+    const thirdRun = await migrateLegacyFamilyRepInvites(db);
+    expect(thirdRun.scannedPendingCount).toBe(0);
+    expect(thirdRun.revokedLegacyFamilyRepInvitesCount).toBe(0);
+    expect(thirdRun.recoveredAuditLogsCount).toBe(0);
   });
 });

@@ -412,7 +412,7 @@ export async function listPendingInvitesForVerifiedUser(
     }
     if (
       inv.grantedRole === 'FAMILY_REP' &&
-      (!inv.familyId ||
+      (!(inv.familyId instanceof mongoose.Types.ObjectId) ||
         !participant.familyId ||
         participant.familyId.toString() !== inv.familyId.toString())
     ) {
@@ -613,7 +613,7 @@ export async function claimParticipantInviteForUser(params: {
 
       if (
         liveInvite.grantedRole === 'FAMILY_REP' &&
-        (!liveInvite.familyId ||
+        (!(liveInvite.familyId instanceof mongoose.Types.ObjectId) ||
           !eligibleFamily ||
           !liveInvite.familyId.equals(eligibleFamily._id))
       ) {

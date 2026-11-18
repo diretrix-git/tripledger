@@ -17,6 +17,7 @@ import {
   USER_EMAIL_VERIFICATION_TOKEN_INDEX_NAME,
   UserModel,
 } from '../models/User.js';
+import { supportsTransactions } from '../services/atomicWrite.js';
 import { ensureRateLimitIndexes } from '../services/rateLimitStore.js';
 
 export interface DuplicateTripUserAuditEntry {
@@ -60,6 +61,7 @@ export interface LegacyInviteDefaultsBackfillReport {
 export interface LegacyFamilyRepInviteMigrationReport {
   scannedPendingCount: number;
   revokedLegacyFamilyRepInvitesCount: number;
+  recoveredAuditLogsCount: number;
   revokedInviteIds: string[];
 }
 
@@ -78,6 +80,7 @@ export interface ParticipantLinkingRiskAuditReport {
   unlinkedPrivilegedGuestsWithEmailCount: number;
   unlinkedPrivilegedGuestsCount: number;
   pendingLegacyFamilyRepInvitesMissingFamilyIdCount: number;
+  pendingMigrationAuditLogsCount: number;
   nonCreatorUnverifiedPrivilegedLinks: HistoricalPrivilegedLinkRiskEntry[];
   participantsTripUserPartialIndexPresent: boolean;
   usersVerificationTokenPartialIndexPresent: boolean;
@@ -89,7 +92,7 @@ const LEGACY_PENDING_FAMILY_REP_INVITE_FILTER = {
   grantedRole: 'FAMILY_REP',
   usedAt: null,
   revokedAt: null,
-  $or: [{ familyId: null }, { familyId: { $exists: false } }],
+  $or: [{ familyId: { $not: { $type: 'objectId' } } }, { familyId: { $type: 'array' } }],
 };
 
 interface IndexInfo {
@@ -593,11 +596,80 @@ export async function backfillInviteSecurityDefaults(
   };
 }
 
+interface LegacyInviteMigrationCandidate {
+  _id: mongoose.Types.ObjectId;
+  tripId: mongoose.Types.ObjectId;
+  participantId?: mongoose.Types.ObjectId;
+  intendedEmail?: string | null;
+  familyId?: unknown;
+  revokedAt?: unknown;
+}
+
+function describeRawValueType(value: unknown): string {
+  if (value === undefined) return 'missing';
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+async function ensureLegacyInviteMigrationAuditLog(params: {
+  activityLogsCol: mongoose.mongo.Collection<mongoose.mongo.BSON.Document>;
+  doc: LegacyInviteMigrationCandidate;
+  createdAt: Date;
+  session?: mongoose.ClientSession;
+}): Promise<boolean> {
+  const { activityLogsCol, doc, createdAt, session } = params;
+  const existingLog = await activityLogsCol.findOne(
+    {
+      entityType: 'PARTICIPANT_INVITE',
+      entityId: doc._id,
+      actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+    },
+    {
+      projection: { _id: 1 },
+      ...(session ? { session } : {}),
+    }
+  );
+  if (existingLog) {
+    return false;
+  }
+
+  await activityLogsCol.insertOne(
+    {
+      tripId: doc.tripId,
+      actorUserId: null,
+      actorParticipantId: null,
+      actorName: 'System Migration',
+      actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+      entityType: 'PARTICIPANT_INVITE',
+      entityId: doc._id,
+      summary:
+        'System migration revoked a legacy pending FAMILY_REP invitation missing a valid familyId ObjectId binding.',
+      metadata: {
+        reason: 'MISSING_FAMILY_ID_LEGACY_INVITE',
+        grantedRole: 'FAMILY_REP',
+        participantId: doc.participantId ? doc.participantId.toString() : null,
+        intendedEmail: doc.intendedEmail ?? null,
+        rawFamilyIdType: describeRawValueType(doc.familyId),
+      },
+      createdAt,
+    },
+    session ? { session } : undefined
+  );
+  return true;
+}
+
 /**
  * Revokes legacy pending (unredeemed, unrevoked) `FAMILY_REP` invitations that lack a
- * non-null `familyId` binding so operators can cleanly close ambiguous pre-Phase-3.1 records.
+ * valid non-null `ObjectId` `familyId` binding (covering `null`, absent, or malformed values).
  * Historical already-used or already-revoked invites are preserved untouched, and intended
  * family assignments are never guessed.
+ *
+ * - On replica sets (`supportsTransactions() === true` on the active Mongoose connection),
+ *   revocation + `ActivityLog` insertion execute inside an atomic ACID transaction.
+ * - On standalone MongoDB (or when recovering an interrupted standalone run), invites are
+ *   revoked with `migrationAuditPending: true`, recovered on retry by idempotently backfilling
+ *   the `PARTICIPANT_INVITE_REVOKED_MIGRATION` log if missing, and cleared via `$unset`.
  */
 export async function migrateLegacyFamilyRepInvites(
   db: NonNullable<mongoose.Connection['db']> | undefined = mongoose.connection.db
@@ -609,60 +681,130 @@ export async function migrateLegacyFamilyRepInvites(
   const invitesCol = db.collection(ParticipantInviteModel.collection.collectionName);
   const activityLogsCol = db.collection(ActivityLogModel.collection.collectionName);
 
+  const now = new Date();
+  let recoveredAuditLogsCount = 0;
+
+  // Step 1: Recover any interrupted standalone revocations awaiting migration audit logging.
+  const pendingAuditDocs = await invitesCol
+    .find<LegacyInviteMigrationCandidate>(
+      {
+        grantedRole: 'FAMILY_REP',
+        usedAt: null,
+        revokedAt: { $ne: null },
+        migrationAuditPending: true,
+      },
+      {
+        projection: {
+          _id: 1,
+          tripId: 1,
+          participantId: 1,
+          intendedEmail: 1,
+          familyId: 1,
+          revokedAt: 1,
+        },
+      }
+    )
+    .toArray();
+
+  for (const pendingAuditDoc of pendingAuditDocs) {
+    const inserted = await ensureLegacyInviteMigrationAuditLog({
+      activityLogsCol,
+      doc: pendingAuditDoc,
+      createdAt:
+        pendingAuditDoc.revokedAt instanceof Date ? pendingAuditDoc.revokedAt : now,
+    });
+    if (inserted) {
+      recoveredAuditLogsCount += 1;
+    }
+    await invitesCol.updateOne(
+      { _id: pendingAuditDoc._id, migrationAuditPending: true },
+      { $unset: { migrationAuditPending: '' } }
+    );
+  }
+
+  // Step 2: Revoke remaining pending invalid FAMILY_REP invites (missing, null, or malformed familyId).
   const pendingLegacyInvites = await invitesCol
-    .find<{
-      _id: mongoose.Types.ObjectId;
-      tripId: mongoose.Types.ObjectId;
-      participantId?: mongoose.Types.ObjectId;
-      intendedEmail?: string | null;
-    }>(LEGACY_PENDING_FAMILY_REP_INVITE_FILTER, {
-      projection: { _id: 1, tripId: 1, participantId: 1, intendedEmail: 1 },
+    .find<LegacyInviteMigrationCandidate>(LEGACY_PENDING_FAMILY_REP_INVITE_FILTER, {
+      projection: { _id: 1, tripId: 1, participantId: 1, intendedEmail: 1, familyId: 1 },
     })
     .toArray();
 
   const revokedInviteIds: string[] = [];
-  const now = new Date();
+  const useTransaction = mongoose.connection.db === db && (await supportsTransactions());
 
-  for (const doc of pendingLegacyInvites) {
-    const updateRes = await invitesCol.updateOne(
-      {
-        _id: doc._id,
-        ...LEGACY_PENDING_FAMILY_REP_INVITE_FILTER,
-      },
-      {
-        $set: {
-          revokedAt: now,
-          updatedAt: now,
-        },
+  if (useTransaction) {
+    for (const doc of pendingLegacyInvites) {
+      let committedRevoke = false;
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          committedRevoke = false;
+          const updateRes = await invitesCol.updateOne(
+            {
+              _id: doc._id,
+              ...LEGACY_PENDING_FAMILY_REP_INVITE_FILTER,
+            },
+            {
+              $set: {
+                revokedAt: now,
+                updatedAt: now,
+              },
+            },
+            { session }
+          );
+
+          if ((updateRes.modifiedCount ?? 0) === 1) {
+            await ensureLegacyInviteMigrationAuditLog({
+              activityLogsCol,
+              doc,
+              createdAt: now,
+              session,
+            });
+            committedRevoke = true;
+          }
+        });
+      } finally {
+        await session.endSession();
       }
-    );
-
-    if ((updateRes.modifiedCount ?? 0) === 1) {
-      revokedInviteIds.push(doc._id.toString());
-      await activityLogsCol.insertOne({
-        tripId: doc.tripId,
-        actorUserId: null,
-        actorParticipantId: null,
-        actorName: 'System Migration',
-        actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
-        entityType: 'PARTICIPANT_INVITE',
-        entityId: doc._id,
-        summary:
-          'System migration revoked a legacy pending FAMILY_REP invitation missing a familyId binding.',
-        metadata: {
-          reason: 'MISSING_FAMILY_ID_LEGACY_INVITE',
-          grantedRole: 'FAMILY_REP',
-          participantId: doc.participantId ? doc.participantId.toString() : null,
-          intendedEmail: doc.intendedEmail ?? null,
+      if (committedRevoke) {
+        revokedInviteIds.push(doc._id.toString());
+      }
+    }
+  } else {
+    for (const doc of pendingLegacyInvites) {
+      const updateRes = await invitesCol.updateOne(
+        {
+          _id: doc._id,
+          ...LEGACY_PENDING_FAMILY_REP_INVITE_FILTER,
         },
-        createdAt: now,
-      });
+        {
+          $set: {
+            revokedAt: now,
+            updatedAt: now,
+            migrationAuditPending: true,
+          },
+        }
+      );
+
+      if ((updateRes.modifiedCount ?? 0) === 1) {
+        revokedInviteIds.push(doc._id.toString());
+        await ensureLegacyInviteMigrationAuditLog({
+          activityLogsCol,
+          doc,
+          createdAt: now,
+        });
+        await invitesCol.updateOne(
+          { _id: doc._id, migrationAuditPending: true },
+          { $unset: { migrationAuditPending: '' } }
+        );
+      }
     }
   }
 
   return {
     scannedPendingCount: pendingLegacyInvites.length,
     revokedLegacyFamilyRepInvitesCount: revokedInviteIds.length,
+    recoveredAuditLogsCount,
     revokedInviteIds,
   };
 }
@@ -695,6 +837,7 @@ export async function auditParticipantLinkingRisks(
     unlinkedPrivilegedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsCount,
     pendingLegacyFamilyRepInvitesMissingFamilyIdCount,
+    pendingMigrationAuditLogsCount,
     anomalousLinks,
     participantIndexes,
     userIndexes,
@@ -716,6 +859,12 @@ export async function auditParticipantLinkingRisks(
       $and: [unlinkedFilter, { role: { $in: [...PRIVILEGED_TRIP_ROLES] } }],
     }),
     invitesCol.countDocuments(LEGACY_PENDING_FAMILY_REP_INVITE_FILTER),
+    invitesCol.countDocuments({
+      grantedRole: 'FAMILY_REP',
+      usedAt: null,
+      revokedAt: { $ne: null },
+      migrationAuditPending: true,
+    }),
     participantsCol
       .aggregate<{
         _id: unknown;
@@ -801,6 +950,7 @@ export async function auditParticipantLinkingRisks(
     unlinkedPrivilegedGuestsWithEmailCount,
     unlinkedPrivilegedGuestsCount,
     pendingLegacyFamilyRepInvitesMissingFamilyIdCount,
+    pendingMigrationAuditLogsCount,
     nonCreatorUnverifiedPrivilegedLinks: anomalousLinks.map((entry) => ({
       tripId: String(entry.tripId),
       participantId: String(entry._id),

@@ -261,11 +261,12 @@ export async function assertParticipantEligibleForFamilyRepInvite(params: {
 
   if (
     requireExpectedFamilyId &&
-    (!expectedFamilyId || !expectedFamilyId.equals(participant.familyId))
+    (!(expectedFamilyId instanceof mongoose.Types.ObjectId) ||
+      !expectedFamilyId.equals(participant.familyId))
   ) {
     throw new AppError(
-      !expectedFamilyId
-        ? 'This FAMILY_REP invitation is missing a bound family group and is no longer valid.'
+      !(expectedFamilyId instanceof mongoose.Types.ObjectId)
+        ? 'This FAMILY_REP invitation is missing a valid bound family group and is no longer valid.'
         : 'This FAMILY_REP invitation was issued for a different family group and is no longer valid.',
       409,
       'INVITE_FAMILY_MISMATCH'
