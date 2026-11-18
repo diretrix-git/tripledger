@@ -1,5 +1,6 @@
 import React from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
+import { useAuthCacheIsolation } from './hooks/useAuthCacheIsolation.js';
 import { useAuthStore } from './stores/authStore.js';
 import { AppShell } from './components/layout/AppShell.js';
 import { AuthPage } from './pages/AuthPage.js';
@@ -21,9 +22,16 @@ function ProtectedRoute({ children }: { children: React.ReactElement }): React.R
   return children;
 }
 
+function AuthCacheBoundary(): null {
+  useAuthCacheIsolation();
+  return null;
+}
+
 export function App(): React.ReactElement {
   return (
-    <Routes>
+    <>
+      <AuthCacheBoundary />
+      <Routes>
       <Route path="/login" element={<AuthPage mode="login" />} />
       <Route path="/register" element={<AuthPage mode="register" />} />
       <Route path="/verify-email" element={<VerifyEmailPage />} />
@@ -76,7 +84,8 @@ export function App(): React.ReactElement {
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+      </Routes>
+    </>
   );
 }
 

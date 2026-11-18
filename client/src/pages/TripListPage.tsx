@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Plus, Users, UsersRound } from 'lucide-react';
 import { formatPaisaToNPR, type TripMode } from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
+import { useAuthStore } from '../stores/authStore.js';
 import type { DashboardTripSummary } from './DashboardPage.js';
 
 export function TripListPage({
@@ -17,16 +18,19 @@ export function TripListPage({
   title: string;
   subtitle: string;
 }): React.ReactElement {
+  const user = useAuthStore((s) => s.user);
+  const accessToken = useAuthStore((s) => s.accessToken);
   const queryParams = new URLSearchParams();
   if (filterMode) queryParams.set('mode', filterMode);
   if (filterClosed) queryParams.set('status', 'CLOSED');
 
   const { data, isLoading } = useQuery({
-    queryKey: ['trips', filterMode ?? 'ALL', filterClosed ? 'CLOSED' : 'ALL'],
+    queryKey: ['trips', user?.id ?? null, filterMode ?? 'ALL', filterClosed ? 'CLOSED' : 'ALL'],
     queryFn: () =>
       apiRequest<{ trips: DashboardTripSummary[] }>(
         `/trips${queryParams.toString() ? `?${queryParams.toString()}` : ''}`
       ),
+    enabled: Boolean(accessToken && user?.id),
   });
 
   const trips = data?.trips ?? [];

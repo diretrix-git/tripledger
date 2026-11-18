@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useRef, useState } from 'react';
+import React, { useContext, useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { QueryClientContext } from '@tanstack/react-query';
 import {
@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { formatPaisaToNPR } from '@tripledger/shared';
 import { useAuthStore, type AuthUser } from '../../stores/authStore.js';
+import { clearAuthQueryCache, useAuthCacheIsolation } from '../../hooks/useAuthCacheIsolation.js';
 import { useOfflineSync } from '../../hooks/useOfflineSync.js';
 import { apiRequest } from '../../api/client.js';
 
@@ -31,17 +32,7 @@ export function AppShell(): React.ReactElement {
   const { isOnline, isSyncing, queue, flushOfflineQueue } = useOfflineSync();
   const [showQueueDrawer, setShowQueueDrawer] = useState(false);
 
-  const prevSessionKeyRef = useRef<string | null>(
-    user?.id ? `${user.id}:${Boolean(accessToken)}` : null
-  );
-
-  useEffect(() => {
-    const nextSessionKey = user?.id ? `${user.id}:${Boolean(accessToken)}` : null;
-    if (prevSessionKeyRef.current !== null && prevSessionKeyRef.current !== nextSessionKey) {
-      queryClient?.clear();
-    }
-    prevSessionKeyRef.current = nextSessionKey;
-  }, [accessToken, queryClient, user?.id]);
+  useAuthCacheIsolation();
 
   useEffect(() => {
     if (!accessToken || !user?.id) return;
@@ -81,7 +72,7 @@ export function AppShell(): React.ReactElement {
     } catch {
       // ignore network error on logout
     }
-    queryClient?.clear();
+    clearAuthQueryCache(queryClient);
     clearAuth();
     navigate('/login');
   };

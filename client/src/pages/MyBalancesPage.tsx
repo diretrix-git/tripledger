@@ -4,11 +4,14 @@ import { useQuery } from '@tanstack/react-query';
 import { ArrowDownLeft, ArrowUpRight, CheckCircle2 } from 'lucide-react';
 import { formatPaisaToNPR } from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
+import { useAuthStore } from '../stores/authStore.js';
 import type { DashboardTripSummary } from './DashboardPage.js';
 
 export function MyBalancesPage(): React.ReactElement {
+  const user = useAuthStore((s) => s.user);
+  const accessToken = useAuthStore((s) => s.accessToken);
   const { data, isLoading } = useQuery({
-    queryKey: ['dashboard'],
+    queryKey: ['dashboard', user?.id ?? null],
     queryFn: () =>
       apiRequest<{
         metrics: {
@@ -23,6 +26,7 @@ export function MyBalancesPage(): React.ReactElement {
           }
         >;
       }>('/dashboard/summary'),
+    enabled: Boolean(accessToken && user?.id),
   });
 
   if (isLoading) {

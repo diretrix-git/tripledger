@@ -85,6 +85,7 @@ export function TripDetailPage(): React.ReactElement {
   const { tripId } = useParams<{ tripId: string }>();
   const queryClient = useQueryClient();
   const currentUser = useAuthStore((s) => s.user);
+  const accessToken = useAuthStore((s) => s.accessToken);
   const allOfflineQueue = useOfflineQueueStore((s) => s.queue);
   const offlineQueue = useMemo(
     () => allOfflineQueue.filter((q) => q.tripId === tripId),
@@ -157,15 +158,15 @@ export function TripDetailPage(): React.ReactElement {
   }, [tripId]);
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['trip', tripId],
+    queryKey: ['trip', tripId, currentUser?.id ?? null],
     queryFn: () => apiRequest<TripDetailResponse>(`/trips/${tripId}`),
-    enabled: Boolean(tripId),
+    enabled: Boolean(tripId && accessToken),
   });
 
   const invitesQuery = useQuery({
-    queryKey: ['trip-invites', tripId],
+    queryKey: ['trip-invites', tripId, currentUser?.id ?? null],
     queryFn: () => apiRequest<{ invites: ParticipantInviteEntity[] }>(`/trips/${tripId}/invites`),
-    enabled: Boolean(tripId && data?.myParticipant?.role === 'ORGANIZER'),
+    enabled: Boolean(tripId && accessToken && data?.myParticipant?.role === 'ORGANIZER'),
   });
 
   if (isLoading) {
@@ -1505,6 +1506,7 @@ export function TripDetailPage(): React.ReactElement {
                       : undefined;
                   const isDesignatedFamilyRep =
                     currentUser?.emailVerified === true &&
+                    Boolean(currentUser?.id && myParticipantRecord?.userId === currentUser.id) &&
                     trip.mode === 'FAMILY' &&
                     s.settlementMode === 'FAMILY' &&
                     isActiveActor &&

@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { apiRequest, ApiClientError, shouldAttemptTokenRefresh } from '../api/client.js';
+import { App } from '../App.js';
 import { AppShell } from '../components/layout/AppShell.js';
 import { SettingsPage } from '../pages/SettingsPage.js';
+import { TripDetailPage } from '../pages/TripDetailPage.js';
 import { AUTH_STORAGE_KEY, useAuthStore, type AuthUser } from '../stores/authStore.js';
 import { useOfflineQueueStore } from '../stores/offlineQueueStore.js';
 
@@ -577,5 +579,290 @@ describe('F-01: Token refresh exclusions, single-flight deduplication, and cross
     await expect(apiRequest('/auth/me')).rejects.toBeInstanceOf(ApiClientError);
     expect(useAuthStore.getState().accessToken).toBeNull();
     expect(useAuthStore.getState().user).toBeNull();
+  });
+
+  it('9. (M-01) clears React Query cache synchronously across ProtectedRoute unmount, /login account switch, and cross-tab switch, and binds FAMILY_REP UI to userId', async () => {
+    const userA = makeUser({
+      id: 'user-a',
+      name: 'Alice OrgRep',
+      email: 'alice@example.com',
+      emailVerified: true,
+    });
+    const userB = makeUser({
+      id: 'user-b',
+      name: 'Bob Member',
+      email: 'bob@example.com',
+      emailVerified: true,
+    });
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+
+    const buildTripPayload = (forUserId: 'user-a' | 'user-b') => ({
+      trip: {
+        id: 'trip-1',
+        name: 'Mustang Isolation Trip',
+        mode: 'FAMILY',
+        status: 'ACTIVE',
+        currency: 'NPR',
+        ...(forUserId === 'user-a' ? { inviteCode: 'SECRET-A' } : {}),
+        shareToken: 'share-1',
+        shareEnabled: true,
+        checklist: [],
+      },
+      myParticipant:
+        forUserId === 'user-a'
+          ? { id: 'p-a', name: 'Alice OrgRep', role: 'ORGANIZER', familyId: 'fam-1' }
+          : { id: 'p-b', name: 'Bob Member', role: 'PARTICIPANT', familyId: 'fam-1' },
+      participants: [
+        {
+          id: 'p-a',
+          tripId: 'trip-1',
+          userId: 'user-a',
+          familyId: 'fam-1',
+          name: 'Alice OrgRep',
+          email: 'alice@example.com',
+          role: 'ORGANIZER',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+        {
+          id: 'p-b',
+          tripId: 'trip-1',
+          userId: 'user-b',
+          familyId: 'fam-1',
+          name: 'Bob Member',
+          email: 'bob@example.com',
+          role: 'PARTICIPANT',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+      ],
+      families: [
+        {
+          id: 'fam-1',
+          tripId: 'trip-1',
+          name: 'Alpha Fam',
+          representativeId: 'p-a',
+          defaultWeight: 1,
+        },
+      ],
+      expenses: [],
+      settlements: [],
+      ledger: {
+        totalApprovedExpensePaisa: 0,
+        totalPackageExpensePaisa: 0,
+        totalAdditionalExpensePaisa: 0,
+        totalPendingExpensePaisa: 0,
+        totalConfirmedSettlementPaisa: 0,
+        individualBalances: [],
+        familyBalances: [],
+        ungroupedParticipantBalances: [],
+      },
+      individualSettlementSuggestions: [],
+      familySettlementSuggestions: [],
+    });
+
+    let userBTripFetches = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const auth = new Headers(init?.headers).get('Authorization');
+
+        if (url.endsWith('/auth/login') && method === 'POST') {
+          return jsonResponse({
+            success: true,
+            data: { user: userB, accessToken: 'tok-b', refreshToken: 'ref-b' },
+          });
+        }
+        if (url.endsWith('/auth/me')) {
+          return jsonResponse({
+            success: true,
+            data: { user: auth === 'Bearer tok-a' ? userA : userB },
+          });
+        }
+        if (url.endsWith('/dashboard/summary')) {
+          return jsonResponse({
+            success: true,
+            data: {
+              metrics: {
+                activeTripsCount: 1,
+                closedTripsCount: 0,
+                totalActiveTripExpensePaisa: 0,
+                totalOwedToMePaisa: 0,
+                totalIOwePaisa: 0,
+                netOverallBalancePaisa: 0,
+              },
+              trips: [],
+              recentActivities: [],
+            },
+          });
+        }
+        if (url.endsWith('/trips/invites/pending')) {
+          return jsonResponse({ success: true, data: { invites: [] } });
+        }
+        if (url.endsWith('/trips/trip-1')) {
+          if (auth === 'Bearer tok-a') {
+            return jsonResponse({ success: true, data: buildTripPayload('user-a') });
+          }
+          if (auth === 'Bearer tok-b') {
+            userBTripFetches += 1;
+            return jsonResponse({ success: true, data: buildTripPayload('user-b') });
+          }
+        }
+        if (url.endsWith('/trips/trip-1/invites')) {
+          if (auth === 'Bearer tok-a') {
+            return jsonResponse({ success: true, data: { invites: [] } });
+          }
+          throw new Error('Unauthorized invites fetch by non-organizer user-b');
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { staleTime: 10_000, retry: false } },
+    });
+
+    function TestNavControls() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate('/trips/trip-1')}>
+          Open Trip 1 Nav
+        </button>
+      );
+    }
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <TestNavControls />
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Code: SECRET-A/i)).toBeInTheDocument();
+    });
+    expect(queryClient.getQueryData(['trip', 'trip-1', 'user-a'])).toBeDefined();
+
+    // Cross-tab logout while inside <ProtectedRoute>: ProtectedRoute redirects to /login and
+    // AuthCacheBoundary synchronously clears queryClient even though AppShell unmounts before effect.
+    dispatchCrossTabStorage(
+      JSON.stringify({
+        state: { user: null, accessToken: null, refreshToken: null },
+        version: 0,
+      })
+    );
+
+    expect(queryClient.getQueryCache().getAll()).toHaveLength(0);
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Sign in to TripLedger/i })).toBeInTheDocument();
+    });
+
+    // User B signs in through AuthPage within 10s staleTime
+    fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
+      target: { value: userB.email },
+    });
+    fireEvent.change(screen.getByPlaceholderText('••••••••'), {
+      target: { value: 'Password123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Sign In$/i }));
+
+    await waitFor(() => {
+      expect(useAuthStore.getState().user?.id).toBe('user-b');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Trip 1 Nav' }));
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Isolation Trip/i)).toBeInTheDocument();
+    });
+    expect(userBTripFetches).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText(/Code: SECRET-A/i)).not.toBeInTheDocument();
+
+    // Direct cross-tab switch back to User A immediately wipes User B's query cache
+    dispatchCrossTabStorage(
+      JSON.stringify({
+        state: { user: userA, accessToken: 'tok-a', refreshToken: 'ref-a' },
+        version: 0,
+      })
+    );
+    expect(queryClient.getQueryData(['trip', 'trip-1', 'user-b'])).toBeUndefined();
+    await waitFor(() => {
+      expect(screen.getByText(/Code: SECRET-A/i)).toBeInTheDocument();
+    });
+
+    // Designated FAMILY_REP UI additionally verifies currentUser.id matches participant.userId
+    cleanup();
+    useAuthStore.getState().setAuth(userB, 'tok-b', 'ref-b');
+    const mismatchedRepPayload = {
+      ...buildTripPayload('user-a'),
+      myParticipant: { id: 'p-a', name: 'Alice Rep', role: 'FAMILY_REP', familyId: 'fam-1' },
+      participants: [
+        {
+          ...buildTripPayload('user-a').participants[0]!,
+          role: 'FAMILY_REP',
+        },
+        {
+          id: 'p-recv',
+          tripId: 'trip-1',
+          userId: 'user-other',
+          familyId: 'fam-1',
+          name: 'Other Member',
+          email: 'other@example.com',
+          role: 'PARTICIPANT',
+          memberType: 'ADULT',
+          defaultWeight: 1,
+          isActive: true,
+        },
+      ],
+      settlements: [
+        {
+          id: 's-fam-rep-check',
+          tripId: 'trip-1',
+          settlementMode: 'FAMILY',
+          fromParticipantId: 'p-recv',
+          toParticipantId: 'p-recv',
+          fromFamilyId: 'fam-1',
+          toFamilyId: 'fam-1',
+          amountPaisa: 10000,
+          paymentMethod: 'ESEWA',
+          status: 'REPORTED',
+          settledAt: '2026-11-16T07:00:00.000Z',
+          createdAt: '2026-11-16T07:00:00.000Z',
+          updatedAt: '2026-11-16T07:00:00.000Z',
+        },
+      ],
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).endsWith('/trips/trip-1')) {
+          return jsonResponse({ success: true, data: mismatchedRepPayload });
+        }
+        throw new Error(`Unexpected mismatched fetch: ${String(input)}`);
+      })
+    );
+    const qcMismatch = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qcMismatch}>
+        <MemoryRouter initialEntries={['/trips/trip-1']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Mustang Isolation Trip/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    await waitFor(() => {
+      expect(screen.getByText('REPORTED')).toBeInTheDocument();
+    });
+    expect(screen.queryByRole('button', { name: /Confirm settlement/i })).not.toBeInTheDocument();
   });
 });

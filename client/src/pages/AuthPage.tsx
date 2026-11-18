@@ -1,10 +1,13 @@
-import React, { useState } from 'react';
+import React, { useContext, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { QueryClientContext } from '@tanstack/react-query';
 import { ApiClientError, apiRequest } from '../api/client.js';
+import { clearAuthQueryCache } from '../hooks/useAuthCacheIsolation.js';
 import { useAuthStore, type AuthUser } from '../stores/authStore.js';
 
 export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactElement {
   const navigate = useNavigate();
+  const queryClient = useContext(QueryClientContext);
   const setAuth = useAuthStore((s) => s.setAuth);
 
   const [name, setName] = useState('');
@@ -35,6 +38,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
         body: JSON.stringify(body),
       });
 
+      clearAuthQueryCache(queryClient);
       setAuth(data.user, data.accessToken, data.refreshToken);
       navigate('/');
     } catch (err) {

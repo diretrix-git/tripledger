@@ -65,8 +65,9 @@ export function DashboardPage(): React.ReactElement {
   const [joinError, setJoinError] = useState<string | null>(null);
 
   const { data, isLoading } = useQuery({
-    queryKey: ['dashboard'],
+    queryKey: ['dashboard', user?.id ?? null],
     queryFn: () => apiRequest<DashboardResponse>('/dashboard/summary'),
+    enabled: Boolean(accessToken && user?.id),
   });
 
   const { data: pendingInvitesData } = useQuery({
