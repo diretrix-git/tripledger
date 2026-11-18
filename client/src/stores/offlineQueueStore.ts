@@ -1,12 +1,25 @@
-import { create } from 'zustand';
+import { create, type StoreApi, type UseBoundStore } from 'zustand';
 import type { ExpenseCategory, PaymentMethod, SplitMethod } from '@tripledger/shared';
-import { AUTH_STORAGE_KEY, useAuthStore } from './authStore.js';
+import {
+  AUTH_STORAGE_KEY,
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+} from './authStore.js';
 
 export const LEGACY_OFFLINE_QUEUE_STORAGE_KEY = 'tripledger-offline-expense-queue';
 export const OFFLINE_QUEUE_STORAGE_PREFIX = 'tripledger-offline-expense-queue:user:';
 
 export function getOfflineQueueStorageKey(userId: string): string {
   return `${OFFLINE_QUEUE_STORAGE_PREFIX}${encodeURIComponent(userId)}`;
+}
+
+function getMutationLockName(userId: string): string {
+  return `tripledger:offline-queue:mutation:${encodeURIComponent(userId)}`;
+}
+
+function getSyncLockName(userId: string): string {
+  return `tripledger:offline-queue:sync:${encodeURIComponent(userId)}`;
 }
 
 export interface QueuedOfflineExpense {
@@ -47,7 +60,7 @@ interface PersistedUserQueueEnvelope {
   queue: QueuedOfflineExpense[];
 }
 
-interface OfflineQueueState {
+export interface OfflineQueueState {
   isOnline: boolean;
   isSyncing: boolean;
   activeUserId: string | null;
@@ -57,20 +70,40 @@ interface OfflineQueueState {
   setSyncing: (syncing: boolean) => void;
   dismissLegacyNotice: () => void;
   syncAuthContext: () => void;
-  enqueueExpense: (item: Omit<QueuedOfflineExpense, 'syncStatus' | 'queuedAt'>) => boolean;
+  refreshUserQueueFromStorage: (expectedUserId?: string) => Promise<QueuedOfflineExpense[]>;
+  tryWithUserSyncLock: (userId: string, work: () => Promise<void>) => Promise<boolean>;
+  enqueueExpense: (
+    item: Omit<QueuedOfflineExpense, 'syncStatus' | 'queuedAt'>
+  ) => Promise<boolean>;
   markItemStatus: (
     clientMutationId: string,
     status: 'PENDING' | 'SYNCING' | 'FAILED',
     error?: string,
     expectedUserId?: string
-  ) => void;
-  removeQueuedExpense: (clientMutationId: string, expectedUserId?: string) => void;
+  ) => Promise<void>;
+  removeQueuedExpense: (clientMutationId: string, expectedUserId?: string) => Promise<void>;
+  destroy: () => void;
 }
+
+export type OfflineQueueStore = UseBoundStore<StoreApi<OfflineQueueState>>;
 
 function getLocalStorageSafely(): Storage | null {
   if (typeof window === 'undefined') return null;
   try {
     return window.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getLockManagerSafely(): LockManager | null {
+  if (typeof navigator === 'undefined') return null;
+  try {
+    const candidate = (navigator as Navigator & { locks?: LockManager }).locks;
+    if (candidate && typeof candidate.request === 'function') {
+      return candidate;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -133,7 +166,10 @@ function isValidQueueEntryForUser(
   return true;
 }
 
-function readUserQueueFromStorage(userId: string): QueuedOfflineExpense[] {
+function readUserQueueFromStorage(
+  userId: string,
+  options: { recoverStuckSyncing?: boolean } = {}
+): QueuedOfflineExpense[] {
   const storage = getLocalStorageSafely();
   if (!storage) return [];
 
@@ -173,9 +209,10 @@ function readUserQueueFromStorage(userId: string): QueuedOfflineExpense[] {
         continue;
       }
       seenIds.add(candidate.clientMutationId);
-      // Recover items left in SYNCING across reloads/logouts back to PENDING cleanly.
+      // Recover items left in SYNCING across reloads/logouts back to PENDING cleanly,
+      // while preserving live SYNCING markers for concurrent sibling operations in active sessions.
       validEntries.push(
-        candidate.syncStatus === 'SYNCING'
+        options.recoverStuckSyncing && candidate.syncStatus === 'SYNCING'
           ? { ...candidate, syncStatus: 'PENDING' }
           : candidate
       );
@@ -250,165 +287,255 @@ function discardLegacyUnscopedQueue(): number {
   return discardedCount;
 }
 
-const initialAuthUserId = resolveAuthenticatedUserId();
-const initialLegacyDiscarded =
-  initialAuthUserId !== null ? discardLegacyUnscopedQueue() : 0;
-const initialQueue =
-  initialAuthUserId !== null ? readUserQueueFromStorage(initialAuthUserId) : [];
+/**
+ * Creates a user-scoped offline expense queue store instance.
+ *
+ * Cross-tab concurrency guarantees:
+ * - Primary: When the Web Locks API (`navigator.locks`) is available, queue read-merge-write
+ *   mutations serialize under an exclusive per-user mutation lock, and queue flushing uses
+ *   `{ ifAvailable: true }` leader election under a separate per-user sync lock.
+ * - Fallback: When `navigator.locks` is unavailable (older browsers or Node/non-lock test hosts),
+ *   a per-tab Promise mutex serializes operations within the tab and reconciles against live
+ *   `localStorage` state before writing, without claiming cross-tab atomic mutual exclusion;
+ *   server-side `(tripId, clientMutationId)` idempotency remains the final guard against duplicate
+ *   expense creation.
+ */
+export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } = {}): OfflineQueueStore {
+  const bindWindowEvents = options.bindWindowEvents ?? true;
+  const inTabMutationChains = new Map<string, Promise<void>>();
 
-export const useOfflineQueueStore = create<OfflineQueueState>()((set, get) => ({
-  isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
-  isSyncing: false,
-  activeUserId: initialAuthUserId,
-  queue: initialQueue,
-  legacyDiscardedCount: initialLegacyDiscarded,
-  setOnlineStatus: (isOnline) => set({ isOnline }),
-  setSyncing: (isSyncing) => set({ isSyncing }),
-  dismissLegacyNotice: () => set({ legacyDiscardedCount: 0 }),
-  syncAuthContext: () => {
-    const nextUserId = resolveAuthenticatedUserId();
-    const discardedNow = discardLegacyUnscopedQueue();
-    const prevState = get();
-
-    if (nextUserId === null) {
-      if (
-        prevState.activeUserId !== null ||
-        prevState.queue.length > 0 ||
-        prevState.isSyncing ||
-        prevState.legacyDiscardedCount !== 0
-      ) {
-        set({
-          activeUserId: null,
-          queue: [],
-          isSyncing: false,
-          legacyDiscardedCount: 0,
-        });
+  const runWithUserQueueLock = <T,>(userId: string, work: () => Promise<T> | T): Promise<T> => {
+    const prevChain = inTabMutationChains.get(userId) ?? Promise.resolve();
+    const runOperation = async (): Promise<T> => {
+      const lockManager = getLockManagerSafely();
+      if (lockManager) {
+        return lockManager.request(
+          getMutationLockName(userId),
+          { mode: 'exclusive' },
+          () => Promise.resolve(work())
+        );
       }
-      return;
-    }
+      return work();
+    };
 
-    if (prevState.activeUserId !== nextUserId) {
-      const nextQueue = readUserQueueFromStorage(nextUserId);
-      set({
-        activeUserId: nextUserId,
-        queue: nextQueue,
-        isSyncing: false,
-        legacyDiscardedCount: discardedNow,
-      });
-      return;
-    }
-
-    const sanitizedInMemory = prevState.queue.filter((q) => q.userId === nextUserId);
-    if (
-      sanitizedInMemory.length !== prevState.queue.length ||
-      discardedNow > 0
-    ) {
-      if (sanitizedInMemory.length !== prevState.queue.length) {
-        writeUserQueueToStorage(nextUserId, sanitizedInMemory);
+    const resultPromise = prevChain.then(runOperation, runOperation);
+    const tailPromise = resultPromise.then(
+      () => undefined,
+      () => undefined
+    );
+    inTabMutationChains.set(userId, tailPromise);
+    void tailPromise.finally(() => {
+      if (inTabMutationChains.get(userId) === tailPromise) {
+        inTabMutationChains.delete(userId);
       }
-      set((state) => ({
-        queue: sanitizedInMemory,
-        legacyDiscardedCount: state.legacyDiscardedCount + discardedNow,
-      }));
-    }
-  },
-  enqueueExpense: (item) => {
-    const currentUserId = resolveAuthenticatedUserId();
-    if (!currentUserId || typeof item.userId !== 'string' || item.userId !== currentUserId) {
-      return false;
-    }
-
-    if (get().activeUserId !== currentUserId) {
-      get().syncAuthContext();
-    }
-
-    let enqueued = false;
-    set((state) => {
-      if (state.activeUserId !== currentUserId) {
-        return state;
-      }
-      const ownedQueue = state.queue.filter((q) => q.userId === currentUserId);
-      // Deduplicate by clientMutationId
-      if (ownedQueue.some((q) => q.clientMutationId === item.clientMutationId)) {
-        enqueued = true;
-        return ownedQueue.length === state.queue.length ? state : { queue: ownedQueue };
-      }
-      const nextQueue: QueuedOfflineExpense[] = [
-        ...ownedQueue,
-        {
-          ...item,
-          userId: currentUserId,
-          queuedAt: new Date().toISOString(),
-          syncStatus: 'PENDING',
-        },
-      ];
-      writeUserQueueToStorage(currentUserId, nextQueue);
-      enqueued = true;
-      return { queue: nextQueue };
     });
-    return enqueued;
-  },
-  markItemStatus: (clientMutationId, syncStatus, lastError, expectedUserId) =>
-    set((state) => {
-      const targetUserId = expectedUserId ?? state.activeUserId;
-      if (!targetUserId) {
-        return state;
+    return resultPromise;
+  };
+
+  const initialAuthUserId = resolveAuthenticatedUserId();
+  const initialLegacyDiscarded =
+    initialAuthUserId !== null ? discardLegacyUnscopedQueue() : 0;
+  const initialQueue =
+    initialAuthUserId !== null
+      ? readUserQueueFromStorage(initialAuthUserId, { recoverStuckSyncing: true })
+      : [];
+
+  const store = create<OfflineQueueState>()((set, get) => ({
+    isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    isSyncing: false,
+    activeUserId: initialAuthUserId,
+    queue: initialQueue,
+    legacyDiscardedCount: initialLegacyDiscarded,
+    setOnlineStatus: (isOnline) => set({ isOnline }),
+    setSyncing: (isSyncing) => set({ isSyncing }),
+    dismissLegacyNotice: () => set({ legacyDiscardedCount: 0 }),
+    syncAuthContext: () => {
+      const nextUserId = resolveAuthenticatedUserId();
+      const discardedNow = discardLegacyUnscopedQueue();
+      const prevState = get();
+
+      if (nextUserId === null) {
+        if (
+          prevState.activeUserId !== null ||
+          prevState.queue.length > 0 ||
+          prevState.isSyncing ||
+          prevState.legacyDiscardedCount !== 0
+        ) {
+          set({
+            activeUserId: null,
+            queue: [],
+            isSyncing: false,
+            legacyDiscardedCount: 0,
+          });
+        }
+        return;
       }
 
-      if (state.activeUserId === targetUserId) {
-        const nextQueue = state.queue
-          .filter((q) => q.userId === targetUserId)
-          .map((q) =>
-            q.clientMutationId === clientMutationId
-              ? { ...q, syncStatus, lastError }
-              : q
-          );
+      if (prevState.activeUserId !== nextUserId) {
+        const nextQueue = readUserQueueFromStorage(nextUserId, { recoverStuckSyncing: true });
+        set({
+          activeUserId: nextUserId,
+          queue: nextQueue,
+          isSyncing: false,
+          legacyDiscardedCount: discardedNow,
+        });
+        return;
+      }
+
+      const sanitizedInMemory = prevState.queue.filter((q) => q.userId === nextUserId);
+      if (
+        sanitizedInMemory.length !== prevState.queue.length ||
+        discardedNow > 0
+      ) {
+        if (sanitizedInMemory.length !== prevState.queue.length) {
+          writeUserQueueToStorage(nextUserId, sanitizedInMemory);
+        }
+        set((state) => ({
+          queue: sanitizedInMemory,
+          legacyDiscardedCount: state.legacyDiscardedCount + discardedNow,
+        }));
+      }
+    },
+    refreshUserQueueFromStorage: async (expectedUserId) => {
+      const targetUserId = expectedUserId ?? get().activeUserId;
+      if (!targetUserId) {
+        return [];
+      }
+      return runWithUserQueueLock(targetUserId, () => {
+        const storage = getLocalStorageSafely();
+        const latestQueue = storage
+          ? readUserQueueFromStorage(targetUserId, { recoverStuckSyncing: false })
+          : get().queue.filter((q) => q.userId === targetUserId);
+        if (get().activeUserId === targetUserId) {
+          set({ queue: latestQueue });
+        }
+        return latestQueue;
+      });
+    },
+    tryWithUserSyncLock: async (userId, work) => {
+      const lockManager = getLockManagerSafely();
+      if (lockManager) {
+        return lockManager.request(
+          getSyncLockName(userId),
+          { mode: 'exclusive', ifAvailable: true },
+          async (lock) => {
+            if (!lock) {
+              return false;
+            }
+            await work();
+            return true;
+          }
+        );
+      }
+      await work();
+      return true;
+    },
+    enqueueExpense: async (item) => {
+      const startSession = captureAuthSessionSnapshot();
+      const currentUserId = resolveAuthenticatedUserId();
+      if (
+        !currentUserId ||
+        !startSession.hasAccessToken ||
+        startSession.userId !== currentUserId ||
+        typeof item.userId !== 'string' ||
+        item.userId !== currentUserId
+      ) {
+        return false;
+      }
+
+      return runWithUserQueueLock(currentUserId, () => {
+        if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+          return false;
+        }
+        if (get().activeUserId !== currentUserId) {
+          get().syncAuthContext();
+          if (get().activeUserId !== currentUserId) {
+            return false;
+          }
+        }
+
+        const storage = getLocalStorageSafely();
+        const baseQueue = storage
+          ? readUserQueueFromStorage(currentUserId, { recoverStuckSyncing: false })
+          : get().queue.filter((q) => q.userId === currentUserId);
+
+        if (baseQueue.some((q) => q.clientMutationId === item.clientMutationId)) {
+          if (get().activeUserId === currentUserId) {
+            set({ queue: baseQueue });
+          }
+          return true;
+        }
+
+        const nextQueue: QueuedOfflineExpense[] = [
+          ...baseQueue,
+          {
+            ...item,
+            userId: currentUserId,
+            queuedAt: new Date().toISOString(),
+            syncStatus: 'PENDING',
+          },
+        ];
+        writeUserQueueToStorage(currentUserId, nextQueue);
+        if (get().activeUserId === currentUserId) {
+          set({ queue: nextQueue });
+        }
+        return true;
+      });
+    },
+    markItemStatus: async (clientMutationId, syncStatus, lastError, expectedUserId) => {
+      const targetUserId = expectedUserId ?? get().activeUserId;
+      if (!targetUserId) {
+        return;
+      }
+
+      await runWithUserQueueLock(targetUserId, () => {
+        const storage = getLocalStorageSafely();
+        const baseQueue = storage
+          ? readUserQueueFromStorage(targetUserId, { recoverStuckSyncing: false })
+          : get().queue.filter((q) => q.userId === targetUserId);
+
+        const nextQueue = baseQueue.map((q) =>
+          q.clientMutationId === clientMutationId
+            ? { ...q, syncStatus, lastError }
+            : q
+        );
         writeUserQueueToStorage(targetUserId, nextQueue);
-        return { queue: nextQueue };
-      }
-
-      // Session changed while an in-flight sync completed/failed for targetUserId:
-      // update only targetUserId's persisted storage without mutating the active user's queue.
-      const storedQueue = readUserQueueFromStorage(targetUserId);
-      const updatedStoredQueue = storedQueue.map((q) =>
-        q.clientMutationId === clientMutationId
-          ? { ...q, syncStatus, lastError }
-          : q
-      );
-      writeUserQueueToStorage(targetUserId, updatedStoredQueue);
-      return state;
-    }),
-  removeQueuedExpense: (clientMutationId, expectedUserId) =>
-    set((state) => {
-      const targetUserId = expectedUserId ?? state.activeUserId;
+        if (get().activeUserId === targetUserId) {
+          set({ queue: nextQueue });
+        }
+      });
+    },
+    removeQueuedExpense: async (clientMutationId, expectedUserId) => {
+      const targetUserId = expectedUserId ?? get().activeUserId;
       if (!targetUserId) {
-        return state;
+        return;
       }
 
-      if (state.activeUserId === targetUserId) {
-        const nextQueue = state.queue.filter(
+      await runWithUserQueueLock(targetUserId, () => {
+        const storage = getLocalStorageSafely();
+        const baseQueue = storage
+          ? readUserQueueFromStorage(targetUserId, { recoverStuckSyncing: false })
+          : get().queue.filter((q) => q.userId === targetUserId);
+
+        const nextQueue = baseQueue.filter(
           (q) => q.userId === targetUserId && q.clientMutationId !== clientMutationId
         );
         writeUserQueueToStorage(targetUserId, nextQueue);
-        return { queue: nextQueue };
+        if (get().activeUserId === targetUserId) {
+          set({ queue: nextQueue });
+        }
+      });
+    },
+    destroy: () => {
+      unsubscribeAuth();
+      if (storageListener && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('storage', storageListener);
       }
+      inTabMutationChains.clear();
+    },
+  }));
 
-      const storedQueue = readUserQueueFromStorage(targetUserId);
-      const updatedStoredQueue = storedQueue.filter(
-        (q) => q.clientMutationId !== clientMutationId
-      );
-      writeUserQueueToStorage(targetUserId, updatedStoredQueue);
-      return state;
-    }),
-}));
-
-let offlineQueueBindingsRegistered = false;
-
-export function initOfflineQueueAuthIsolation(): void {
-  if (offlineQueueBindingsRegistered) return;
-  offlineQueueBindingsRegistered = true;
-
-  useAuthStore.subscribe((state, prevState) => {
+  const unsubscribeAuth = useAuthStore.subscribe((state, prevState) => {
     const prevUserId = prevState.accessToken && prevState.user?.id ? prevState.user.id : null;
     const nextUserId = state.accessToken && state.user?.id ? state.user.id : null;
     if (
@@ -416,39 +543,52 @@ export function initOfflineQueueAuthIsolation(): void {
       state.sessionGeneration !== prevState.sessionGeneration ||
       Boolean(state.accessToken) !== Boolean(prevState.accessToken)
     ) {
-      useOfflineQueueStore.getState().syncAuthContext();
+      store.getState().syncAuthContext();
     }
   });
 
-  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-    window.addEventListener('storage', (event: StorageEvent) => {
+  let storageListener: ((event: StorageEvent) => void) | null = null;
+  if (
+    bindWindowEvents &&
+    typeof window !== 'undefined' &&
+    typeof window.addEventListener === 'function'
+  ) {
+    storageListener = (event: StorageEvent) => {
       if (event.storageArea && event.storageArea !== window.localStorage) {
         return;
       }
-      const activeUserId = useOfflineQueueStore.getState().activeUserId;
-      if (
-        event.key === null ||
-        event.key === AUTH_STORAGE_KEY ||
-        event.key === LEGACY_OFFLINE_QUEUE_STORAGE_KEY ||
-        (activeUserId && event.key === getOfflineQueueStorageKey(activeUserId))
-      ) {
-        if (event.key === null && activeUserId) {
-          useOfflineQueueStore.setState({ queue: [], legacyDiscardedCount: 0 });
-          return;
-        }
-        useOfflineQueueStore.getState().syncAuthContext();
-        const latestActiveUserId = useOfflineQueueStore.getState().activeUserId;
-        if (
-          latestActiveUserId &&
-          event.key === getOfflineQueueStorageKey(latestActiveUserId)
-        ) {
-          useOfflineQueueStore.setState({
-            queue: readUserQueueFromStorage(latestActiveUserId),
-          });
-        }
+
+      if (event.key === null) {
+        // Storage was cleared globally: ensure auth context & queue state are reconciled,
+        // never leaving activeUserId stale or hydrating another user's items.
+        store.setState({ queue: [], isSyncing: false, legacyDiscardedCount: 0 });
+        store.getState().syncAuthContext();
+        return;
       }
-    });
+
+      const activeUserId = store.getState().activeUserId;
+      const isAuthOrLegacyKey =
+        event.key === AUTH_STORAGE_KEY || event.key === LEGACY_OFFLINE_QUEUE_STORAGE_KEY;
+      const isCurrentUserQueueKey =
+        Boolean(activeUserId) && event.key === getOfflineQueueStorageKey(activeUserId!);
+
+      if (!isAuthOrLegacyKey && !isCurrentUserQueueKey) {
+        return;
+      }
+
+      store.getState().syncAuthContext();
+      const latestActiveUserId = store.getState().activeUserId;
+      if (
+        latestActiveUserId &&
+        event.key === getOfflineQueueStorageKey(latestActiveUserId)
+      ) {
+        void store.getState().refreshUserQueueFromStorage(latestActiveUserId);
+      }
+    };
+    window.addEventListener('storage', storageListener);
   }
+
+  return store;
 }
 
-initOfflineQueueAuthIsolation();
+export const useOfflineQueueStore = createOfflineQueueStore();

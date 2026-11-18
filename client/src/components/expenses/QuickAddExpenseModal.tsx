@@ -207,7 +207,7 @@ export function QuickAddExpenseModal({
         if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
           return;
         }
-        const queued = enqueueExpense({
+        const queued = await enqueueExpense({
           userId: startSession.userId,
           clientMutationId,
           tripId: requestTripId,
@@ -247,7 +247,7 @@ export function QuickAddExpenseModal({
         }
         // If network dropped mid-flight, queue offline automatically
         if (err instanceof TypeError) {
-          const queued = enqueueExpense({
+          const queued = await enqueueExpense({
             userId: startSession.userId,
             clientMutationId,
             tripId: requestTripId,

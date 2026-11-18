@@ -47,7 +47,7 @@ describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
     expect(formatPaisaToNPR(paisa)).toBe('NPR 1,500.50');
   });
 
-  it('enqueues offline expenses strictly for the active authenticated user, enforces deduplication, and rejects unauthenticated or mismatched callers', () => {
+  it('enqueues offline expenses strictly for the active authenticated user, enforces deduplication, and rejects unauthenticated or mismatched callers', async () => {
     const sampleExpense = {
       userId: 'u1',
       clientMutationId: 'uuid-offline-test-1',
@@ -68,7 +68,7 @@ describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
     };
 
     // Unauthenticated enqueue is rejected
-    expect(useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(false);
+    expect(await useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(false);
     expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
 
     // Authenticate u1
@@ -87,22 +87,22 @@ describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
 
     // Mismatched userId is rejected even while u1 is signed in
     expect(
-      useOfflineQueueStore.getState().enqueueExpense({
+      await useOfflineQueueStore.getState().enqueueExpense({
         ...sampleExpense,
         userId: 'u2',
         clientMutationId: 'uuid-mismatched-1',
       })
     ).toBe(false);
 
-    expect(useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(true);
-    expect(useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(true); // duplicate call deduplicated
+    expect(await useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(true);
+    expect(await useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(true); // duplicate call deduplicated
 
     const queue = useOfflineQueueStore.getState().queue;
     expect(queue).toHaveLength(1);
     expect(queue[0].userId).toBe('u1');
     expect(queue[0].syncStatus).toBe('PENDING');
 
-    useOfflineQueueStore.getState().removeQueuedExpense('uuid-offline-test-1');
+    await useOfflineQueueStore.getState().removeQueuedExpense('uuid-offline-test-1');
     expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
   });
 });
