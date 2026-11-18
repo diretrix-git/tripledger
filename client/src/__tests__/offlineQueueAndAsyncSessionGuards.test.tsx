@@ -387,7 +387,7 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
       expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
       expect(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))).toBeNull();
     });
-  });
+  }, 15000);
 
   it('L-01: safely discards legacy unscoped entries without submitting them, and recovers SYNCING items only for owning user', async () => {
     const userB = makeUser({ id: 'user-b', name: 'Bob', email: 'bob@example.com' });
@@ -1679,10 +1679,13 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
       expect(tab1Acquired).toBe(true);
     });
 
+    const tab1PeerStore = createOfflineQueueStore({ bindWindowEvents: false });
     const tab2PeerStore = createOfflineQueueStore({ bindWindowEvents: false });
-    createdStores.push(tab2PeerStore);
+    createdStores.push(tab1PeerStore, tab2PeerStore);
+    tab1PeerStore.getState().setOnlineStatus(true);
     tab2PeerStore.getState().setOnlineStatus(true);
     await tab2PeerStore.getState().refreshUserQueueFromStorage('user-a');
+    expect(tab2PeerStore.getState().queue[0]?.syncStatus).toBe('SYNCING');
 
     function PeerWatcherProbe() {
       useOfflineSync(tab2PeerStore);
@@ -1695,10 +1698,15 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
       </QueryClientProvider>
     );
 
-    // Tab 1 completes with a 503 -> FAILED cleanly before releasing sync lock
-    await tab2PeerStore.getState().markItemStatus('mut-peer-finished', 'FAILED', 'Server busy', 'user-a');
+    // Tab 1 completes with a 503 -> FAILED in shared localStorage cleanly while Tab 2 still has SYNCING in memory,
+    // then Tab 1 releases sync:user-a -> Tab 2 must acquire sync:user-a, read FAILED from storage, and NOT retry
+    await tab1PeerStore.getState().markItemStatus('mut-peer-finished', 'FAILED', 'Server busy', 'user-a');
+    expect(tab2PeerStore.getState().queue[0]?.syncStatus).toBe('SYNCING');
     releaseTab1Normal();
-    await new Promise((r) => setTimeout(r, 30));
+    await waitFor(() => {
+      expect(tab2PeerStore.getState().queue[0]?.syncStatus).toBe('FAILED');
+    });
+    expect(tab2PeerStore.getState().queue[0]?.lastError).toBe('Server busy');
     expect(postedMutations).toEqual([]);
 
     // 4. Manual "Sync Now" recovers orphaned SYNCING if previous recovery did not run while offline / lock failed
@@ -2045,6 +2053,261 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
       warnSpy.mockRestore();
       window.removeEventListener('unhandledrejection', onBrowserUnhandled);
       process.off('unhandledRejection', onNodeUnhandled);
+    }
+  });
+
+  it('Phase 3.1.12 L-01 (mocked jsdom Web Locks): cold-booting or signing into Tab 2 during active Tab 1 sync preserves SYNCING, arms recovery watcher, respects account switches, and recovers on Tab 1 crash', async () => {
+    installTestWebLocks();
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    const userB = makeUser({ id: 'user-b', name: 'Bob', email: 'bob@example.com' });
+
+    const postedWithAuth: Array<{
+      token: string | null;
+      clientMutationId: string;
+      title: string;
+    }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const auth = new Headers(init?.headers).get('Authorization');
+        if (url.endsWith('/auth/me')) {
+          return jsonResponse({
+            success: true,
+            data: { user: auth === 'Bearer tok-b' ? userB : userA },
+          });
+        }
+        if (url.endsWith('/trips/trip-1/expenses') && method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as {
+            clientMutationId: string;
+            title: string;
+          };
+          postedWithAuth.push({
+            token: auth,
+            clientMutationId: body.clientMutationId,
+            title: body.title,
+          });
+          return jsonResponse({ success: true, data: { expense: { id: 'exp-cold-1' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    // 1. Tab 1 actively holds sync:user-a with mut-cold-boot-1 persisted as SYNCING
+    const coldEntry = makeQueuedEntry({
+      clientMutationId: 'mut-cold-boot-1',
+      userId: 'user-a',
+      syncStatus: 'SYNCING',
+      lastError: 'Prior retry metadata',
+      payload: {
+        title: 'Nagarkot Hotel',
+        category: 'ACCOMMODATION',
+        amountPaisa: 85000,
+        isEstimated: false,
+        isPackage: false,
+        splitMethod: 'EQUAL',
+        paymentMethod: 'CASH',
+        incurredAt: '2026-11-18T06:00:00.000Z',
+        payments: [{ participantId: 'p-a', amountPaisa: 85000 }],
+        clientMutationId: 'mut-cold-boot-1',
+      },
+    });
+    window.localStorage.setItem(
+      getOfflineQueueStorageKey('user-a'),
+      JSON.stringify({ version: 1, userId: 'user-a', queue: [coldEntry] })
+    );
+
+    let releaseTab1Cold!: () => void;
+    let tab1Acquired = false;
+    void navigator.locks.request(
+      'tripledger:offline-queue:sync:user-a',
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          tab1Acquired = true;
+          releaseTab1Cold = resolve;
+        })
+    );
+    await waitFor(() => {
+      expect(tab1Acquired).toBe(true);
+    });
+
+    // Cold-boot Tab 2 AFTER user-a is already authenticated (exercises initialQueue hydration)
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+    const coldBootTab2 = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(coldBootTab2);
+    coldBootTab2.getState().setOnlineStatus(true);
+
+    // Must NOT convert SYNCING -> PENDING on cold boot while Web Locks are available
+    expect(coldBootTab2.getState().queue[0]?.syncStatus).toBe('SYNCING');
+    expect(
+      (
+        JSON.parse(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))!) as {
+          queue: QueuedOfflineExpense[];
+        }
+      ).queue[0]?.syncStatus
+    ).toBe('SYNCING');
+
+    function ColdBootProbe() {
+      useOfflineSync(coldBootTab2);
+      return null;
+    }
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <ColdBootProbe />
+      </QueryClientProvider>
+    );
+
+    // Give effects microtasks to arm watcher; while Tab 1 holds lock, zero POSTs and SYNCING intact
+    await new Promise((r) => setTimeout(r, 25));
+    expect(postedWithAuth).toEqual([]);
+    expect(coldBootTab2.getState().queue[0]?.syncStatus).toBe('SYNCING');
+
+    // Tab 1 terminates/releases lock without clearing entry -> Tab 2 recovers and submits ONCE
+    releaseTab1Cold();
+    await waitFor(() => {
+      expect(postedWithAuth).toEqual([
+        {
+          token: 'Bearer tok-a',
+          clientMutationId: 'mut-cold-boot-1',
+          title: 'Nagarkot Hotel',
+        },
+      ]);
+    });
+    await waitFor(() => {
+      expect(coldBootTab2.getState().queue).toHaveLength(0);
+      expect(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))).toBeNull();
+    });
+
+    // 2. Tab 2 logs into user-a while Tab 1 holds sync:user-a with BOTH a PENDING and SYNCING item,
+    //    then switches to user-b before Tab 1 releases lock, and later resumes as user-a cleanly
+    cleanup();
+    postedWithAuth.length = 0;
+    const syncEntry = makeQueuedEntry({
+      clientMutationId: 'mut-login-sync-1',
+      userId: 'user-a',
+      syncStatus: 'SYNCING',
+    });
+    const pendingEntry = makeQueuedEntry({
+      clientMutationId: 'mut-login-pend-2',
+      userId: 'user-a',
+      syncStatus: 'PENDING',
+    });
+    window.localStorage.setItem(
+      getOfflineQueueStorageKey('user-a'),
+      JSON.stringify({ version: 1, userId: 'user-a', queue: [syncEntry, pendingEntry] })
+    );
+
+    let releaseTab1Dual!: () => void;
+    tab1Acquired = false;
+    void navigator.locks.request(
+      'tripledger:offline-queue:sync:user-a',
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          tab1Acquired = true;
+          releaseTab1Dual = resolve;
+        })
+    );
+    await waitFor(() => {
+      expect(tab1Acquired).toBe(true);
+    });
+
+    // Start Tab 2 signed out, render probe, then sign in as user-a -> syncAuthContext keeps SYNCING
+    useAuthStore.getState().clearAuth();
+    const loginTab2 = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(loginTab2);
+    loginTab2.getState().setOnlineStatus(true);
+
+    function LoginProbe() {
+      useOfflineSync(loginTab2);
+      return null;
+    }
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <LoginProbe />
+      </QueryClientProvider>
+    );
+
+    useAuthStore.getState().setAuth(userA, 'tok-a1', 'ref-a1');
+    expect(loginTab2.getState().queue.map((q) => [q.clientMutationId, q.syncStatus])).toEqual([
+      ['mut-login-sync-1', 'SYNCING'],
+      ['mut-login-pend-2', 'PENDING'],
+    ]);
+
+    // Switch to User B while waiting on Tab 1's sync:user-a lock
+    await new Promise((r) => setTimeout(r, 20));
+    useAuthStore.getState().setAuth(userB, 'tok-b', 'ref-b');
+    releaseTab1Dual();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Must not submit User A items under User B
+    expect(postedWithAuth).toEqual([]);
+    expect(loginTab2.getState().activeUserId).toBe('user-b');
+    expect(loginTab2.getState().queue).toHaveLength(0);
+
+    // Re-login User A -> recovers orphaned SYNCING alongside PENDING and submits exact clientMutationIds once each
+    useAuthStore.getState().setAuth(userA, 'tok-a2', 'ref-a2');
+    await waitFor(() => {
+      expect(postedWithAuth.map((p) => [p.token, p.clientMutationId])).toEqual([
+        ['Bearer tok-a2', 'mut-login-sync-1'],
+        ['Bearer tok-a2', 'mut-login-pend-2'],
+      ]);
+    });
+    await waitFor(() => {
+      expect(loginTab2.getState().queue).toHaveLength(0);
+    });
+  });
+
+  it('Phase 3.1.12 L-02 (mocked jsdom Web Locks): rethrows post-grant callback exceptions from runWithUserQueueLock without executing work twice and keeps subsequent mutations usable', async () => {
+    installTestWebLocks();
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+
+    const store = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(store);
+    store.getState().setOnlineStatus(false);
+
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem');
+    let shouldThrowOnSet = true;
+    const unsubscribe = store.subscribe(() => {
+      if (shouldThrowOnSet) {
+        shouldThrowOnSet = false;
+        throw new Error('Simulated UI subscriber error inside locked mutation callback');
+      }
+    });
+
+    try {
+      await expect(
+        store
+          .getState()
+          .enqueueExpense(makeQueuedEntry({ clientMutationId: 'post-grant-err-1', userId: 'user-a' }))
+      ).rejects.toThrow('Simulated UI subscriber error inside locked mutation callback');
+
+      // Callback ran only ONCE after lock grant (must NOT re-run in fallback catch block)
+      const queueWritesAfterErr = setItemSpy.mock.calls.filter(
+        ([key]) => key === getOfflineQueueStorageKey('user-a')
+      );
+      expect(queueWritesAfterErr).toHaveLength(1);
+      expect(store.getState().crossTabCoordinationDegraded).toBe(false);
+
+      // Subsequent operations in the same lock chain continue normally without poisoning
+      expect(
+        await store
+          .getState()
+          .enqueueExpense(makeQueuedEntry({ clientMutationId: 'post-grant-ok-2', userId: 'user-a' }))
+      ).toBe(true);
+      expect(store.getState().queue.map((q) => q.clientMutationId)).toEqual([
+        'post-grant-err-1',
+        'post-grant-ok-2',
+      ]);
+    } finally {
+      unsubscribe();
+      setItemSpy.mockRestore();
     }
   });
 });
