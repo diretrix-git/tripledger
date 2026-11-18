@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -46,7 +46,7 @@ import {
   type TripRole,
   type TripSummaryEntity,
 } from '@tripledger/shared';
-import { apiRequest } from '../api/client.js';
+import { ApiClientError, apiRequest } from '../api/client.js';
 import { QuickAddExpenseModal } from '../components/expenses/QuickAddExpenseModal.js';
 import {
   exportTripReportToExcel,
@@ -86,6 +86,15 @@ export function TripDetailPage(): React.ReactElement {
   const queryClient = useQueryClient();
   const currentUser = useAuthStore((s) => s.user);
   const accessToken = useAuthStore((s) => s.accessToken);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
+  const tripEpochRef = useRef(0);
+  const lastTripIdRef = useRef(tripId);
+  if (lastTripIdRef.current !== tripId) {
+    lastTripIdRef.current = tripId;
+    tripEpochRef.current += 1;
+  }
+  const activeContextRef = useRef({ tripId, sessionGeneration });
+  activeContextRef.current = { tripId, sessionGeneration };
   const allOfflineQueue = useOfflineQueueStore((s) => s.queue);
   const offlineQueue = useMemo(
     () => allOfflineQueue.filter((q) => q.tripId === tripId),
@@ -146,6 +155,7 @@ export function TripDetailPage(): React.ReactElement {
     setInviteParticipantId('');
     setInviteRole('ORGANIZER');
     setInviteEmail('');
+    setIssuingInvite(false);
     setIssuedInviteSecret(null);
     setNewFamilyName('');
     setNewFamilyRepId('');
@@ -216,27 +226,90 @@ export function TripDetailPage(): React.ReactElement {
     setTimeout(() => setCopiedBanner(null), 2500);
   };
 
-  const handleAddParticipant = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const runScopedTripMutation = async <T,>(opts: {
+    action: () => Promise<T>;
+    onSuccess?: (result: T) => void;
+    invalidateKeys?: readonly unknown[][];
+    fallbackErrorMessage: string;
+    onError?: (err: unknown) => string;
+    onFinallySameContext?: () => void;
+  }) => {
+    const startTripId = tripId;
+    const startEpoch = tripEpochRef.current;
+    const startGeneration = useAuthStore.getState().sessionGeneration;
+    const isSameContext = () => {
+      const current = activeContextRef.current;
+      return (
+        current.tripId === startTripId &&
+        tripEpochRef.current === startEpoch &&
+        current.sessionGeneration === startGeneration &&
+        useAuthStore.getState().sessionGeneration === startGeneration
+      );
+    };
+
     setActionError(null);
     try {
-      await apiRequest(`/trips/${trip.id}/participants`, {
-        method: 'POST',
-        body: JSON.stringify({
-          name: newParticipantName,
-          email: newParticipantEmail || undefined,
-          role: 'PARTICIPANT',
-          memberType: newParticipantType,
-          familyId: newParticipantFamilyId || null,
-          defaultWeight: Number.parseFloat(newParticipantWeight) || 1,
-        }),
-      });
-      setNewParticipantName('');
-      setNewParticipantEmail('');
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
+      const result = await opts.action();
+      if (isSameContext()) {
+        opts.onSuccess?.(result);
+      }
+      if (
+        opts.invalidateKeys &&
+        useAuthStore.getState().sessionGeneration === startGeneration
+      ) {
+        await Promise.all(
+          opts.invalidateKeys.map((queryKey) => queryClient.invalidateQueries({ queryKey }))
+        );
+      }
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to add participant');
+      if (isSameContext()) {
+        const message = opts.onError
+          ? opts.onError(err)
+          : err instanceof Error
+            ? err.message
+            : opts.fallbackErrorMessage;
+        setActionError(message);
+      }
+      if (
+        err instanceof ApiClientError &&
+        err.code === 'EMAIL_DELIVERY_FAILED' &&
+        opts.invalidateKeys &&
+        useAuthStore.getState().sessionGeneration === startGeneration
+      ) {
+        await Promise.all(
+          opts.invalidateKeys.map((queryKey) => queryClient.invalidateQueries({ queryKey }))
+        );
+      }
+    } finally {
+      if (isSameContext()) {
+        opts.onFinallySameContext?.();
+      }
     }
+  };
+
+  const handleAddParticipant = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/participants`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: newParticipantName,
+            email: newParticipantEmail || undefined,
+            role: 'PARTICIPANT',
+            memberType: newParticipantType,
+            familyId: newParticipantFamilyId || null,
+            defaultWeight: Number.parseFloat(newParticipantWeight) || 1,
+          }),
+        }),
+      onSuccess: () => {
+        setNewParticipantName('');
+        setNewParticipantEmail('');
+      },
+      invalidateKeys: [['trip', requestTripId]],
+      fallbackErrorMessage: 'Failed to add participant',
+    });
   };
 
   const handleIssueParticipantInvite = async (e: React.FormEvent) => {
@@ -250,65 +323,77 @@ export function TripDetailPage(): React.ReactElement {
       return;
     }
 
-    setActionError(null);
+    const requestTripId = trip.id;
+    const participantNames = new Map(participantNameMap);
     setIssuingInvite(true);
-    try {
-      const res = await apiRequest<CreateParticipantInviteResponse>(
-        `/trips/${trip.id}/participants/${inviteParticipantId}/invites`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            grantedRole: inviteRole,
-            intendedEmail: inviteEmail.trim() || undefined,
-            expiresInHours: inviteTtlHours,
-          }),
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest<CreateParticipantInviteResponse>(
+          `/trips/${requestTripId}/participants/${inviteParticipantId}/invites`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              grantedRole: inviteRole,
+              intendedEmail: inviteEmail.trim() || undefined,
+              expiresInHours: inviteTtlHours,
+            }),
+          }
+        ),
+      onSuccess: (res) => {
+        setIssuedInviteSecret({
+          participantName: participantNames.get(res.invite.participantId) ?? 'Participant',
+          grantedRole: res.invite.grantedRole,
+          intendedEmail: res.invite.intendedEmail,
+          claimUrl: res.claimUrl,
+          rawToken: res.rawToken,
+          emailSent: Boolean(res.emailDelivery?.sent),
+        });
+        setInviteEmail('');
+      },
+      invalidateKeys: [['trip-invites', requestTripId]],
+      fallbackErrorMessage: 'Failed to issue invitation',
+      onError: (err) => {
+        if (err instanceof ApiClientError && err.code === 'EMAIL_DELIVERY_FAILED') {
+          return `Email delivery failed (${err.message}). This invitation and any prior pending invitation for this participant are now revoked; issue a new invitation to retry.`;
         }
-      );
-      setIssuedInviteSecret({
-        participantName: participantNameMap.get(res.invite.participantId) ?? 'Participant',
-        grantedRole: res.invite.grantedRole,
-        intendedEmail: res.invite.intendedEmail,
-        claimUrl: res.claimUrl,
-        rawToken: res.rawToken,
-        emailSent: Boolean(res.emailDelivery?.sent),
-      });
-      setInviteEmail('');
-      await queryClient.invalidateQueries({ queryKey: ['trip-invites', trip.id] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to issue invitation');
-    } finally {
-      setIssuingInvite(false);
-    }
+        return err instanceof Error ? err.message : 'Failed to issue invitation';
+      },
+      onFinallySameContext: () => {
+        setIssuingInvite(false);
+      },
+    });
   };
 
   const handleRevokeInvite = async (inviteId: string) => {
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/invites/${inviteId}/revoke`, { method: 'POST' });
-      await queryClient.invalidateQueries({ queryKey: ['trip-invites', trip.id] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to revoke invitation');
-    }
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/invites/${inviteId}/revoke`, { method: 'POST' }),
+      invalidateKeys: [['trip-invites', requestTripId]],
+      fallbackErrorMessage: 'Failed to revoke invitation',
+    });
   };
 
   const handleAddFamily = async (e: React.FormEvent) => {
     e.preventDefault();
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/families`, {
-        method: 'POST',
-        body: JSON.stringify({
-          name: newFamilyName,
-          representativeId: newFamilyRepId || null,
-          defaultWeight: 1,
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/families`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: newFamilyName,
+            representativeId: newFamilyRepId || null,
+            defaultWeight: 1,
+          }),
         }),
-      });
-      setNewFamilyName('');
-      setNewFamilyRepId('');
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to create family group');
-    }
+      onSuccess: () => {
+        setNewFamilyName('');
+        setNewFamilyRepId('');
+      },
+      invalidateKeys: [['trip', requestTripId]],
+      fallbackErrorMessage: 'Failed to create family group',
+    });
   };
 
   const handleApproveExpense = async (
@@ -316,28 +401,28 @@ export function TripDetailPage(): React.ReactElement {
     approvalStatus: 'APPROVED' | 'REJECTED',
     actualAmountPaisa?: number
   ) => {
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/expenses/${expenseId}/approve`, {
-        method: 'POST',
-        body: JSON.stringify({ approvalStatus, actualAmountPaisa }),
-      });
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update expense status');
-    }
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/expenses/${expenseId}/approve`, {
+          method: 'POST',
+          body: JSON.stringify({ approvalStatus, actualAmountPaisa }),
+        }),
+      invalidateKeys: [['trip', requestTripId]],
+      fallbackErrorMessage: 'Failed to update expense status',
+    });
   };
 
   const handleDeleteExpense = async (expenseId: string) => {
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/expenses/${expenseId}`, {
-        method: 'DELETE',
-      });
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to remove expense');
-    }
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/expenses/${expenseId}`, {
+          method: 'DELETE',
+        }),
+      invalidateKeys: [['trip', requestTripId]],
+      fallbackErrorMessage: 'Failed to remove expense',
+    });
   };
 
   const handleRecordSettlement = async (e: React.FormEvent) => {
@@ -345,28 +430,31 @@ export function TripDetailPage(): React.ReactElement {
     if (trip.status === 'CLOSED') {
       return;
     }
-    setActionError(null);
-    try {
-      const amountPaisa = nprToPaisa(settleAmountNpr);
-      await apiRequest(`/trips/${trip.id}/settlements`, {
-        method: 'POST',
-        body: JSON.stringify({
-          settlementMode: trip.mode === 'FAMILY' ? settlementViewMode : 'INDIVIDUAL',
-          fromParticipantId: settleFromId,
-          toParticipantId: settleToId,
-          amountPaisa,
-          paymentMethod: settleMethod,
-          status: isOrganizer ? 'CONFIRMED' : 'REPORTED',
-          referenceNote: settleNote || undefined,
-        }),
-      });
-      setSettleAmountNpr('');
-      setSettleNote('');
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to record settlement');
-    }
+    const requestTripId = trip.id;
+    const settlementMode = trip.mode === 'FAMILY' ? settlementViewMode : 'INDIVIDUAL';
+    await runScopedTripMutation({
+      action: async () => {
+        const amountPaisa = nprToPaisa(settleAmountNpr);
+        return apiRequest(`/trips/${requestTripId}/settlements`, {
+          method: 'POST',
+          body: JSON.stringify({
+            settlementMode,
+            fromParticipantId: settleFromId,
+            toParticipantId: settleToId,
+            amountPaisa,
+            paymentMethod: settleMethod,
+            status: isOrganizer ? 'CONFIRMED' : 'REPORTED',
+            referenceNote: settleNote || undefined,
+          }),
+        });
+      },
+      onSuccess: () => {
+        setSettleAmountNpr('');
+        setSettleNote('');
+      },
+      invalidateKeys: [['trip', requestTripId], ['dashboard']],
+      fallbackErrorMessage: 'Failed to record settlement',
+    });
   };
 
   const handlePrefillSuggestion = (s: SettlementSuggestion) => {
@@ -384,17 +472,16 @@ export function TripDetailPage(): React.ReactElement {
     settlementId: string,
     status: 'CONFIRMED' | 'REJECTED'
   ) => {
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/settlements/${settlementId}/status`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status }),
-      });
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update settlement');
-    }
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/settlements/${settlementId}/status`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status }),
+        }),
+      invalidateKeys: [['trip', requestTripId], ['dashboard']],
+      fallbackErrorMessage: 'Failed to update settlement',
+    });
   };
 
   const handleChecklistToggle = async (
@@ -402,35 +489,34 @@ export function TripDetailPage(): React.ReactElement {
     field: 'checked' | 'notApplicable',
     value: boolean
   ) => {
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/checklist`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          category,
-          [field]: value,
-          ...(field === 'checked' && value ? { notApplicable: false } : {}),
-          ...(field === 'notApplicable' && value ? { checked: false } : {}),
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/checklist`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            category,
+            [field]: value,
+            ...(field === 'checked' && value ? { notApplicable: false } : {}),
+            ...(field === 'notApplicable' && value ? { checked: false } : {}),
+          }),
         }),
-      });
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to update checklist');
-    }
+      invalidateKeys: [['trip', requestTripId]],
+      fallbackErrorMessage: 'Failed to update checklist',
+    });
   };
 
   const handleCloseTrip = async () => {
-    setActionError(null);
-    try {
-      await apiRequest(`/trips/${trip.id}/close`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      });
-      await queryClient.invalidateQueries({ queryKey: ['trip', trip.id] });
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Cannot close trip yet');
-    }
+    const requestTripId = trip.id;
+    await runScopedTripMutation({
+      action: () =>
+        apiRequest(`/trips/${requestTripId}/close`, {
+          method: 'POST',
+          body: JSON.stringify({}),
+        }),
+      invalidateKeys: [['trip', requestTripId], ['dashboard']],
+      fallbackErrorMessage: 'Cannot close trip yet',
+    });
   };
 
   const myBalance = ledger.individualBalances.find(

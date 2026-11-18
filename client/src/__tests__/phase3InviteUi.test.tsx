@@ -1272,4 +1272,262 @@ describe('Phase 3 UI: Guest PARTICIPANT restriction, organizer-only invite manag
     ).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue('Select Sender')).not.toBeInTheDocument();
   });
+
+  it('guards in-flight UI mutations against trip switches and session changes, and surfaces clear revocation messaging on 503 EMAIL_DELIVERY_FAILED', async () => {
+    useAuthStore
+      .getState()
+      .setAuth(makeUser({ id: 'user-1', name: 'Aarav Sharma', email: 'aarav@example.com' }), 'tok-org', 'ref-org');
+
+    const payloadA = {
+      ...makeBaseTripPayload('ORGANIZER'),
+      trip: { ...makeBaseTripPayload('ORGANIZER').trip, id: 'trip-a', name: 'Trip Alpha' },
+    };
+    const payloadB = {
+      ...makeBaseTripPayload('ORGANIZER'),
+      trip: { ...makeBaseTripPayload('ORGANIZER').trip, id: 'trip-b', name: 'Trip Beta' },
+    };
+
+    let resolveInviteA!: (res: Response) => void;
+    let resolveSettleA!: (res: Response) => void;
+    let rejectSettleASession!: (err: Error) => void;
+    let settleCallCount = 0;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+
+        if (url.endsWith('/trips/trip-a') && method === 'GET') {
+          return jsonResponse({ success: true, data: payloadA });
+        }
+        if (url.endsWith('/trips/trip-b') && method === 'GET') {
+          return jsonResponse({ success: true, data: payloadB });
+        }
+        if (url.endsWith('/trips/trip-a/invites') && method === 'GET') {
+          return jsonResponse({ success: true, data: { invites: [] } });
+        }
+        if (url.endsWith('/trips/trip-b/invites') && method === 'GET') {
+          return jsonResponse({ success: true, data: { invites: [] } });
+        }
+        if (url.endsWith('/trips/trip-a/participants/p-mem/invites') && method === 'POST') {
+          return new Promise<Response>((resolve) => {
+            resolveInviteA = resolve;
+          });
+        }
+        if (url.endsWith('/trips/trip-a/settlements') && method === 'POST') {
+          settleCallCount += 1;
+          if (settleCallCount === 1) {
+            return new Promise<Response>((resolve) => {
+              resolveSettleA = resolve;
+            });
+          }
+          return new Promise<Response>((_resolve, reject) => {
+            rejectSettleASession = reject;
+          });
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/trips/trip-a']}>
+          <Link to="/trips/trip-b">Go Trip B</Link>
+          <Link to="/trips/trip-a">Go Trip A</Link>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/Trip Alpha/i)).toBeInTheDocument();
+    });
+
+    // 1. Trigger invite issuance on trip-a, navigate to trip-b before response resolves
+    fireEvent.click(screen.getByRole('button', { name: /Participants/i }));
+    fireEvent.change(screen.getByLabelText('Target Participant'), { target: { value: 'p-mem' } });
+    fireEvent.change(screen.getByPlaceholderText(/Verified Email Required/i), {
+      target: { value: 'bina@example.com' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Issue Role Invitation/i }));
+
+    fireEvent.click(screen.getByRole('link', { name: 'Go Trip B' }));
+    await waitFor(() => {
+      expect(screen.getByText(/Trip Beta/i)).toBeInTheDocument();
+    });
+
+    // Open Participants tab on trip-b and ensure issuing button is reset and not disabled
+    fireEvent.click(screen.getByRole('button', { name: /Participants/i }));
+    expect(screen.getByRole('button', { name: /Issue Role Invitation/i })).not.toBeDisabled();
+
+    // Late invite response from trip-a arrives: MUST NOT render secret/claimUrl on trip-b
+    resolveInviteA(
+      jsonResponse(
+        {
+          success: true,
+          data: {
+            invite: {
+              id: 'inv-a-late',
+              tripId: 'trip-a',
+              participantId: 'p-mem',
+              intendedEmail: 'bina@example.com',
+              grantedRole: 'ORGANIZER',
+              requireVerifiedEmail: true,
+              expiresAt: '2026-12-01T00:00:00.000Z',
+              usedAt: null,
+              revokedAt: null,
+              createdAt: '2026-11-18T00:00:00.000Z',
+            },
+            rawToken: 'LEAK-SECRET-TOKEN-A',
+            claimUrl: 'http://localhost:5173/invites/claim?token=LEAK-SECRET-TOKEN-A',
+            emailDelivery: { sent: true, provider: 'MEMORY' },
+          },
+        },
+        201
+      )
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText(/Issued ORGANIZER invitation/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Copy Invite Link/i })).not.toBeInTheDocument();
+
+    // 2. Submit settlement on trip-a, switch to trip-b and type new values before trip-a resolves
+    fireEvent.click(screen.getByRole('link', { name: 'Go Trip A' }));
+    await waitFor(() => {
+      expect(screen.getByText(/Trip Alpha/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    fireEvent.change(screen.getByDisplayValue('Select Sender'), { target: { value: 'p-mem' } });
+    fireEvent.change(screen.getByDisplayValue('Select Receiver'), { target: { value: 'p-org' } });
+    fireEvent.change(screen.getByPlaceholderText(/1500/i), { target: { value: '500' } });
+    fireEvent.change(screen.getByPlaceholderText(/eSewa TXN/i), { target: { value: 'Note A' } });
+    fireEvent.click(screen.getByRole('button', { name: /Record & Confirm Settlement/i }));
+
+    fireEvent.click(screen.getByRole('link', { name: 'Go Trip B' }));
+    await waitFor(() => {
+      expect(screen.getByText(/Trip Beta/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    const tripBAmount = screen.getByPlaceholderText(/1500/i) as HTMLInputElement;
+    const tripBNote = screen.getByPlaceholderText(/eSewa TXN/i) as HTMLInputElement;
+    fireEvent.change(tripBAmount, { target: { value: '750' } });
+    fireEvent.change(tripBNote, { target: { value: 'Trip B Draft' } });
+
+    resolveSettleA(jsonResponse({ success: true, data: { settlement: { id: 's-late-a' } } }, 201));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(tripBAmount.value).toBe('750');
+    expect(tripBNote.value).toBe('Trip B Draft');
+
+    // 3. Submit settlement on trip-a, switch user/logout while request is in flight -> error must not mutate UI or invalidate new session
+    fireEvent.click(screen.getByRole('link', { name: 'Go Trip A' }));
+    await waitFor(() => {
+      expect(screen.getByText(/Trip Alpha/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Settlements \(/i }));
+    fireEvent.change(screen.getByDisplayValue('Select Sender'), { target: { value: 'p-mem' } });
+    fireEvent.change(screen.getByDisplayValue('Select Receiver'), { target: { value: 'p-org' } });
+    fireEvent.change(screen.getByPlaceholderText(/1500/i), { target: { value: '300' } });
+    fireEvent.click(screen.getByRole('button', { name: /Record & Confirm Settlement/i }));
+
+    invalidateSpy.mockClear();
+    useAuthStore.getState().setAuth(
+      makeUser({ id: 'user-other', name: 'Other User', email: 'other@example.com' }),
+      'tok-other',
+      'ref-other'
+    );
+    rejectSettleASession(new Error('Stale settlement failure after account switch'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText(/Stale settlement failure after account switch/i)).not.toBeInTheDocument();
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    // 4. L-02 UI behavior: 503 EMAIL_DELIVERY_FAILED clearly explains prior + new invite revocation & refreshes invite history
+    cleanup();
+    useAuthStore
+      .getState()
+      .setAuth(makeUser({ id: 'user-1', name: 'Aarav Sharma', email: 'aarav@example.com' }), 'tok-org', 'ref-org');
+    let emailFailInvites = [
+      {
+        id: 'inv-prior',
+        tripId: 'trip-mail-fail',
+        participantId: 'p-mem',
+        intendedEmail: 'bina@example.com',
+        grantedRole: 'PARTICIPANT',
+        requireVerifiedEmail: true,
+        expiresAt: '2026-12-01T00:00:00.000Z',
+        usedAt: null,
+        revokedAt: null,
+        createdAt: '2026-11-18T00:00:00.000Z',
+      },
+    ];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.endsWith('/trips/trip-mail-fail') && method === 'GET') {
+          return jsonResponse({
+            success: true,
+            data: {
+              ...makeBaseTripPayload('ORGANIZER'),
+              trip: { ...makeBaseTripPayload('ORGANIZER').trip, id: 'trip-mail-fail', name: 'Mail Outage Trip' },
+            },
+          });
+        }
+        if (url.endsWith('/trips/trip-mail-fail/invites') && method === 'GET') {
+          return jsonResponse({ success: true, data: { invites: emailFailInvites } });
+        }
+        if (url.endsWith('/trips/trip-mail-fail/participants/p-mem/invites') && method === 'POST') {
+          emailFailInvites = [
+            { ...emailFailInvites[0]!, revokedAt: '2026-11-18T01:00:00.000Z' as unknown as null },
+          ];
+          return jsonResponse(
+            {
+              success: false,
+              error: {
+                code: 'EMAIL_DELIVERY_FAILED',
+                message: 'Unable to deliver invitation email at this time. Please try again later.',
+              },
+            },
+            503
+          );
+        }
+        throw new Error(`Unexpected mail-fail fetch: ${method} ${url}`);
+      })
+    );
+    const qcMail = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qcMail}>
+        <MemoryRouter initialEntries={['/trips/trip-mail-fail']}>
+          <Routes>
+            <Route path="/trips/:tripId" element={<TripDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Mail Outage Trip/i)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Participants/i }));
+    await waitFor(() => {
+      expect(screen.getByText('Pending')).toBeInTheDocument();
+    });
+    fireEvent.change(screen.getByLabelText('Target Participant'), { target: { value: 'p-mem' } });
+    fireEvent.change(screen.getByPlaceholderText(/Verified Email Required/i), {
+      target: { value: 'bina@example.com' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Issue Role Invitation/i }));
+    await waitFor(() => {
+      expect(
+        screen.getByText(/prior pending invitation for this participant are now revoked/i)
+      ).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.queryByText('Pending')).not.toBeInTheDocument();
+      expect(screen.getByText('Revoked')).toBeInTheDocument();
+    });
+  });
 });
