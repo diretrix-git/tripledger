@@ -196,6 +196,8 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
       activeUserId: null,
       queue: [],
       legacyDiscardedCount: 0,
+      crossTabCoordinationDegraded: false,
+      syncError: null,
     });
   });
 
@@ -1526,5 +1528,523 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
     await waitFor(() => {
       expect(screen.getByTestId('current-path').textContent).toBe('/trips/trip-b-valid');
     });
+  });
+
+  it('Phase 3.1.10 L-01 (mocked jsdom Web Locks): protects active peer SYNCING entries while sync lock is held, then recovers orphaned SYNCING automatically and via manual Sync Now with stable clientMutationId', async () => {
+    installTestWebLocks();
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+
+    // Note: installTestWebLocks + two stores in one jsdom runtime simulate Web Locks lock-queue
+    // contention cleanly without multi-process browser tabs.
+    const postedMutations: Array<{ clientMutationId: string; title: string; token: string | null }> =
+      [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const auth = new Headers(init?.headers).get('Authorization');
+        if (url.endsWith('/auth/me')) {
+          return jsonResponse({ success: true, data: { user: userA } });
+        }
+        if (url.endsWith('/trips/trip-1/expenses') && method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as {
+            clientMutationId: string;
+            title: string;
+          };
+          postedMutations.push({
+            clientMutationId: body.clientMutationId,
+            title: body.title,
+            token: auth,
+          });
+          return jsonResponse({ success: true, data: { expense: { id: 'exp-recovered-1' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    // 1. Seed storage with an active SYNCING item owned by a live peer Tab 1 holding sync:user-a
+    const orphanEntry = makeQueuedEntry({
+      clientMutationId: 'mut-orphan-1',
+      userId: 'user-a',
+      syncStatus: 'SYNCING',
+      payload: {
+        title: 'Pokhara Bus Ticket',
+        category: 'TRANSPORTATION',
+        amountPaisa: 45000,
+        isEstimated: false,
+        isPackage: false,
+        splitMethod: 'EQUAL',
+        paymentMethod: 'CASH',
+        incurredAt: '2026-11-18T06:00:00.000Z',
+        payments: [{ participantId: 'p-a', amountPaisa: 45000 }],
+        clientMutationId: 'mut-orphan-1',
+      },
+    });
+    window.localStorage.setItem(
+      getOfflineQueueStorageKey('user-a'),
+      JSON.stringify({ version: 1, userId: 'user-a', queue: [orphanEntry] })
+    );
+
+    let releaseTab1Lock!: () => void;
+    let tab1Acquired = false;
+    void navigator.locks.request(
+      'tripledger:offline-queue:sync:user-a',
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          tab1Acquired = true;
+          releaseTab1Lock = resolve;
+        })
+    );
+    await waitFor(() => {
+      expect(tab1Acquired).toBe(true);
+    });
+
+    const survivingTabStore = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(survivingTabStore);
+    survivingTabStore.getState().setOnlineStatus(true);
+    await survivingTabStore.getState().refreshUserQueueFromStorage('user-a');
+
+    let flushSurvivingManual!: () => Promise<void>;
+    function RecoveryProbe() {
+      const { flushOfflineQueue } = useOfflineSync(survivingTabStore);
+      flushSurvivingManual = flushOfflineQueue;
+      return null;
+    }
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <RecoveryProbe />
+      </QueryClientProvider>
+    );
+
+    // Trigger manual flush while Tab 1 still actively holds sync:user-a -> MUST NOT reset SYNCING or duplicate POST
+    await flushSurvivingManual();
+    expect(postedMutations).toEqual([]);
+    expect(survivingTabStore.getState().queue[0]?.syncStatus).toBe('SYNCING');
+    expect(
+      (
+        JSON.parse(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))!) as {
+          queue: QueuedOfflineExpense[];
+        }
+      ).queue[0]?.syncStatus
+    ).toBe('SYNCING');
+
+    // 2. Simulate Tab 1 crashing/closing: lock releases while mut-orphan-1 stays SYNCING in storage
+    releaseTab1Lock();
+
+    await waitFor(() => {
+      expect(postedMutations).toEqual([
+        {
+          clientMutationId: 'mut-orphan-1',
+          title: 'Pokhara Bus Ticket',
+          token: 'Bearer tok-a',
+        },
+      ]);
+    });
+    await waitFor(() => {
+      expect(survivingTabStore.getState().queue).toHaveLength(0);
+      expect(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))).toBeNull();
+    });
+
+    // 3. Normal peer completion (201 remove or 503 FAILED) does NOT cause redundant recovery or retries
+    cleanup();
+    postedMutations.length = 0;
+    const failedEntry = makeQueuedEntry({
+      clientMutationId: 'mut-peer-finished',
+      userId: 'user-a',
+      syncStatus: 'SYNCING',
+    });
+    window.localStorage.setItem(
+      getOfflineQueueStorageKey('user-a'),
+      JSON.stringify({ version: 1, userId: 'user-a', queue: [failedEntry] })
+    );
+
+    let releaseTab1Normal!: () => void;
+    tab1Acquired = false;
+    void navigator.locks.request(
+      'tripledger:offline-queue:sync:user-a',
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          tab1Acquired = true;
+          releaseTab1Normal = resolve;
+        })
+    );
+    await waitFor(() => {
+      expect(tab1Acquired).toBe(true);
+    });
+
+    const tab2PeerStore = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(tab2PeerStore);
+    tab2PeerStore.getState().setOnlineStatus(true);
+    await tab2PeerStore.getState().refreshUserQueueFromStorage('user-a');
+
+    function PeerWatcherProbe() {
+      useOfflineSync(tab2PeerStore);
+      return null;
+    }
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <PeerWatcherProbe />
+      </QueryClientProvider>
+    );
+
+    // Tab 1 completes with a 503 -> FAILED cleanly before releasing sync lock
+    await tab2PeerStore.getState().markItemStatus('mut-peer-finished', 'FAILED', 'Server busy', 'user-a');
+    releaseTab1Normal();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(postedMutations).toEqual([]);
+
+    // 4. Manual "Sync Now" recovers orphaned SYNCING if previous recovery did not run while offline / lock failed
+    cleanup();
+    const manualOrphan = makeQueuedEntry({
+      clientMutationId: 'mut-manual-orphan',
+      userId: 'user-a',
+      syncStatus: 'SYNCING',
+      payload: {
+        title: 'Thamel Dinner',
+        category: 'FOOD_DRINKS',
+        amountPaisa: 62000,
+        isEstimated: false,
+        isPackage: false,
+        splitMethod: 'EQUAL',
+        paymentMethod: 'CASH',
+        incurredAt: '2026-11-18T06:00:00.000Z',
+        payments: [{ participantId: 'p-a', amountPaisa: 62000 }],
+        clientMutationId: 'mut-manual-orphan',
+      },
+    });
+    window.localStorage.setItem(
+      getOfflineQueueStorageKey('user-a'),
+      JSON.stringify({ version: 1, userId: 'user-a', queue: [manualOrphan] })
+    );
+
+    // Fail the automatic recovery watcher lock check once so mut-manual-orphan remains SYNCING cleanly,
+    // then restore working Web Locks and recover via explicit user click on "Sync Now".
+    const origRequest = navigator.locks.request.bind(navigator.locks);
+    let rejectNextSyncLock = true;
+    Object.defineProperty(navigator, 'locks', {
+      value: {
+        request: (
+          name: string,
+          optsOrCb: LockOptions | LockGrantedCallback<unknown>,
+          maybeCb?: LockGrantedCallback<unknown>
+        ) => {
+          if (rejectNextSyncLock && name.includes(':sync:')) {
+            rejectNextSyncLock = false;
+            return Promise.reject(new DOMException('Transient lock outage', 'AbortError'));
+          }
+          return origRequest(name, optsOrCb as LockOptions, maybeCb!);
+        },
+      },
+      configurable: true,
+    });
+
+    useOfflineQueueStore.getState().setOnlineStatus(true);
+    useOfflineQueueStore.setState({
+      isOnline: true,
+      isSyncing: false,
+      activeUserId: 'user-a',
+      queue: [manualOrphan],
+      legacyDiscardedCount: 0,
+      crossTabCoordinationDegraded: false,
+      syncError: null,
+    });
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<div>Home</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/exclusive cross-tab sync lock/i);
+    });
+    expect(useOfflineQueueStore.getState().isSyncing).toBe(false);
+    expect(postedMutations).toEqual([]);
+
+    fireEvent.click(screen.getByRole('button', { name: /Sync Now/i }));
+    await waitFor(() => {
+      expect(postedMutations).toEqual([
+        {
+          clientMutationId: 'mut-manual-orphan',
+          title: 'Thamel Dinner',
+          token: 'Bearer tok-a',
+        },
+      ]);
+    });
+    await waitFor(() => {
+      expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+  });
+
+  it('Phase 3.1.10 L-01 (mocked jsdom Web Locks): aborts orphaned SYNCING recovery safely on session switch and preserves exact entry for owning user re-login', async () => {
+    installTestWebLocks();
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    const userB = makeUser({ id: 'user-b', name: 'Bob', email: 'bob@example.com' });
+
+    const orphanA = makeQueuedEntry({
+      clientMutationId: 'mut-switch-orphan-1',
+      userId: 'user-a',
+      syncStatus: 'SYNCING',
+    });
+    window.localStorage.setItem(
+      getOfflineQueueStorageKey('user-a'),
+      JSON.stringify({ version: 1, userId: 'user-a', queue: [orphanA] })
+    );
+
+    const postedWithAuth: Array<{ token: string | null; clientMutationId: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const auth = new Headers(init?.headers).get('Authorization');
+        if (url.endsWith('/auth/me')) {
+          return jsonResponse({
+            success: true,
+            data: { user: auth === 'Bearer tok-b' ? userB : userA },
+          });
+        }
+        if (url.endsWith('/trips/trip-1/expenses') && method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as { clientMutationId: string };
+          postedWithAuth.push({ token: auth, clientMutationId: body.clientMutationId });
+          return jsonResponse({ success: true, data: { expense: { id: 'exp-a-resumed' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    let releaseTab1Lock!: () => void;
+    let tab1Acquired = false;
+    void navigator.locks.request(
+      'tripledger:offline-queue:sync:user-a',
+      { mode: 'exclusive' },
+      () =>
+        new Promise<void>((resolve) => {
+          tab1Acquired = true;
+          releaseTab1Lock = resolve;
+        })
+    );
+    await waitFor(() => {
+      expect(tab1Acquired).toBe(true);
+    });
+
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+    // Keep SYNCING state in active store directly to mirror live Tab 1 peer event
+    useOfflineQueueStore.setState({
+      isOnline: true,
+      isSyncing: false,
+      activeUserId: 'user-a',
+      queue: [orphanA],
+      legacyDiscardedCount: 0,
+      crossTabCoordinationDegraded: false,
+      syncError: null,
+    });
+
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<div>Home</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    // Account switches to User B BEFORE Tab 1 releases sync:user-a
+    useAuthStore.getState().setAuth(userB, 'tok-b', 'ref-b');
+    releaseTab1Lock();
+    await new Promise((r) => setTimeout(r, 35));
+
+    // Must never send User A's entry under User B or touch User B's queue
+    expect(postedWithAuth).toEqual([]);
+    expect(useOfflineQueueStore.getState().activeUserId).toBe('user-b');
+    expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+    expect(
+      (
+        JSON.parse(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))!) as {
+          queue: QueuedOfflineExpense[];
+        }
+      ).queue[0]?.clientMutationId
+    ).toBe('mut-switch-orphan-1');
+
+    // Switch back to User A -> recovers and submits exact clientMutationId under User A
+    useAuthStore.getState().setAuth(userA, 'tok-a-2', 'ref-a-2');
+    await waitFor(() => {
+      expect(postedWithAuth).toEqual([
+        { token: 'Bearer tok-a-2', clientMutationId: 'mut-switch-orphan-1' },
+      ]);
+    });
+    await waitFor(() => {
+      expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+    });
+  });
+
+  it('Phase 3.1.10 L-02 (mocked jsdom Web Locks): handles rejected navigator.locks.request during mutations and sync without unhandled rejections, unsafe flushing, or stuck syncing state', async () => {
+    const unhandledReasons: unknown[] = [];
+    const onBrowserUnhandled = (event: PromiseRejectionEvent) => {
+      unhandledReasons.push(event.reason);
+    };
+    const onNodeUnhandled = (reason: unknown) => {
+      unhandledReasons.push(reason);
+    };
+    window.addEventListener('unhandledrejection', onBrowserUnhandled);
+    process.on('unhandledRejection', onNodeUnhandled);
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+      useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+      useOfflineQueueStore.getState().setOnlineStatus(false);
+
+      // 1. Reject ALL navigator.locks.request calls for mutations
+      Object.defineProperty(navigator, 'locks', {
+        value: {
+          request: vi.fn(async () => {
+            throw new DOMException('Mutation lock denied in restricted context', 'SecurityError');
+          }),
+        },
+        configurable: true,
+      });
+
+      const [r1, r2] = await Promise.all([
+        useOfflineQueueStore
+          .getState()
+          .enqueueExpense(makeQueuedEntry({ clientMutationId: 'rej-mut-1', userId: 'user-a' })),
+        useOfflineQueueStore
+          .getState()
+          .enqueueExpense(makeQueuedEntry({ clientMutationId: 'rej-mut-2', userId: 'user-a' })),
+      ]);
+      expect(r1).toBe(true);
+      expect(r2).toBe(true);
+      expect(useOfflineQueueStore.getState().crossTabCoordinationDegraded).toBe(true);
+      expect(useOfflineQueueStore.getState().queue.map((q) => q.clientMutationId)).toEqual([
+        'rej-mut-1',
+        'rej-mut-2',
+      ]);
+      expect(warnSpy).toHaveBeenCalled();
+
+      // Update + remove continue functioning cleanly after mutation lock rejection
+      await useOfflineQueueStore.getState().markItemStatus('rej-mut-2', 'FAILED', 'Test error', 'user-a');
+      await useOfflineQueueStore.getState().removeQueuedExpense('rej-mut-2', 'user-a');
+      expect(useOfflineQueueStore.getState().queue.map((q) => q.clientMutationId)).toEqual([
+        'rej-mut-1',
+      ]);
+
+      // 2. Reject sync lock while mutation lock works -> MUST refuse unsafe concurrent flush & surface error
+      const postedIds: string[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          const method = init?.method ?? 'GET';
+          if (url.endsWith('/auth/me')) {
+            return jsonResponse({ success: true, data: { user: userA } });
+          }
+          if (url.endsWith('/trips/trip-1/expenses') && method === 'POST') {
+            const body = JSON.parse(String(init?.body)) as { clientMutationId: string };
+            postedIds.push(body.clientMutationId);
+            return jsonResponse({ success: true, data: { expense: { id: 'exp-after-lock-recovery' } } }, 201);
+          }
+          throw new Error(`Unexpected fetch: ${method} ${url}`);
+        })
+      );
+
+      installTestWebLocks();
+      const workingRequest = navigator.locks.request.bind(navigator.locks);
+      let failSyncLocks = true;
+      Object.defineProperty(navigator, 'locks', {
+        value: {
+          request: (
+            name: string,
+            optsOrCb: LockOptions | LockGrantedCallback<unknown>,
+            maybeCb?: LockGrantedCallback<unknown>
+          ) => {
+            if (failSyncLocks && name.includes(':sync:')) {
+              return Promise.reject(new DOMException('Sync lock failed', 'SecurityError'));
+            }
+            return workingRequest(name, optsOrCb as LockOptions, maybeCb!);
+          },
+        },
+        configurable: true,
+      });
+
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={['/']}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route index element={<div>Home</div>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      // Go online while sync locks reject
+      useOfflineQueueStore.getState().setOnlineStatus(true);
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/exclusive cross-tab sync lock/i);
+      });
+      expect(postedIds).toEqual([]);
+      expect(useOfflineQueueStore.getState().isSyncing).toBe(false);
+      expect(useOfflineQueueStore.getState().queue).toHaveLength(1);
+      expect(screen.getByRole('button', { name: /Sync Now/i })).not.toBeDisabled();
+
+      // Explicit manual Sync Now while lock still rejects stays non-stuck & emits no unsafe POST
+      fireEvent.click(screen.getByRole('button', { name: /Sync Now/i }));
+      await new Promise((r) => setTimeout(r, 25));
+      expect(postedIds).toEqual([]);
+      expect(useOfflineQueueStore.getState().isSyncing).toBe(false);
+      expect(screen.getByRole('button', { name: /Sync Now/i })).not.toBeDisabled();
+
+      // Dismiss notice cleanly, then subsequent enqueue + flush recover seamlessly once Web Locks recovers
+      fireEvent.click(screen.getByRole('button', { name: /Dismiss/i }));
+      expect(useOfflineQueueStore.getState().syncError).toBeNull();
+      expect(screen.getByRole('status')).toHaveTextContent(/cross-tab lock failed/i);
+
+      failSyncLocks = false;
+      expect(
+        await useOfflineQueueStore
+          .getState()
+          .enqueueExpense(makeQueuedEntry({ clientMutationId: 'rej-mut-3', userId: 'user-a' }))
+      ).toBe(true);
+
+      await waitFor(() => {
+        expect(postedIds).toEqual(['rej-mut-1', 'rej-mut-3']);
+      });
+      await waitFor(() => {
+        expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+        expect(useOfflineQueueStore.getState().crossTabCoordinationDegraded).toBe(false);
+        expect(useOfflineQueueStore.getState().syncError).toBeNull();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      // Give microtasks/event loop a tick to confirm zero unhandled rejections surfaced
+      await new Promise((r) => setTimeout(r, 25));
+      expect(unhandledReasons).toEqual([]);
+    } finally {
+      warnSpy.mockRestore();
+      window.removeEventListener('unhandledrejection', onBrowserUnhandled);
+      process.off('unhandledRejection', onNodeUnhandled);
+    }
   });
 });
