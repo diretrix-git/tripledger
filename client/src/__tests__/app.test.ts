@@ -9,7 +9,9 @@ describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
     useOfflineQueueStore.setState({
       isOnline: true,
       isSyncing: false,
+      activeUserId: null,
       queue: [],
+      legacyDiscardedCount: 0,
     });
   });
 
@@ -45,8 +47,9 @@ describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
     expect(formatPaisaToNPR(paisa)).toBe('NPR 1,500.50');
   });
 
-  it('enqueues offline expenses with clientMutationId and prevents duplicate queue entries', () => {
+  it('enqueues offline expenses strictly for the active authenticated user, enforces deduplication, and rejects unauthenticated or mismatched callers', () => {
     const sampleExpense = {
+      userId: 'u1',
       clientMutationId: 'uuid-offline-test-1',
       tripId: 'trip-1',
       tripName: 'Mustang Road Trip',
@@ -64,11 +67,39 @@ describe('TripLedger Client Shared Currency & Offline Expense Queue', () => {
       },
     };
 
-    useOfflineQueueStore.getState().enqueueExpense(sampleExpense);
-    useOfflineQueueStore.getState().enqueueExpense(sampleExpense); // duplicate call
+    // Unauthenticated enqueue is rejected
+    expect(useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(false);
+    expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+
+    // Authenticate u1
+    useAuthStore.getState().setAuth(
+      {
+        id: 'u1',
+        name: 'Alice',
+        email: 'alice@example.com',
+        emailVerified: true,
+        emailVerifiedAt: '2026-11-16T05:00:00.000Z',
+        defaultCurrency: 'NPR',
+      },
+      'access-1',
+      'refresh-1'
+    );
+
+    // Mismatched userId is rejected even while u1 is signed in
+    expect(
+      useOfflineQueueStore.getState().enqueueExpense({
+        ...sampleExpense,
+        userId: 'u2',
+        clientMutationId: 'uuid-mismatched-1',
+      })
+    ).toBe(false);
+
+    expect(useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(true);
+    expect(useOfflineQueueStore.getState().enqueueExpense(sampleExpense)).toBe(true); // duplicate call deduplicated
 
     const queue = useOfflineQueueStore.getState().queue;
     expect(queue).toHaveLength(1);
+    expect(queue[0].userId).toBe('u1');
     expect(queue[0].syncStatus).toBe('PENDING');
 
     useOfflineQueueStore.getState().removeQueuedExpense('uuid-offline-test-1');

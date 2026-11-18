@@ -97,8 +97,11 @@ export function TripDetailPage(): React.ReactElement {
   activeContextRef.current = { tripId, sessionGeneration };
   const allOfflineQueue = useOfflineQueueStore((s) => s.queue);
   const offlineQueue = useMemo(
-    () => allOfflineQueue.filter((q) => q.tripId === tripId),
-    [allOfflineQueue, tripId]
+    () =>
+      allOfflineQueue.filter(
+        (q) => q.tripId === tripId && Boolean(currentUser?.id) && q.userId === currentUser?.id
+      ),
+    [allOfflineQueue, currentUser?.id, tripId]
   );
 
   const [activeTab, setActiveTab] = useState<
@@ -165,7 +168,7 @@ export function TripDetailPage(): React.ReactElement {
     setSettleAmountNpr('');
     setSettleMethod('ESEWA');
     setSettleNote('');
-  }, [tripId]);
+  }, [tripId, sessionGeneration]);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['trip', tripId, currentUser?.id ?? null],

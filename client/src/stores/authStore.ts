@@ -3,6 +3,12 @@ import { persist } from 'zustand/middleware';
 
 export const AUTH_STORAGE_KEY = 'tripledger-auth-storage';
 
+export interface AuthSessionSnapshot {
+  sessionGeneration: number;
+  userId: string | null;
+  hasAccessToken: boolean;
+}
+
 export interface AuthUser {
   id: string;
   name: string;
@@ -196,6 +202,41 @@ export function handleAuthStorageEvent(event: StorageEvent): void {
   }
   const rawValue = event.key === null ? null : event.newValue;
   useAuthStore.getState().applyExternalStorageValue(rawValue);
+}
+
+/**
+ * Captures the current auth session generation and user identity so async callers
+ * can detect logout, re-login, or account switching before applying side effects.
+ */
+export function captureAuthSessionSnapshot(): AuthSessionSnapshot {
+  const state = useAuthStore.getState();
+  return {
+    sessionGeneration: state.sessionGeneration,
+    userId: state.user?.id ?? null,
+    hasAccessToken: Boolean(state.accessToken),
+  };
+}
+
+/**
+ * Returns true only when the active auth session matches `snapshot` with no
+ * intermediate logout, account switch, or re-authentication.
+ */
+export function isSameAuthSession(
+  snapshot: AuthSessionSnapshot,
+  options: { requireAuthenticated?: boolean } = {}
+): boolean {
+  const state = useAuthStore.getState();
+  const matchesSnapshot =
+    state.sessionGeneration === snapshot.sessionGeneration &&
+    (state.user?.id ?? null) === snapshot.userId &&
+    Boolean(state.accessToken) === snapshot.hasAccessToken;
+  if (!matchesSnapshot) {
+    return false;
+  }
+  if (options.requireAuthenticated) {
+    return Boolean(state.accessToken && state.user?.id);
+  }
+  return true;
 }
 
 export function initAuthCrossTabSync(): void {

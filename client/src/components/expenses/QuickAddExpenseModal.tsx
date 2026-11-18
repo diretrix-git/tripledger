@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { X } from 'lucide-react';
 import {
@@ -16,6 +16,7 @@ import {
   type TripMode,
 } from '@tripledger/shared';
 import { apiRequest } from '../../api/client.js';
+import { captureAuthSessionSnapshot, isSameAuthSession } from '../../stores/authStore.js';
 import { useOfflineQueueStore } from '../../stores/offlineQueueStore.js';
 
 interface QuickAddExpenseModalProps {
@@ -39,6 +40,16 @@ export function QuickAddExpenseModal({
 }: QuickAddExpenseModalProps): React.ReactElement {
   const queryClient = useQueryClient();
   const { isOnline, enqueueExpense } = useOfflineQueueStore();
+  const isMountedRef = useRef(true);
+  const activeTripIdRef = useRef(tripId);
+  activeTripIdRef.current = tripId;
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const activeParticipants = participants.filter((p) => p.isActive);
   const defaultPayerId =
@@ -100,8 +111,20 @@ export function QuickAddExpenseModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const startSession = captureAuthSessionSnapshot();
+    const requestTripId = tripId;
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      setError('You must be signed in to record an expense.');
+      return;
+    }
+
     setError(null);
     setSubmitting(true);
+
+    const canUpdateModalUi = () =>
+      isMountedRef.current &&
+      activeTripIdRef.current === requestTripId &&
+      isSameAuthSession(startSession, { requireAuthenticated: true });
 
     try {
       let computedAmountPaisa = 0;
@@ -181,42 +204,77 @@ export function QuickAddExpenseModal({
       };
 
       if (!isOnline) {
-        enqueueExpense({
+        if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+          return;
+        }
+        const queued = enqueueExpense({
+          userId: startSession.userId,
           clientMutationId,
-          tripId,
+          tripId: requestTripId,
           tripName,
           payload,
         });
-        onClose();
+        if (!queued) {
+          if (canUpdateModalUi()) {
+            setError('Unable to queue offline expense for the current session.');
+          }
+          return;
+        }
+        if (canUpdateModalUi()) {
+          onClose();
+        }
         return;
       }
 
       try {
-        await apiRequest(`/trips/${tripId}/expenses`, {
+        await apiRequest(`/trips/${requestTripId}/expenses`, {
           method: 'POST',
           body: JSON.stringify(payload),
         });
-        await queryClient.invalidateQueries({ queryKey: ['trip', tripId] });
-        await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-        onClose();
+        if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+          return;
+        }
+        await queryClient.invalidateQueries({
+          queryKey: ['trip', requestTripId, startSession.userId],
+        });
+        await queryClient.invalidateQueries({ queryKey: ['dashboard', startSession.userId] });
+        if (canUpdateModalUi()) {
+          onClose();
+        }
       } catch (err) {
+        if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+          return;
+        }
         // If network dropped mid-flight, queue offline automatically
         if (err instanceof TypeError) {
-          enqueueExpense({
+          const queued = enqueueExpense({
+            userId: startSession.userId,
             clientMutationId,
-            tripId,
+            tripId: requestTripId,
             tripName,
             payload,
           });
-          onClose();
+          if (!queued) {
+            if (canUpdateModalUi()) {
+              setError('Unable to queue offline expense for the current session.');
+            }
+            return;
+          }
+          if (canUpdateModalUi()) {
+            onClose();
+          }
           return;
         }
         throw err;
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save expense');
+      if (canUpdateModalUi()) {
+        setError(err instanceof Error ? err.message : 'Failed to save expense');
+      }
     } finally {
-      setSubmitting(false);
+      if (canUpdateModalUi()) {
+        setSubmitting(false);
+      }
     }
   };
 

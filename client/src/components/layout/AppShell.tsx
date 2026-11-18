@@ -17,7 +17,12 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { formatPaisaToNPR } from '@tripledger/shared';
-import { useAuthStore, type AuthUser } from '../../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+  type AuthUser,
+} from '../../stores/authStore.js';
 import { clearAuthQueryCache, useAuthCacheIsolation } from '../../hooks/useAuthCacheIsolation.js';
 import { useOfflineSync } from '../../hooks/useOfflineSync.js';
 import { apiRequest } from '../../api/client.js';
@@ -25,14 +30,26 @@ import { apiRequest } from '../../api/client.js';
 export function AppShell(): React.ReactElement {
   const user = useAuthStore((s) => s.user);
   const accessToken = useAuthStore((s) => s.accessToken);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const updateUser = useAuthStore((s) => s.updateUser);
   const clearAuth = useAuthStore((s) => s.clearAuth);
   const navigate = useNavigate();
   const queryClient = useContext(QueryClientContext);
-  const { isOnline, isSyncing, queue, flushOfflineQueue } = useOfflineSync();
+  const {
+    isOnline,
+    isSyncing,
+    queue,
+    legacyDiscardedCount,
+    dismissLegacyNotice,
+    flushOfflineQueue,
+  } = useOfflineSync();
   const [showQueueDrawer, setShowQueueDrawer] = useState(false);
 
   useAuthCacheIsolation();
+
+  useEffect(() => {
+    setShowQueueDrawer(false);
+  }, [sessionGeneration, user?.id]);
 
   useEffect(() => {
     if (!accessToken || !user?.id) return;
@@ -67,10 +84,14 @@ export function AppShell(): React.ReactElement {
   }, [accessToken, user?.id, updateUser]);
 
   const handleLogout = async () => {
+    const startSession = captureAuthSessionSnapshot();
     try {
       await apiRequest('/auth/logout', { method: 'POST' });
     } catch {
       // ignore network error on logout
+    }
+    if (!isSameAuthSession(startSession)) {
+      return;
     }
     clearAuthQueryCache(queryClient);
     clearAuth();
@@ -211,6 +232,26 @@ export function AppShell(): React.ReactElement {
             >
               Verify in Settings
             </NavLink>
+          </div>
+        )}
+
+        {/* Notice for safely discarded legacy unattributed offline items */}
+        {legacyDiscardedCount > 0 && (
+          <div
+            role="status"
+            className="bg-slate-800 text-slate-100 border-b border-slate-700 px-4 py-2 flex items-center justify-between text-xs gap-2"
+          >
+            <span>
+              {legacyDiscardedCount} legacy unattributed offline expense item(s) could not be
+              verified to an account and were discarded without submission.
+            </span>
+            <button
+              type="button"
+              onClick={dismissLegacyNotice}
+              className="shrink-0 font-semibold text-amber-300 hover:text-amber-200 underline"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
