@@ -8,6 +8,7 @@ import mongoose from 'mongoose';
 import request from 'supertest';
 import { createApp } from '../app.js';
 import { connectDatabase, disconnectDatabase } from '../config/database.js';
+import { migrateLegacyFamilyRepInvites } from '../migrations/migrateParticipantUserIndex.js';
 import {
   ActivityLogModel,
   FamilyModel,
@@ -711,6 +712,14 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
         .send({ name: 'Target CoOrg' });
       const guestId = guestRes.body.data.participant.id as string;
 
+      // Pre-issue an active pending email-less invite BEFORE replacing with a failing email delivery invite
+      const priorInvite = await request(appInstanceA)
+        .post(`/api/v1/trips/${tripId}/participants/${guestId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'PARTICIPANT' });
+      expect(priorInvite.status).toBe(201);
+      const priorInviteId = priorInvite.body.data.invite.id as string;
+
       const res = await request(failingEmailApp)
         .post(`/api/v1/trips/${tripId}/participants/${guestId}/invites`)
         .set('Authorization', `Bearer ${org.accessToken}`)
@@ -718,7 +727,7 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
       expect(res.status).toBe(503);
       expect(res.body.error.code).toBe('EMAIL_DELIVERY_FAILED');
 
-      // Must leave zero active pending unrevoked invites for that guest
+      // Both the failed new invite and the prior superseded invite remain revoked (fail-closed; prior is not restored)
       const activeInvites = await ParticipantInviteModel.countDocuments({
         tripId,
         participantId: guestId,
@@ -726,6 +735,14 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
         revokedAt: null,
       });
       expect(activeInvites).toBe(0);
+      expect((await ParticipantInviteModel.findById(priorInviteId))?.revokedAt).not.toBeNull();
+      expect(
+        await ActivityLogModel.countDocuments({
+          tripId,
+          actionType: 'PARTICIPANT_INVITE_REVOKED',
+          'metadata.reason': 'EMAIL_DELIVERY_FAILED',
+        })
+      ).toBe(1);
     });
 
     it('5. serializes concurrent redemption across two app instances in standalone mode so a token grants at most one promotion', async () => {
@@ -944,6 +961,108 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
         .set('Authorization', `Bearer ${org.accessToken}`);
       expect(retryRevoke.status).toBe(200);
       expect((await ParticipantInviteModel.findById(fam2InvId))?.revokedAt).not.toBeNull();
+    }, 30000);
+
+    it('5c. rolls back standalone Participant.save failure and FAMILY_REP demotion failure cleanly', async () => {
+      const org = await registerAndVerifyUser(appInstanceA, {
+        name: 'Demote Org 5c',
+        email: 'demote.org5c@example.com',
+      });
+      const rep = await registerAndVerifyUser(appInstanceA, {
+        name: 'Demote Rep 5c',
+        email: 'demote.rep5c@example.com',
+      });
+
+      const tripRes = await request(appInstanceA)
+        .post('/api/v1/trips')
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ name: 'Demotion Rollback Trip', mode: 'FAMILY', organizerFamilyName: 'OrgFam' });
+      expect(tripRes.status).toBe(201);
+      const tripId = tripRes.body.data.trip.id as string;
+
+      const famId = (
+        await request(appInstanceA)
+          .post(`/api/v1/trips/${tripId}/families`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Beta Fam 5c' })
+      ).body.data.family.id as string;
+
+      const guestId = (
+        await request(appInstanceA)
+          .post(`/api/v1/trips/${tripId}/participants`)
+          .set('Authorization', `Bearer ${org.accessToken}`)
+          .send({ name: 'Rep Slot 5c', familyId: famId })
+      ).body.data.participant.id as string;
+
+      // 1. Issue FAMILY_REP invite and fail inside Participant.save during standalone claim
+      const repInvite = await request(appInstanceA)
+        .post(`/api/v1/trips/${tripId}/participants/${guestId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'FAMILY_REP', intendedEmail: rep.email });
+      expect(repInvite.status).toBe(201);
+      const repInvId = repInvite.body.data.invite.id as string;
+      const repToken = repInvite.body.data.rawToken as string;
+
+      vi.spyOn(ParticipantModel.prototype, 'save').mockRejectedValueOnce(
+        new Error('Simulated standalone Participant.save failure')
+      );
+      const failSaveClaim = await request(appInstanceA)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: repToken });
+      expect(failSaveClaim.status).toBe(500);
+      vi.restoreAllMocks();
+
+      const invAfterSaveFail = await ParticipantInviteModel.findById(repInvId);
+      expect(invAfterSaveFail?.usedAt).toBeNull();
+      expect(invAfterSaveFail?.usedByUserId).toBeNull();
+      expect((await ParticipantModel.findById(guestId))?.userId).toBeNull();
+      expect((await ParticipantModel.findById(guestId))?.role).toBe('PARTICIPANT');
+      expect((await FamilyModel.findById(famId))?.representativeId).toBeNull();
+
+      // Retry claim succeeds cleanly -> establishes active FAMILY_REP
+      const okClaimRep = await request(appInstanceA)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: repToken });
+      expect(okClaimRep.status).toBe(200);
+      expect(okClaimRep.body.data.role).toBe('FAMILY_REP');
+      expect((await FamilyModel.findById(famId))?.representativeId?.toString()).toBe(guestId);
+
+      // 2. Issue demotion (PARTICIPANT) invite for active FAMILY_REP, inject ActivityLog failure after Family.save
+      const demoteInvite = await request(appInstanceA)
+        .post(`/api/v1/trips/${tripId}/participants/${guestId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'PARTICIPANT', intendedEmail: rep.email });
+      expect(demoteInvite.status).toBe(201);
+      const demoteInvId = demoteInvite.body.data.invite.id as string;
+      const demoteToken = demoteInvite.body.data.rawToken as string;
+
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(
+        new Error('Simulated ActivityLog failure during FAMILY_REP demotion')
+      );
+      const failedDemote = await request(appInstanceA)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: demoteToken });
+      expect(failedDemote.status).toBe(500);
+      vi.restoreAllMocks();
+
+      // Both Participant.role AND Family.representativeId MUST be restored, and demotion invite unredeemed
+      const invAfterDemoteFail = await ParticipantInviteModel.findById(demoteInvId);
+      expect(invAfterDemoteFail?.usedAt).toBeNull();
+      expect(invAfterDemoteFail?.usedByUserId).toBeNull();
+      expect((await ParticipantModel.findById(guestId))?.role).toBe('FAMILY_REP');
+      expect((await FamilyModel.findById(famId))?.representativeId?.toString()).toBe(guestId);
+
+      // Clean retry completes demotion
+      const okDemote = await request(appInstanceA)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: demoteToken });
+      expect(okDemote.status).toBe(200);
+      expect(okDemote.body.data.role).toBe('PARTICIPANT');
+      expect((await FamilyModel.findById(famId))?.representativeId).toBeNull();
     }, 30000);
   });
 
@@ -1183,6 +1302,100 @@ describe('Phase 3: Verified Invitation-Based Role Promotion (SEC-01)', () => {
       expect(
         (await ParticipantInviteModel.findById(secondInv.body.data.invite.id as string))?.revokedAt
       ).not.toBeNull();
+
+      // 4. Replica-set TX abort on FAMILY_REP demotion preserves BOTH Participant.role and Family.representativeId
+      const demoteRsInv = await request(spyEmailApp)
+        .post(`/api/v1/trips/${tripId}/participants/${guestId}/invites`)
+        .set('Authorization', `Bearer ${org.accessToken}`)
+        .send({ grantedRole: 'PARTICIPANT', intendedEmail: rep.email });
+      expect(demoteRsInv.status).toBe(201);
+      const demoteRsInvId = demoteRsInv.body.data.invite.id as string;
+      const demoteRsToken = demoteRsInv.body.data.rawToken as string;
+
+      vi.spyOn(ActivityLogModel, 'create').mockRejectedValueOnce(
+        new Error('RS0 ActivityLog fail on FAMILY_REP demotion')
+      );
+      const failRsDemote = await request(appInstanceA)
+        .post('/api/v1/trips/invites/claim')
+        .set('Authorization', `Bearer ${rep.accessToken}`)
+        .send({ token: demoteRsToken });
+      expect(failRsDemote.status).toBe(500);
+      vi.restoreAllMocks();
+
+      expect((await ParticipantInviteModel.findById(demoteRsInvId))?.usedAt).toBeNull();
+      expect((await ParticipantModel.findById(guestId))?.role).toBe('FAMILY_REP');
+      expect((await FamilyModel.findById(famId))?.representativeId?.toString()).toBe(guestId);
+
+      // 5. Replica-set migrateLegacyFamilyRepInvites aborts updateOne atomically if ActivityLog insert fails, then succeeds on retry
+      const db = mongoose.connection.db!;
+      const legacyId = new mongoose.Types.ObjectId();
+      await db.collection(ParticipantInviteModel.collection.collectionName).insertOne({
+        _id: legacyId,
+        tripId: new mongoose.Types.ObjectId(tripId),
+        participantId: new mongoose.Types.ObjectId(guestId),
+        invitedByUserId: new mongoose.Types.ObjectId(org.userId),
+        invitedByParticipantId: new mongoose.Types.ObjectId(
+          tripRes.body.data.myParticipant.id as string
+        ),
+        tokenHash: hashToken('rs0-mig-abort-test'),
+        grantedRole: 'FAMILY_REP',
+        intendedEmail: 'legacy.rs0@example.com',
+        requireVerifiedEmail: true,
+        familyId: null,
+        expiresAt: new Date(Date.now() + 3600_000),
+        usedAt: null,
+        usedByUserId: null,
+        revokedAt: null,
+        revokedByParticipantId: null,
+      });
+
+      const realCollection = db.collection.bind(db);
+      vi.spyOn(db, 'collection').mockImplementation(((name: string) => {
+        const col = realCollection(name);
+        if (name === ActivityLogModel.collection.collectionName) {
+          return new Proxy(col, {
+            get(target, prop, receiver) {
+              if (prop === 'insertOne') {
+                return async () => {
+                  throw new Error('RS0 migration ActivityLog TX failure');
+                };
+              }
+              return Reflect.get(target, prop, receiver);
+            },
+          });
+        }
+        return col;
+      }) as typeof db.collection);
+
+      await expect(migrateLegacyFamilyRepInvites(db)).rejects.toThrow(
+        /RS0 migration ActivityLog TX failure/i
+      );
+      vi.restoreAllMocks();
+
+      // Because replica-set TX aborted atomically, revokedAt stays null until retry
+      expect(
+        (
+          await db
+            .collection(ParticipantInviteModel.collection.collectionName)
+            .findOne({ _id: legacyId })
+        )?.revokedAt
+      ).toBeNull();
+
+      const retryMig = await migrateLegacyFamilyRepInvites(db);
+      expect(retryMig.revokedLegacyFamilyRepInvitesCount).toBe(1);
+      expect(
+        (
+          await db
+            .collection(ParticipantInviteModel.collection.collectionName)
+            .findOne({ _id: legacyId })
+        )?.revokedAt
+      ).toBeInstanceOf(Date);
+      expect(
+        await ActivityLogModel.countDocuments({
+          entityId: legacyId,
+          actionType: 'PARTICIPANT_INVITE_REVOKED_MIGRATION',
+        })
+      ).toBe(1);
     }, 30000);
   });
 });
