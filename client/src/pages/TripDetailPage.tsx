@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -52,6 +52,7 @@ import {
   exportTripReportToExcel,
   exportTripReportToPDF,
 } from '../utils/exportReport.js';
+import { useAuthStore } from '../stores/authStore.js';
 import { useOfflineQueueStore } from '../stores/offlineQueueStore.js';
 
 interface TripDetailResponse {
@@ -83,6 +84,7 @@ interface TripDetailResponse {
 export function TripDetailPage(): React.ReactElement {
   const { tripId } = useParams<{ tripId: string }>();
   const queryClient = useQueryClient();
+  const currentUser = useAuthStore((s) => s.user);
   const allOfflineQueue = useOfflineQueueStore((s) => s.queue);
   const offlineQueue = useMemo(
     () => allOfflineQueue.filter((q) => q.tripId === tripId),
@@ -129,6 +131,30 @@ export function TripDetailPage(): React.ReactElement {
   const [settleAmountNpr, setSettleAmountNpr] = useState('');
   const [settleMethod, setSettleMethod] = useState<PaymentMethod>('ESEWA');
   const [settleNote, setSettleNote] = useState('');
+
+  useEffect(() => {
+    setActiveTab('OVERVIEW');
+    setShowAddExpense(false);
+    setCopiedBanner(null);
+    setActionError(null);
+    setNewParticipantName('');
+    setNewParticipantEmail('');
+    setNewParticipantType('ADULT');
+    setNewParticipantFamilyId('');
+    setNewParticipantWeight('1');
+    setInviteParticipantId('');
+    setInviteRole('ORGANIZER');
+    setInviteEmail('');
+    setIssuedInviteSecret(null);
+    setNewFamilyName('');
+    setNewFamilyRepId('');
+    setSettlementViewMode('INDIVIDUAL');
+    setSettleFromId('');
+    setSettleToId('');
+    setSettleAmountNpr('');
+    setSettleMethod('ESEWA');
+    setSettleNote('');
+  }, [tripId]);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['trip', tripId],
@@ -177,6 +203,7 @@ export function TripDetailPage(): React.ReactElement {
     trip.status !== 'CLOSED' &&
     ['ORGANIZER', 'CONTRIBUTOR', 'FAMILY_REP'].includes(myParticipant.role);
 
+  const activeParticipants = participants.filter((p) => p.isActive);
   const participantMap = new Map(participants.map((p) => [p.id, p]));
   const familyMap = new Map(families.map((f) => [f.id, f]));
   const participantNameMap = new Map(participants.map((p) => [p.id, p.name]));
@@ -314,13 +341,16 @@ export function TripDetailPage(): React.ReactElement {
 
   const handleRecordSettlement = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (trip.status === 'CLOSED') {
+      return;
+    }
     setActionError(null);
     try {
       const amountPaisa = nprToPaisa(settleAmountNpr);
       await apiRequest(`/trips/${trip.id}/settlements`, {
         method: 'POST',
         body: JSON.stringify({
-          settlementMode: settlementViewMode,
+          settlementMode: trip.mode === 'FAMILY' ? settlementViewMode : 'INDIVIDUAL',
           fromParticipantId: settleFromId,
           toParticipantId: settleToId,
           amountPaisa,
@@ -339,7 +369,10 @@ export function TripDetailPage(): React.ReactElement {
   };
 
   const handlePrefillSuggestion = (s: SettlementSuggestion) => {
-    setSettlementViewMode(s.mode);
+    if (trip.status === 'CLOSED') {
+      return;
+    }
+    setSettlementViewMode(trip.mode === 'FAMILY' ? s.mode : 'INDIVIDUAL');
     setSettleFromId(s.fromParticipantId);
     setSettleToId(s.toParticipantId);
     setSettleAmountNpr(paisaToNprString(s.amountPaisa));
@@ -782,12 +815,14 @@ export function TripDetailPage(): React.ReactElement {
                             {formatPaisaToNPR(s.amountPaisa)}
                           </p>
                         </div>
-                        <button
-                          onClick={() => handlePrefillSuggestion(s)}
-                          className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold shrink-0"
-                        >
-                          Settle
-                        </button>
+                        {trip.status !== 'CLOSED' && (
+                          <button
+                            onClick={() => handlePrefillSuggestion(s)}
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[11px] font-semibold shrink-0"
+                          >
+                            Settle
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -1286,7 +1321,7 @@ export function TripDetailPage(): React.ReactElement {
                       className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs bg-white"
                     >
                       <option value="">-- Select Representative (Optional) --</option>
-                      {participants.map((p) => (
+                      {activeParticipants.map((p) => (
                         <option key={p.id} value={p.id}>
                           {p.name}
                         </option>
@@ -1316,6 +1351,11 @@ export function TripDetailPage(): React.ReactElement {
             <p className="text-xs text-slate-500 mb-4">
               Settlements reimburse participants directly and never modify original expense records. Only confirmed settlements reduce outstanding balances.
             </p>
+            {trip.status === 'CLOSED' ? (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs text-slate-600">
+                Trip is closed. Recording new settlements is disabled.
+              </div>
+            ) : (
             <form onSubmit={handleRecordSettlement} className="space-y-3">
               {trip.mode === 'FAMILY' && (
                 <div>
@@ -1361,7 +1401,7 @@ export function TripDetailPage(): React.ReactElement {
                     className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs bg-white"
                   >
                     <option value="">Select Sender</option>
-                    {participants.map((p) => (
+                    {activeParticipants.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
                       </option>
@@ -1379,7 +1419,7 @@ export function TripDetailPage(): React.ReactElement {
                     className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs bg-white"
                   >
                     <option value="">Select Receiver</option>
-                    {participants.map((p) => (
+                    {activeParticipants.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
                       </option>
@@ -1441,6 +1481,7 @@ export function TripDetailPage(): React.ReactElement {
                 {isOrganizer ? 'Record & Confirm Settlement' : 'Report Settlement Payment'}
               </button>
             </form>
+            )}
           </div>
 
           <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
@@ -1463,6 +1504,7 @@ export function TripDetailPage(): React.ReactElement {
                       ? familyMap.get(s.toFamilyId)
                       : undefined;
                   const isDesignatedFamilyRep =
+                    currentUser?.emailVerified === true &&
                     trip.mode === 'FAMILY' &&
                     s.settlementMode === 'FAMILY' &&
                     isActiveActor &&
