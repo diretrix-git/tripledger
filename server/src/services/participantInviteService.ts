@@ -10,6 +10,7 @@ import {
 } from '@tripledger/shared';
 import { env } from '../config/env.js';
 import {
+  ActivityLogModel,
   FamilyModel,
   ParticipantInviteModel,
   ParticipantModel,
@@ -33,7 +34,10 @@ import {
   assertParticipantEligibleForFamilyRepInvite,
   captureFamilySnapshot,
   restoreFamilySnapshots,
+  restoreRevokedInviteRecords,
+  revokePendingParticipantInvites,
   type FamilyUpdateSnapshot,
+  type RevokedInviteRollbackRecord,
 } from './familyInvariant.js';
 import {
   assertFreshActiveOrganizerActor,
@@ -105,15 +109,23 @@ export async function issueParticipantInvite(params: {
   const txState: {
     invite?: IParticipantInvite;
     targetParticipant?: IParticipant;
-  } = {};
+    freshActor?: IParticipant;
+    revokedInvites: RevokedInviteRollbackRecord[];
+    activityLogId?: mongoose.Types.ObjectId;
+  } = {
+    revokedInvites: [],
+  };
 
   await runSerializedTripOrganizerMutation({
     tripId: trip._id,
     work: async (session) => {
       txState.invite = undefined;
       txState.targetParticipant = undefined;
+      txState.freshActor = undefined;
+      txState.revokedInvites = [];
+      txState.activityLogId = undefined;
 
-      await assertFreshActiveOrganizerActor(trip._id, actorParticipant._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(trip._id, actorParticipant._id, session);
 
       const liveTrip = await TripModel.findById(trip._id).session(session);
       if (!liveTrip) {
@@ -200,29 +212,22 @@ export async function issueParticipantInvite(params: {
         boundFamilyId = eligibleFamily._id;
       }
 
-      const now = new Date();
       // Supersede any prior pending unredeemed invitations for the same participant slot
       // so stale or duplicate pending links/roles cannot remain active simultaneously.
-      await ParticipantInviteModel.updateMany(
-        {
-          tripId: trip._id,
-          participantId: targetParticipant._id,
-          usedAt: null,
-          revokedAt: null,
-        },
-        {
-          $set: {
-            revokedAt: now,
-            revokedByParticipantId: actorParticipant._id,
-          },
-        },
-        session ? { session } : undefined
-      );
+      const revokedPrior = await revokePendingParticipantInvites({
+        tripId: trip._id,
+        participantIds: [targetParticipant._id],
+        actorParticipantId: freshActor._id,
+        session,
+      });
+      if (revokedPrior) {
+        txState.revokedInvites.push(revokedPrior);
+      }
 
       const inviterObjectId =
         actorUserId && mongoose.Types.ObjectId.isValid(actorUserId)
           ? new mongoose.Types.ObjectId(actorUserId)
-          : actorParticipant.userId;
+          : freshActor.userId;
       if (!inviterObjectId) {
         throw new AppError('Inviter account linkage required.', 403, 'FORBIDDEN_TRIP_ACCESS');
       }
@@ -234,7 +239,7 @@ export async function issueParticipantInvite(params: {
             participantId: targetParticipant._id,
             familyId: boundFamilyId,
             invitedByUserId: inviterObjectId,
-            invitedByParticipantId: actorParticipant._id,
+            invitedByParticipantId: freshActor._id,
             tokenHash,
             intendedEmail: policy.intendedEmail,
             grantedRole: parsed.grantedRole,
@@ -247,11 +252,36 @@ export async function issueParticipantInvite(params: {
 
       txState.invite = created;
       txState.targetParticipant = targetParticipant;
+      txState.freshActor = freshActor;
+
+      const activityLogId = new mongoose.Types.ObjectId();
+      txState.activityLogId = activityLogId;
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'PARTICIPANT_INVITE_CREATED',
+        entityType: 'PARTICIPANT_INVITE',
+        entityId: created._id,
+        summary: `${freshActor.name} issued a ${created.grantedRole} invitation for "${targetParticipant.name}".`,
+        metadata: {
+          participantId: targetParticipant._id.toString(),
+          grantedRole: created.grantedRole,
+          requireVerifiedEmail: created.requireVerifiedEmail,
+        },
+        session,
+      });
     },
     rollback: async () => {
+      if (txState.activityLogId) {
+        await ActivityLogModel.deleteOne({ _id: txState.activityLogId });
+      }
       if (txState.invite) {
         await ParticipantInviteModel.deleteOne({ _id: txState.invite._id });
       }
+      await restoreRevokedInviteRecords(txState.revokedInvites);
     },
   });
 
@@ -275,7 +305,8 @@ export async function issueParticipantInvite(params: {
       // Fail closed on delivery failure: revoke the freshly created invite so no undelivered
       // active invite token lingers in the database.
       try {
-        await ParticipantInviteModel.updateOne(
+        const actorForRevoke = txState.freshActor ?? actorParticipant;
+        const revokeRes = await ParticipantInviteModel.updateOne(
           {
             _id: txState.invite._id,
             usedAt: null,
@@ -284,10 +315,27 @@ export async function issueParticipantInvite(params: {
           {
             $set: {
               revokedAt: new Date(),
-              revokedByParticipantId: actorParticipant._id,
+              revokedByParticipantId: actorForRevoke._id,
             },
           }
         );
+        if (revokeRes.modifiedCount === 1) {
+          await logTripActivity({
+            tripId: trip._id,
+            actorUserId,
+            actorParticipantId: actorForRevoke._id,
+            actorName: actorForRevoke.name,
+            actionType: 'PARTICIPANT_INVITE_REVOKED',
+            entityType: 'PARTICIPANT_INVITE',
+            entityId: txState.invite._id,
+            summary: `${actorForRevoke.name}'s ${txState.invite.grantedRole} invitation for "${txState.targetParticipant.name}" was revoked after email delivery failed.`,
+            metadata: {
+              participantId: txState.targetParticipant._id.toString(),
+              grantedRole: txState.invite.grantedRole,
+              reason: 'EMAIL_DELIVERY_FAILED',
+            },
+          });
+        }
       } catch (revokeErr) {
         console.error(
           '[tripledger] Failed to revoke invite after email delivery error:',
@@ -297,22 +345,6 @@ export async function issueParticipantInvite(params: {
       throw err;
     }
   }
-
-  await logTripActivity({
-    tripId: trip._id,
-    actorUserId,
-    actorParticipantId: actorParticipant._id,
-    actorName: actorParticipant.name,
-    actionType: 'PARTICIPANT_INVITE_CREATED',
-    entityType: 'PARTICIPANT_INVITE',
-    entityId: txState.invite._id,
-    summary: `${actorParticipant.name} issued a ${txState.invite.grantedRole} invitation for "${txState.targetParticipant.name}".`,
-    metadata: {
-      participantId: txState.targetParticipant._id.toString(),
-      grantedRole: txState.invite.grantedRole,
-      requireVerifiedEmail: txState.invite.requireVerifiedEmail,
-    },
-  });
 
   return {
     invite: formatParticipantInvite(txState.invite),
@@ -420,8 +452,15 @@ export async function claimParticipantInviteForUser(params: {
     participant?: IParticipant;
     invite?: IParticipantInvite;
     rollbackSnapshot?: ParticipantUpdateSnapshot;
+    participantSaved: boolean;
     familySnapshots: FamilyUpdateSnapshot[];
+    claimedInviteRevert?: {
+      _id: mongoose.Types.ObjectId;
+      usedAt: Date;
+    };
+    activityLogId?: mongoose.Types.ObjectId;
   } = {
+    participantSaved: false,
     familySnapshots: [],
   };
 
@@ -432,7 +471,10 @@ export async function claimParticipantInviteForUser(params: {
       txState.participant = undefined;
       txState.invite = undefined;
       txState.rollbackSnapshot = undefined;
+      txState.participantSaved = false;
       txState.familySnapshots = [];
+      txState.claimedInviteRevert = undefined;
+      txState.activityLogId = undefined;
 
       const user = await UserModel.findById(params.userId).session(session);
       if (!user) {
@@ -611,6 +653,11 @@ export async function claimParticipantInviteForUser(params: {
         );
       }
 
+      txState.claimedInviteRevert = {
+        _id: claimedInvite._id,
+        usedAt: claimedInvite.usedAt ?? now,
+      };
+
       const participantSnap = captureParticipantUpdateSnapshot(participant);
       txState.rollbackSnapshot = participantSnap;
 
@@ -623,6 +670,7 @@ export async function claimParticipantInviteForUser(params: {
       try {
         await participant.save(session ? { session } : undefined);
         participantSnap.expectedUpdatedAt = participant.updatedAt;
+        txState.participantSaved = true;
       } catch (err) {
         if (isDuplicateKeyError(err)) {
           throw new AppError(
@@ -690,40 +738,63 @@ export async function claimParticipantInviteForUser(params: {
       txState.trip = trip;
       txState.participant = participant;
       txState.invite = claimedInvite;
+
+      const activityLogId = new mongoose.Types.ObjectId();
+      txState.activityLogId = activityLogId;
+      await logTripActivity({
+        _id: activityLogId,
+        tripId: trip._id,
+        actorUserId: params.userId,
+        actorParticipantId: participant._id,
+        actorName: participant.name,
+        actionType: 'PARTICIPANT_INVITE_REDEEMED',
+        entityType: 'PARTICIPANT_INVITE',
+        entityId: claimedInvite._id,
+        summary: `${participant.name} accepted a ${participant.role} role invitation.`,
+        metadata: {
+          participantId: participant._id.toString(),
+          grantedRole: participant.role,
+        },
+        session,
+      });
     },
     rollback: async () => {
+      if (txState.activityLogId) {
+        await ActivityLogModel.deleteOne({ _id: txState.activityLogId });
+      }
       await restoreFamilySnapshots(txState.familySnapshots);
-      if (!txState.rollbackSnapshot) return;
-      await ParticipantModel.updateOne(
-        {
-          _id: txState.rollbackSnapshot._id,
-          ...(txState.rollbackSnapshot.expectedUpdatedAt
-            ? { updatedAt: txState.rollbackSnapshot.expectedUpdatedAt }
-            : {}),
-        },
-        buildParticipantUpdateRestoreOp(txState.rollbackSnapshot)
-      );
+      if (txState.participantSaved && txState.rollbackSnapshot) {
+        await ParticipantModel.updateOne(
+          {
+            _id: txState.rollbackSnapshot._id,
+            ...(txState.rollbackSnapshot.expectedUpdatedAt
+              ? { updatedAt: txState.rollbackSnapshot.expectedUpdatedAt }
+              : {}),
+          },
+          buildParticipantUpdateRestoreOp(txState.rollbackSnapshot)
+        );
+      }
+      if (txState.claimedInviteRevert) {
+        await ParticipantInviteModel.collection.updateOne(
+          {
+            _id: txState.claimedInviteRevert._id,
+            usedAt: txState.claimedInviteRevert.usedAt,
+            revokedAt: null,
+          },
+          {
+            $set: {
+              usedAt: null,
+              usedByUserId: null,
+            },
+          }
+        );
+      }
     },
   });
 
   if (!txState.trip || !txState.participant || !txState.invite) {
     throw new AppError('Failed to redeem participant invitation.', 500, 'INTERNAL_SERVER_ERROR');
   }
-
-  await logTripActivity({
-    tripId: txState.trip._id,
-    actorUserId: params.userId,
-    actorParticipantId: txState.participant._id,
-    actorName: txState.participant.name,
-    actionType: 'PARTICIPANT_INVITE_REDEEMED',
-    entityType: 'PARTICIPANT_INVITE',
-    entityId: txState.invite._id,
-    summary: `${txState.participant.name} accepted a ${txState.participant.role} role invitation.`,
-    metadata: {
-      participantId: txState.participant._id.toString(),
-      grantedRole: txState.participant.role,
-    },
-  });
 
   return {
     tripId: txState.trip._id.toString(),
@@ -751,6 +822,8 @@ export async function revokeParticipantInviteForTrip(params: {
   const txState: {
     invite?: IParticipantInvite;
     alreadyRevoked?: boolean;
+    revokedRecord?: RevokedInviteRollbackRecord;
+    activityLogId?: mongoose.Types.ObjectId;
   } = {};
 
   await runSerializedTripOrganizerMutation({
@@ -758,8 +831,10 @@ export async function revokeParticipantInviteForTrip(params: {
     work: async (session) => {
       txState.invite = undefined;
       txState.alreadyRevoked = false;
+      txState.revokedRecord = undefined;
+      txState.activityLogId = undefined;
 
-      await assertFreshActiveOrganizerActor(tripId, actorParticipant._id, session);
+      const freshActor = await assertFreshActiveOrganizerActor(tripId, actorParticipant._id, session);
 
       const liveInvite = await ParticipantInviteModel.findOne({
         _id: inviteId,
@@ -783,6 +858,7 @@ export async function revokeParticipantInviteForTrip(params: {
         return;
       }
 
+      const revokeTimestamp = new Date();
       const revoked = await ParticipantInviteModel.findOneAndUpdate(
         {
           _id: liveInvite._id,
@@ -792,8 +868,8 @@ export async function revokeParticipantInviteForTrip(params: {
         },
         {
           $set: {
-            revokedAt: new Date(),
-            revokedByParticipantId: actorParticipant._id,
+            revokedAt: revokeTimestamp,
+            revokedByParticipantId: freshActor._id,
           },
         },
         {
@@ -823,31 +899,42 @@ export async function revokeParticipantInviteForTrip(params: {
 
       txState.invite = revoked;
       txState.alreadyRevoked = false;
+      txState.revokedRecord = {
+        inviteIds: [revoked._id],
+        revokedAt: revoked.revokedAt ?? revokeTimestamp,
+      };
+
+      const activityLogId = new mongoose.Types.ObjectId();
+      txState.activityLogId = activityLogId;
+      await logTripActivity({
+        _id: activityLogId,
+        tripId,
+        actorUserId,
+        actorParticipantId: freshActor._id,
+        actorName: freshActor.name,
+        actionType: 'PARTICIPANT_INVITE_REVOKED',
+        entityType: 'PARTICIPANT_INVITE',
+        entityId: revoked._id,
+        summary: `${freshActor.name} revoked a pending ${revoked.grantedRole} invitation.`,
+        metadata: {
+          participantId: revoked.participantId.toString(),
+          grantedRole: revoked.grantedRole,
+        },
+        session,
+      });
     },
     rollback: async () => {
-      // Single-document findOneAndUpdate in standalone mode or ACID TX needs no manual revert.
+      if (txState.activityLogId) {
+        await ActivityLogModel.deleteOne({ _id: txState.activityLogId });
+      }
+      if (txState.revokedRecord) {
+        await restoreRevokedInviteRecords([txState.revokedRecord]);
+      }
     },
   });
 
   if (!txState.invite) {
     throw new AppError('Failed to revoke invitation.', 500, 'INTERNAL_SERVER_ERROR');
-  }
-
-  if (!txState.alreadyRevoked) {
-    await logTripActivity({
-      tripId,
-      actorUserId,
-      actorParticipantId: actorParticipant._id,
-      actorName: actorParticipant.name,
-      actionType: 'PARTICIPANT_INVITE_REVOKED',
-      entityType: 'PARTICIPANT_INVITE',
-      entityId: txState.invite._id,
-      summary: `${actorParticipant.name} revoked a pending ${txState.invite.grantedRole} invitation.`,
-      metadata: {
-        participantId: txState.invite.participantId.toString(),
-        grantedRole: txState.invite.grantedRole,
-      },
-    });
   }
 
   return {
