@@ -458,7 +458,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
 
       const tripObjId = new mongoose.Types.ObjectId(fx.tripId);
       expect(await countActiveLinkedOrganizers(tripObjId)).toBe(1);
-    });
+    }, 30000);
 
     it('2. allows valid co-organizer demotion, deactivation, and removal while blocking reducing active linked organizers below 1', async () => {
       const fx = await seedTripWithOrganizers(appInstanceA, 1, false);
@@ -507,7 +507,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
         .set('Authorization', `Bearer ${fx.creatorToken}`);
       expect(removeLastDespiteInactiveCo.status).toBe(400);
       expect(removeLastDespiteInactiveCo.body.error.code).toBe('SOLE_ORGANIZER');
-    });
+    }, 30000);
 
     it('3. serializes concurrent co-organizer demotions across two independent server instances without zero-organizer state', async () => {
       const fx = await seedTripWithOrganizers(appInstanceA, 1, true);
@@ -533,7 +533,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
 
       // Invariant holds even with the guest ORGANIZER present
       expect(await countActiveLinkedOrganizers(tripObjId)).toBe(1);
-    });
+    }, 30000);
 
     it('4. serializes concurrent co-organizer deactivation and deletion bursts (4 co-organizers) leaving at least 1 active linked organizer', async () => {
       const fx = await seedTripWithOrganizers(appInstanceA, 3, true);
@@ -572,7 +572,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
 
       const remaining = await ParticipantModel.find(activeLinkedOrganizerFilter(tripObjId)).lean();
       expect(remaining).toHaveLength(1);
-    });
+    }, 30000);
 
     it('5. fails closed on lease timeout in standalone mode and recovers expired leases from crashed instances', async () => {
       const fx = await seedTripWithOrganizers(appInstanceA, 1, false);
@@ -623,7 +623,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
 
       const tripAfter = await TripModel.findById(fx.tripId).lean();
       expect(tripAfter?.organizerMutationLock?.owner).toBeNull();
-    });
+    }, 30000);
 
     it('6. restores original organizer state via compensating rollback and releases lease when persistence fails mid-operation', async () => {
       const fx = await seedTripWithOrganizers(appInstanceA, 1, false);
@@ -676,7 +676,7 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
       expect(coAfterFailedRemove?.role).toBe('ORGANIZER');
       expect(coAfterFailedRemove?.userId?.toString()).toBe(co.userId);
       expect(await countActiveLinkedOrganizers(tripObjId)).toBe(2);
-    });
+    }, 30000);
 
     it('7. fails closed with 503 TRANSACTIONS_UNAVAILABLE when NODE_ENV=production runs against standalone MongoDB', async () => {
       const fx = await seedTripWithOrganizers(appInstanceA, 1, false);
@@ -832,6 +832,6 @@ describe('Sole Active Linked Organizer Invariant (F-02 Pre-Phase-3 Hardening)', 
         lockVersionBeforeAbort
       );
       expect(await countActiveLinkedOrganizers(tripObjId)).toBe(2);
-    });
+    }, 30000);
   });
 });

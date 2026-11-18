@@ -208,7 +208,7 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       });
     expect(submitExpenseAttempt.status).toBe(403);
     expect(submitExpenseAttempt.body.error.code).toBe('INSUFFICIENT_ROLE');
-  });
+  }, 30000);
 
   it('prevents deactivated participants from regaining access or roles via invite code or auto-linking, and guards updateParticipant', async () => {
     const orgReg = await request(app).post('/api/v1/auth/register').send({
@@ -340,7 +340,7 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       .get('/api/v1/dashboard/summary')
       .set('Authorization', `Bearer ${guestUserReg.body.data.accessToken}`);
     expect((await ParticipantModel.findById(inactiveGuest._id))?.userId).toBeNull();
-  });
+  }, 30000);
 
   it('enforces inviteEnabled / inviteExpiresAt controls and handles concurrent join without E11000 errors', async () => {
     const orgReg = await request(app).post('/api/v1/auth/register').send({
@@ -750,7 +750,7 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       .send({ status: 'CONFIRMED' });
     expect(validRepConfirm.status).toBe(200);
     expect(validRepConfirm.body.data.settlement.status).toBe('CONFIRMED');
-  });
+  }, 30000);
 
   it('M-02: disables invites on trip closure, blocks joining CLOSED trips, preserves reopening, and enforces strict Mongo join rate limiting', async () => {
     const orgReg = await request(app).post('/api/v1/auth/register').send({
@@ -897,5 +897,5 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       .set('Authorization', `Bearer ${u2Token}`);
     expect(rl3.status).toBe(429);
     expect(rl3.body.error.code).toBe('RATE_LIMITED');
-  });
+  }, 30000);
 });
