@@ -3,13 +3,20 @@ import { Link, useNavigate } from 'react-router-dom';
 import { QueryClientContext } from '@tanstack/react-query';
 import { ApiClientError, apiRequest } from '../api/client.js';
 import { clearAuthQueryCache } from '../hooks/useAuthCacheIsolation.js';
-import { useAuthStore, type AuthUser } from '../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+  type AuthUser,
+} from '../stores/authStore.js';
 
 export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useContext(QueryClientContext);
   const setAuth = useAuthStore((s) => s.setAuth);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const isMountedRef = useRef(true);
+  const prevGenerationRef = useRef(sessionGeneration);
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -25,8 +32,17 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
     };
   }, []);
 
+  useEffect(() => {
+    if (prevGenerationRef.current !== sessionGeneration) {
+      prevGenerationRef.current = sessionGeneration;
+      setError(null);
+      setLoading(false);
+    }
+  }, [sessionGeneration]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const startSession = captureAuthSessionSnapshot();
     setError(null);
     setLoading(true);
 
@@ -50,11 +66,18 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
         return;
       }
 
+      if (!isSameAuthSession(startSession)) {
+        setError(
+          'Your signed-in session changed in another tab while this request was in flight. Please submit again if you still want to switch accounts.'
+        );
+        return;
+      }
+
       clearAuthQueryCache(queryClient);
       setAuth(data.user, data.accessToken, data.refreshToken);
       navigate('/');
     } catch (err) {
-      if (!isMountedRef.current) {
+      if (!isMountedRef.current || !isSameAuthSession(startSession)) {
         return;
       }
       if (err instanceof ApiClientError && err.code === 'EMAIL_DELIVERY_FAILED') {
@@ -65,7 +88,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
         setError(err instanceof Error ? err.message : 'Authentication failed');
       }
     } finally {
-      if (isMountedRef.current) {
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
         setLoading(false);
       }
     }

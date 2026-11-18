@@ -4,13 +4,19 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Users, UsersRound } from 'lucide-react';
 import { nprToPaisa, type TripMode } from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
-import { captureAuthSessionSnapshot, isSameAuthSession } from '../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+} from '../stores/authStore.js';
 
 export function CreateTripPage(): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const isMountedRef = useRef(true);
+  const prevGenerationRef = useRef(sessionGeneration);
   const initialMode = (searchParams.get('mode') === 'FAMILY' ? 'FAMILY' : 'FRIENDS') as TripMode;
 
   const [mode, setMode] = useState<TripMode>(initialMode);
@@ -29,6 +35,14 @@ export function CreateTripPage(): React.ReactElement {
       isMountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (prevGenerationRef.current !== sessionGeneration) {
+      prevGenerationRef.current = sessionGeneration;
+      setError(null);
+      setLoading(false);
+    }
+  }, [sessionGeneration]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

@@ -7,16 +7,20 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { App } from '../App.js';
 import { QuickAddExpenseModal } from '../components/expenses/QuickAddExpenseModal.js';
 import { AppShell } from '../components/layout/AppShell.js';
+import { useOfflineSync } from '../hooks/useOfflineSync.js';
 import { AcceptInvitePage } from '../pages/AcceptInvitePage.js';
+import { AuthPage } from '../pages/AuthPage.js';
 import { CreateTripPage } from '../pages/CreateTripPage.js';
 import { DashboardPage } from '../pages/DashboardPage.js';
 import { SettingsPage } from '../pages/SettingsPage.js';
 import { VerifyEmailPage } from '../pages/VerifyEmailPage.js';
 import { AUTH_STORAGE_KEY, useAuthStore, type AuthUser } from '../stores/authStore.js';
 import {
+  createOfflineQueueStore,
   getOfflineQueueStorageKey,
   LEGACY_OFFLINE_QUEUE_STORAGE_KEY,
   useOfflineQueueStore,
+  type OfflineQueueStore,
   type QueuedOfflineExpense,
 } from '../stores/offlineQueueStore.js';
 
@@ -131,9 +135,60 @@ function PathProbe() {
   return <div data-testid="current-path">{location.pathname}</div>;
 }
 
+function installTestWebLocks() {
+  const held = new Map<string, { waiters: Array<() => void> }>();
+  const request = (
+    name: string,
+    optsOrCb: LockOptions | LockGrantedCallback<unknown>,
+    maybeCb?: LockGrantedCallback<unknown>
+  ): Promise<unknown> => {
+    const opts: LockOptions = typeof optsOrCb === 'function' ? {} : optsOrCb;
+    const callback: LockGrantedCallback<unknown> =
+      typeof optsOrCb === 'function' ? optsOrCb : maybeCb!;
+
+    const acquireAndRun = async () => {
+      const state = held.get(name)!;
+      try {
+        return await callback({ name, mode: opts.mode ?? 'exclusive' } as Lock);
+      } finally {
+        const nextWaiter = state.waiters.shift();
+        if (nextWaiter) {
+          nextWaiter();
+        } else {
+          held.delete(name);
+        }
+      }
+    };
+
+    const existing = held.get(name);
+    if (existing) {
+      if (opts.ifAvailable) {
+        return Promise.resolve(callback(null));
+      }
+      return new Promise<void>((resolve) => {
+        existing.waiters.push(resolve);
+      }).then(acquireAndRun);
+    }
+
+    held.set(name, { waiters: [] });
+    return Promise.resolve().then(acquireAndRun);
+  };
+
+  Object.defineProperty(navigator, 'locks', {
+    value: { request },
+    configurable: true,
+  });
+}
+
 describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session guards (L-02)', () => {
+  const createdStores: OfflineQueueStore[] = [];
+
   beforeEach(() => {
     window.localStorage.clear();
+    Object.defineProperty(navigator, 'locks', {
+      value: undefined,
+      configurable: true,
+    });
     useAuthStore.setState({ user: null, accessToken: null, refreshToken: null });
     useOfflineQueueStore.setState({
       isOnline: true,
@@ -145,6 +200,13 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
   });
 
   afterEach(() => {
+    while (createdStores.length > 0) {
+      createdStores.pop()?.getState().destroy();
+    }
+    Object.defineProperty(navigator, 'locks', {
+      value: undefined,
+      configurable: true,
+    });
     cleanup();
     vi.restoreAllMocks();
   });
@@ -465,10 +527,10 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
 
     useOfflineQueueStore.getState().setOnlineStatus(false);
     useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
-    useOfflineQueueStore
+    await useOfflineQueueStore
       .getState()
       .enqueueExpense(makeQueuedEntry({ clientMutationId: 'mut-1', userId: 'user-a' }));
-    useOfflineQueueStore
+    await useOfflineQueueStore
       .getState()
       .enqueueExpense(makeQueuedEntry({ clientMutationId: 'mut-2', userId: 'user-a' }));
 
@@ -1008,5 +1070,461 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
 
     expect(screen.getByTestId('current-path').textContent).toBe('/trips/new');
     expect(createInvalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it('M-01: serializes concurrent multi-tab queue mutations and flush coordination via Web Locks without losing sibling entries', async () => {
+    installTestWebLocks();
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+
+    // Two independent tab stores sharing localStorage & navigator.locks (without cross-tab storage event delivery yet)
+    const tab1Store = createOfflineQueueStore({ bindWindowEvents: false });
+    const tab2Store = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(tab1Store, tab2Store);
+    tab1Store.getState().setOnlineStatus(false);
+    tab2Store.getState().setOnlineStatus(false);
+
+    // 1. Two tabs concurrently enqueue different expenses for the same user
+    const [ok1, ok2] = await Promise.all([
+      tab1Store.getState().enqueueExpense(makeQueuedEntry({ clientMutationId: 'tab-mut-1', userId: 'user-a' })),
+      tab2Store.getState().enqueueExpense(makeQueuedEntry({ clientMutationId: 'tab-mut-2', userId: 'user-a' })),
+    ]);
+    expect(ok1).toBe(true);
+    expect(ok2).toBe(true);
+
+    const persistedAfterConcurrentEnqueue = JSON.parse(
+      window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))!
+    ) as { queue: QueuedOfflineExpense[] };
+    expect(persistedAfterConcurrentEnqueue.queue.map((q) => q.clientMutationId).sort()).toEqual([
+      'tab-mut-1',
+      'tab-mut-2',
+    ]);
+
+    // 2. Tab 1 changes tab-mut-1 status while Tab 2 concurrently enqueues tab-mut-3
+    await Promise.all([
+      tab1Store.getState().markItemStatus('tab-mut-1', 'SYNCING', undefined, 'user-a'),
+      tab2Store.getState().enqueueExpense(makeQueuedEntry({ clientMutationId: 'tab-mut-3', userId: 'user-a' })),
+    ]);
+
+    const persistedAfterStatusAndEnqueue = JSON.parse(
+      window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))!
+    ) as { queue: QueuedOfflineExpense[] };
+    expect(
+      persistedAfterStatusAndEnqueue.queue
+        .map((q) => [q.clientMutationId, q.syncStatus])
+        .sort()
+    ).toEqual([
+      ['tab-mut-1', 'SYNCING'],
+      ['tab-mut-2', 'PENDING'],
+      ['tab-mut-3', 'PENDING'],
+    ]);
+
+    // 3. Tab 1 removes tab-mut-1 while Tab 2 concurrently enqueues tab-mut-4
+    await Promise.all([
+      tab1Store.getState().removeQueuedExpense('tab-mut-1', 'user-a'),
+      tab2Store.getState().enqueueExpense(makeQueuedEntry({ clientMutationId: 'tab-mut-4', userId: 'user-a' })),
+    ]);
+
+    const persistedAfterRemoveAndEnqueue = JSON.parse(
+      window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))!
+    ) as { queue: QueuedOfflineExpense[] };
+    expect(
+      persistedAfterRemoveAndEnqueue.queue.map((q) => q.clientMutationId).sort()
+    ).toEqual(['tab-mut-2', 'tab-mut-3', 'tab-mut-4']);
+
+    // 4. Concurrent flush attempts from two tabs coordinate via Web Locks { ifAvailable: true }
+    //    so only one tab transmits POST requests while the other stands down
+    window.localStorage.removeItem(getOfflineQueueStorageKey('user-a'));
+    await tab1Store.getState().refreshUserQueueFromStorage('user-a');
+    await tab2Store.getState().refreshUserQueueFromStorage('user-a');
+    await tab1Store
+      .getState()
+      .enqueueExpense(makeQueuedEntry({ clientMutationId: 'sync-single-1', userId: 'user-a' }));
+    await tab2Store.getState().refreshUserQueueFromStorage('user-a');
+
+    let resolveSharedPost!: (res: Response) => void;
+    const postMutationIds: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith('/trips/trip-1/expenses') && init?.method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as { clientMutationId: string };
+          postMutationIds.push(body.clientMutationId);
+          return new Promise<Response>((resolve) => {
+            resolveSharedPost = resolve;
+          });
+        }
+        throw new Error(`Unexpected fetch: ${String(input)}`);
+      })
+    );
+
+    let flushTab1!: () => Promise<void>;
+    let flushTab2!: () => Promise<void>;
+    function DualTabSyncProbe({
+      store,
+      assignFlush,
+    }: {
+      store: OfflineQueueStore;
+      assignFlush: (fn: () => Promise<void>) => void;
+    }) {
+      const { flushOfflineQueue } = useOfflineSync(store);
+      assignFlush(flushOfflineQueue);
+      return null;
+    }
+
+    tab1Store.getState().setOnlineStatus(true);
+    tab2Store.getState().setOnlineStatus(true);
+    const qcDual = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={qcDual}>
+        <DualTabSyncProbe store={tab1Store} assignFlush={(fn) => { flushTab1 = fn; }} />
+        <DualTabSyncProbe store={tab2Store} assignFlush={(fn) => { flushTab2 = fn; }} />
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => {
+      expect(postMutationIds).toHaveLength(1);
+    });
+    // Tab 2 triggers flush while Tab 1 holds the per-user sync lock -> must not duplicate POST
+    await flushTab2();
+    expect(postMutationIds).toEqual(['sync-single-1']);
+
+    resolveSharedPost(jsonResponse({ success: true, data: { expense: { id: 'exp-dual-1' } } }, 201));
+    await waitFor(() => {
+      expect(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))).toBeNull();
+    });
+    void flushTab1;
+
+    // 5. Fallback mode (without navigator.locks): within-tab concurrent Promise.all preserves both items cleanly
+    Object.defineProperty(navigator, 'locks', {
+      value: undefined,
+      configurable: true,
+    });
+    const fallbackStore = createOfflineQueueStore({ bindWindowEvents: false });
+    createdStores.push(fallbackStore);
+    fallbackStore.getState().setOnlineStatus(false);
+    await Promise.all([
+      fallbackStore.getState().enqueueExpense(makeQueuedEntry({ clientMutationId: 'fb-1', userId: 'user-a' })),
+      fallbackStore.getState().enqueueExpense(makeQueuedEntry({ clientMutationId: 'fb-2', userId: 'user-a' })),
+    ]);
+    expect(fallbackStore.getState().queue.map((q) => q.clientMutationId)).toEqual([
+      'fb-1',
+      'fb-2',
+    ]);
+  });
+
+  it('M-01 & L-01: preserves correct user-a queue when 201 arrives during account switch, ignores late user-a storage events while user-b is active, handles key===null storage clears, and retries FAILED items manually', async () => {
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    const userB = makeUser({ id: 'user-b', name: 'Bob', email: 'bob@example.com' });
+
+    useOfflineQueueStore.getState().setOnlineStatus(false);
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+    await useOfflineQueueStore
+      .getState()
+      .enqueueExpense(makeQueuedEntry({ clientMutationId: 'ok-1', userId: 'user-a' }));
+    await useOfflineQueueStore
+      .getState()
+      .enqueueExpense(makeQueuedEntry({ clientMutationId: 'ok-2', userId: 'user-a' }));
+
+    let resolveOk1!: (res: Response) => void;
+    const postedInOrder: Array<{ token: string | null; clientMutationId: string }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const auth = new Headers(init?.headers).get('Authorization');
+        if (url.endsWith('/auth/me')) {
+          return jsonResponse({
+            success: true,
+            data: { user: auth === 'Bearer tok-b' ? userB : userA },
+          });
+        }
+        if (url.endsWith('/trips/trip-1/expenses') && method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as { clientMutationId: string };
+          postedInOrder.push({ token: auth, clientMutationId: body.clientMutationId });
+          if (body.clientMutationId === 'ok-1') {
+            return new Promise<Response>((resolve) => {
+              resolveOk1 = resolve;
+            });
+          }
+          return jsonResponse({ success: true, data: { expense: { id: 'exp-ok-2' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
+
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<div>Home</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    // Go online to begin ok-1 POST
+    useOfflineQueueStore.getState().setOnlineStatus(true);
+    await waitFor(() => {
+      expect(postedInOrder).toEqual([{ token: 'Bearer tok-a', clientMutationId: 'ok-1' }]);
+    });
+
+    // Account switches to User B while ok-1 is in flight, then ok-1 returns HTTP 201
+    invalidateSpy.mockClear();
+    useAuthStore.getState().setAuth(userB, 'tok-b', 'ref-b');
+    resolveOk1(jsonResponse({ success: true, data: { expense: { id: 'exp-ok-1' } } }, 201));
+    await new Promise((r) => setTimeout(r, 30));
+
+    // ok-2 must NOT be submitted under User B, User B cache not invalidated, User B queue stays empty
+    expect(postedInOrder).toEqual([{ token: 'Bearer tok-a', clientMutationId: 'ok-1' }]);
+    expect(invalidateSpy).not.toHaveBeenCalled();
+    expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+    expect(useOfflineQueueStore.getState().isSyncing).toBe(false);
+
+    // Late storage event for User A arriving while User B is active is ignored cleanly
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key: getOfflineQueueStorageKey('user-a'),
+        newValue: window.localStorage.getItem(getOfflineQueueStorageKey('user-a')),
+        storageArea: window.localStorage,
+      })
+    );
+    expect(useOfflineQueueStore.getState().activeUserId).toBe('user-b');
+    expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+
+    // Switch back to User A: ok-1 was removed cleanly and only ok-2 resumes and syncs
+    useAuthStore.getState().setAuth(userA, 'tok-a2', 'ref-a2');
+    await waitFor(() => {
+      expect(postedInOrder).toEqual([
+        { token: 'Bearer tok-a', clientMutationId: 'ok-1' },
+        { token: 'Bearer tok-a2', clientMutationId: 'ok-2' },
+      ]);
+    });
+    await waitFor(() => {
+      expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+    });
+
+    // StorageEvent with key === null clears queue and resets activeUserId without hydrating legacy items
+    useOfflineQueueStore.getState().setOnlineStatus(false);
+    await useOfflineQueueStore
+      .getState()
+      .enqueueExpense(makeQueuedEntry({ clientMutationId: 'clear-evt-1', userId: 'user-a' }));
+    expect(useOfflineQueueStore.getState().activeUserId).toBe('user-a');
+    expect(useOfflineQueueStore.getState().queue).toHaveLength(1);
+
+    window.localStorage.clear();
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key: null,
+        newValue: null,
+        storageArea: window.localStorage,
+      })
+    );
+    expect(useOfflineQueueStore.getState().activeUserId).toBeNull();
+    expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+    expect(useAuthStore.getState().user).toBeNull();
+
+    // Failed expense synchronization preserves FAILED + error across reload and succeeds on manual "Sync Now" retry
+    cleanup();
+    let failAttempts = 0;
+    const retryIds: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.endsWith('/auth/me')) {
+          return jsonResponse({ success: true, data: { user: userA } });
+        }
+        if (url.endsWith('/trips/trip-1/expenses') && method === 'POST') {
+          const body = JSON.parse(String(init?.body)) as { clientMutationId: string };
+          retryIds.push(body.clientMutationId);
+          failAttempts += 1;
+          if (failAttempts === 1) {
+            return jsonResponse(
+              { success: false, error: { code: 'SERVER_BUSY', message: 'Temporary Outage' } },
+              503
+            );
+          }
+          return jsonResponse({ success: true, data: { expense: { id: 'exp-retried' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    useOfflineQueueStore.getState().setOnlineStatus(false);
+    useAuthStore.getState().setAuth(userA, 'tok-a3', 'ref-a3');
+    await useOfflineQueueStore
+      .getState()
+      .enqueueExpense(makeQueuedEntry({ clientMutationId: 'retry-mut-1', userId: 'user-a' }));
+
+    const qcRetry = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qcRetry}>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<div>Home</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    useOfflineQueueStore.getState().setOnlineStatus(true);
+    await waitFor(() => {
+      expect(useOfflineQueueStore.getState().queue[0]?.syncStatus).toBe('FAILED');
+    });
+    expect(useOfflineQueueStore.getState().queue[0]?.lastError).toBe('Temporary Outage');
+    expect(retryIds).toEqual(['retry-mut-1']);
+
+    // Manual retry via "Sync Now" reuses exact clientMutationId and clears queue on 201
+    fireEvent.click(screen.getByRole('button', { name: /Sync Now/i }));
+    await waitFor(() => {
+      expect(useOfflineQueueStore.getState().queue).toHaveLength(0);
+    });
+    expect(retryIds).toEqual(['retry-mut-1', 'retry-mut-1']);
+    expect(window.localStorage.getItem(getOfflineQueueStorageKey('user-a'))).toBeNull();
+  });
+
+  it('L-02: blocks stale AuthPage login completion after cross-tab account switch and clears CreateTripPage stale error banner on switch', async () => {
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    const userB = makeUser({ id: 'user-b', name: 'Bob', email: 'bob@example.com' });
+
+    let loginCount = 0;
+    let resolveStaleLogin!: (res: Response) => void;
+    let tripCount = 0;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        if (url.endsWith('/auth/login') && method === 'POST') {
+          loginCount += 1;
+          if (loginCount === 1) {
+            return new Promise<Response>((resolve) => {
+              resolveStaleLogin = resolve;
+            });
+          }
+          return jsonResponse({
+            success: true,
+            data: { user: userA, accessToken: 'tok-a-fresh', refreshToken: 'ref-a-fresh' },
+          });
+        }
+        if (url.endsWith('/trips') && method === 'POST') {
+          tripCount += 1;
+          if (tripCount === 1) {
+            return jsonResponse(
+              { success: false, error: { code: 'VALIDATION_ERROR', message: 'Stale Trip Error' } },
+              400
+            );
+          }
+          return jsonResponse({ success: true, data: { trip: { id: 'trip-b-valid' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      })
+    );
+
+    // 1. AuthPage stale login completion cannot overwrite newer cross-tab session
+    const qcAuth = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qcAuth}>
+        <MemoryRouter initialEntries={['/login']}>
+          <Routes>
+            <Route path="/login" element={<><AuthPage mode="login" /><PathProbe /></>} />
+            <Route path="/" element={<PathProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    fireEvent.change(screen.getByPlaceholderText('you@example.com'), {
+      target: { value: userA.email },
+    });
+    fireEvent.change(screen.getByPlaceholderText('••••••••'), {
+      target: { value: 'Password123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Sign In$/i }));
+
+    // Tab 2 signs in as User B via cross-tab storage event before Tab 1 resolves
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key: AUTH_STORAGE_KEY,
+        newValue: JSON.stringify({
+          state: { user: userB, accessToken: 'tok-b-tab2', refreshToken: 'ref-b-tab2' },
+          version: 0,
+        }),
+        storageArea: window.localStorage,
+      })
+    );
+    expect(useAuthStore.getState().user?.id).toBe('user-b');
+
+    resolveStaleLogin(
+      jsonResponse({
+        success: true,
+        data: { user: userA, accessToken: 'tok-a-stale', refreshToken: 'ref-a-stale' },
+      })
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/session changed in another tab/i)).toBeInTheDocument();
+    });
+    expect(useAuthStore.getState().user?.id).toBe('user-b');
+    expect(useAuthStore.getState().accessToken).toBe('tok-b-tab2');
+    expect(screen.getByTestId('current-path').textContent).toBe('/login');
+
+    // Legitimate subsequent re-submit when no competing transition occurs still succeeds cleanly
+    fireEvent.click(screen.getByRole('button', { name: /^Sign In$/i }));
+    await waitFor(() => {
+      expect(useAuthStore.getState().user?.id).toBe('user-a');
+      expect(useAuthStore.getState().accessToken).toBe('tok-a-fresh');
+      expect(screen.getByTestId('current-path').textContent).toBe('/');
+    });
+
+    // 2. CreateTripPage clears stale error notice after account switch and preserves valid submission
+    cleanup();
+    useAuthStore.getState().setAuth(userA, 'tok-a-fresh', 'ref-a-fresh');
+    const qcCreate = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qcCreate}>
+        <MemoryRouter initialEntries={['/trips/new']}>
+          <Routes>
+            <Route path="/trips/new" element={<><CreateTripPage /><PathProbe /></>} />
+            <Route path="/trips/:tripId" element={<PathProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    fireEvent.change(screen.getByPlaceholderText(/Mustang Bike Trip/i), {
+      target: { value: 'Bad Trip' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Create Trip/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Stale Trip Error/i)).toBeInTheDocument();
+    });
+
+    // Account switch clears stale error banner immediately
+    useAuthStore.getState().setAuth(userB, 'tok-b2', 'ref-b2');
+    await waitFor(() => {
+      expect(screen.queryByText(/Stale Trip Error/i)).not.toBeInTheDocument();
+    });
+
+    // Same-session valid submission under User B still navigates cleanly
+    fireEvent.change(screen.getByPlaceholderText(/Mustang Bike Trip/i), {
+      target: { value: 'Valid Bob Trip' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Create Trip/i }));
+    await waitFor(() => {
+      expect(screen.getByTestId('current-path').textContent).toBe('/trips/trip-b-valid');
+    });
   });
 });
