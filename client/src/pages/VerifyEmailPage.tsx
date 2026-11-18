@@ -2,14 +2,21 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { AlertTriangle, CheckCircle2, MailCheck, XCircle } from 'lucide-react';
 import { apiRequest } from '../api/client.js';
-import { useAuthStore } from '../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+} from '../stores/authStore.js';
 
 export function VerifyEmailPage(): React.ReactElement {
   const [searchParams, setSearchParams] = useSearchParams();
   const initialTokenRef = useRef(searchParams.get('token')?.trim() ?? '');
   const initialToken = initialTokenRef.current;
   const user = useAuthStore((s) => s.user);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const updateUser = useAuthStore((s) => s.updateUser);
+  const isMountedRef = useRef(true);
+  const prevGenerationRef = useRef(sessionGeneration);
 
   const [manualToken, setManualToken] = useState('');
   const [status, setStatus] = useState<'idle' | 'submitting' | 'verified' | 'error'>(
@@ -24,6 +31,24 @@ export function VerifyEmailPage(): React.ReactElement {
   } | null>(null);
   const autoSubmittedRef = useRef(false);
 
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (prevGenerationRef.current !== sessionGeneration) {
+      prevGenerationRef.current = sessionGeneration;
+      setMessage(null);
+      setSessionMismatchNotice(null);
+      setResendNotice(null);
+      setResending(false);
+      setStatus((prev) => (prev === 'idle' ? prev : 'idle'));
+    }
+  }, [sessionGeneration]);
+
   const submitVerification = async (tokenValue: string) => {
     const trimmed = tokenValue.trim();
     if (!trimmed) {
@@ -32,6 +57,7 @@ export function VerifyEmailPage(): React.ReactElement {
       return;
     }
 
+    const startSession = captureAuthSessionSnapshot();
     setStatus('submitting');
     setMessage(null);
     setSessionMismatchNotice(null);
@@ -46,6 +72,10 @@ export function VerifyEmailPage(): React.ReactElement {
         body: JSON.stringify({ token: trimmed }),
       });
 
+      if (!isSameAuthSession(startSession)) {
+        return;
+      }
+
       const currentUser = useAuthStore.getState().user;
       if (currentUser && res.userId && currentUser.id === res.userId) {
         updateUser(
@@ -57,17 +87,23 @@ export function VerifyEmailPage(): React.ReactElement {
           res.userId
         );
       } else if (currentUser && currentUser.id !== res.userId) {
-        setSessionMismatchNotice(
-          'This link verified a different TripLedger account. Your currently signed-in account was left unchanged.'
+        if (isMountedRef.current) {
+          setSessionMismatchNotice(
+            'This link verified a different TripLedger account. Your currently signed-in account was left unchanged.'
+          );
+        }
+      }
+      if (isMountedRef.current) {
+        setStatus('verified');
+        setMessage('Your email address has been verified.');
+      }
+    } catch (err) {
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setStatus('error');
+        setMessage(
+          err instanceof Error ? err.message : 'Verification link is invalid or has expired.'
         );
       }
-      setStatus('verified');
-      setMessage('Your email address has been verified.');
-    } catch (err) {
-      setStatus('error');
-      setMessage(
-        err instanceof Error ? err.message : 'Verification link is invalid or has expired.'
-      );
     }
   };
 
@@ -99,7 +135,10 @@ export function VerifyEmailPage(): React.ReactElement {
   };
 
   const handleResendVerification = async () => {
-    const actingUserId = useAuthStore.getState().user?.id;
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      return;
+    }
     setResending(true);
     setResendNotice(null);
     try {
@@ -109,24 +148,34 @@ export function VerifyEmailPage(): React.ReactElement {
         emailVerified: boolean;
       }>('/auth/resend-verification', { method: 'POST' });
 
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+
       const currentUser = useAuthStore.getState().user;
-      if (res.alreadyVerified && currentUser && (!actingUserId || currentUser.id === actingUserId)) {
-        updateUser({ ...currentUser, emailVerified: true }, actingUserId);
-        setStatus('verified');
-        setMessage('Your email address is already verified.');
-      } else {
+      if (res.alreadyVerified && currentUser && currentUser.id === startSession.userId) {
+        updateUser({ ...currentUser, emailVerified: true }, startSession.userId);
+        if (isMountedRef.current) {
+          setStatus('verified');
+          setMessage('Your email address is already verified.');
+        }
+      } else if (isMountedRef.current) {
         setResendNotice({
           type: 'success',
           text: 'A new verification email has been sent. Check your inbox for the latest link.',
         });
       }
     } catch (err) {
-      setResendNotice({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to send verification email.',
-      });
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setResendNotice({
+          type: 'error',
+          text: err instanceof Error ? err.message : 'Failed to send verification email.',
+        });
+      }
     } finally {
-      setResending(false);
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setResending(false);
+      }
     }
   };
 

@@ -1,12 +1,20 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, MailWarning } from 'lucide-react';
 import { apiRequest } from '../api/client.js';
-import { useAuthStore, type AuthUser } from '../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+  type AuthUser,
+} from '../stores/authStore.js';
 
 export function SettingsPage(): React.ReactElement {
   const user = useAuthStore((s) => s.user);
   const accessToken = useAuthStore((s) => s.accessToken);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const updateUser = useAuthStore((s) => s.updateUser);
+  const isMountedRef = useRef(true);
+  const prevGenerationRef = useRef(sessionGeneration);
 
   const [name, setName] = useState(user?.name ?? '');
   const [phone, setPhone] = useState(user?.phone ?? '');
@@ -16,6 +24,22 @@ export function SettingsPage(): React.ReactElement {
   } | null>(null);
   const [saving, setSaving] = useState(false);
   const [resending, setResending] = useState(false);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (prevGenerationRef.current !== sessionGeneration) {
+      prevGenerationRef.current = sessionGeneration;
+      setStatusBanner(null);
+      setSaving(false);
+      setResending(false);
+    }
+  }, [sessionGeneration]);
 
   useEffect(() => {
     setName(user?.name ?? '');
@@ -54,7 +78,10 @@ export function SettingsPage(): React.ReactElement {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    const actingUserId = useAuthStore.getState().user?.id;
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      return;
+    }
     setSaving(true);
     setStatusBanner(null);
     try {
@@ -62,20 +89,32 @@ export function SettingsPage(): React.ReactElement {
         method: 'PATCH',
         body: JSON.stringify({ name, phone }),
       });
-      updateUser(res.user, actingUserId);
-      setStatusBanner({ type: 'info', text: 'Profile updated successfully.' });
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+      updateUser(res.user, startSession.userId);
+      if (isMountedRef.current) {
+        setStatusBanner({ type: 'info', text: 'Profile updated successfully.' });
+      }
     } catch (err) {
-      setStatusBanner({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to update profile',
-      });
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setStatusBanner({
+          type: 'error',
+          text: err instanceof Error ? err.message : 'Failed to update profile',
+        });
+      }
     } finally {
-      setSaving(false);
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setSaving(false);
+      }
     }
   };
 
   const handleResendVerification = async () => {
-    const actingUserId = useAuthStore.getState().user?.id;
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      return;
+    }
     setResending(true);
     setStatusBanner(null);
     try {
@@ -85,23 +124,33 @@ export function SettingsPage(): React.ReactElement {
         emailVerified: boolean;
       }>('/auth/resend-verification', { method: 'POST' });
 
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+
       const currentUser = useAuthStore.getState().user;
-      if (res.alreadyVerified && currentUser && (!actingUserId || currentUser.id === actingUserId)) {
-        updateUser({ ...currentUser, emailVerified: true }, actingUserId);
-        setStatusBanner({ type: 'info', text: 'Your email address is already verified.' });
-      } else {
+      if (res.alreadyVerified && currentUser && currentUser.id === startSession.userId) {
+        updateUser({ ...currentUser, emailVerified: true }, startSession.userId);
+        if (isMountedRef.current) {
+          setStatusBanner({ type: 'info', text: 'Your email address is already verified.' });
+        }
+      } else if (isMountedRef.current) {
         setStatusBanner({
           type: 'info',
           text: 'Verification email sent. Check your inbox for the verification link.',
         });
       }
     } catch (err) {
-      setStatusBanner({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to send verification email',
-      });
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setStatusBanner({
+          type: 'error',
+          text: err instanceof Error ? err.message : 'Failed to send verification email',
+        });
+      }
     } finally {
-      setResending(false);
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setResending(false);
+      }
     }
   };
 

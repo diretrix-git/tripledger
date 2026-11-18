@@ -1,4 +1,4 @@
-import React, { useContext, useState } from 'react';
+import React, { useContext, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { QueryClientContext } from '@tanstack/react-query';
 import { ApiClientError, apiRequest } from '../api/client.js';
@@ -9,6 +9,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
   const navigate = useNavigate();
   const queryClient = useContext(QueryClientContext);
   const setAuth = useAuthStore((s) => s.setAuth);
+  const isMountedRef = useRef(true);
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -16,6 +17,13 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
   const [phone, setPhone] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -38,10 +46,17 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
         body: JSON.stringify(body),
       });
 
+      if (!isMountedRef.current) {
+        return;
+      }
+
       clearAuthQueryCache(queryClient);
       setAuth(data.user, data.accessToken, data.refreshToken);
       navigate('/');
     } catch (err) {
+      if (!isMountedRef.current) {
+        return;
+      }
       if (err instanceof ApiClientError && err.code === 'EMAIL_DELIVERY_FAILED') {
         setError(
           'Your account was created, but sending the verification email failed. Please sign in and resend verification from Settings.'
@@ -50,7 +65,9 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
         setError(err instanceof Error ? err.message : 'Authentication failed');
       }
     } finally {
-      setLoading(false);
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 

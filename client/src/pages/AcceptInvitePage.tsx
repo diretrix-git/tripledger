@@ -4,7 +4,11 @@ import { useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, KeyRound, MailWarning, ShieldCheck, XCircle } from 'lucide-react';
 import type { ParticipantEntity, TripRole, TripSummaryEntity } from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
-import { useAuthStore } from '../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+} from '../stores/authStore.js';
 
 function extractInviteTokenInput(rawInput: string): string {
   const trimmed = rawInput.trim();
@@ -23,10 +27,13 @@ export function AcceptInvitePage(): React.ReactElement {
   const [searchParams, setSearchParams] = useSearchParams();
   const initialTokenRef = useRef<string>(searchParams.get('token')?.trim() ?? '');
   const queryClient = useQueryClient();
+  const isMountedRef = useRef(true);
 
   const user = useAuthStore((s) => s.user);
   const accessToken = useAuthStore((s) => s.accessToken);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
   const updateUser = useAuthStore((s) => s.updateUser);
+  const prevGenerationRef = useRef(sessionGeneration);
 
   const [tokenInput, setTokenInput] = useState(initialTokenRef.current);
   const [submitting, setSubmitting] = useState(false);
@@ -38,6 +45,24 @@ export function AcceptInvitePage(): React.ReactElement {
     tripName: string;
     role: TripRole;
   } | null>(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (prevGenerationRef.current !== sessionGeneration) {
+      prevGenerationRef.current = sessionGeneration;
+      setClaimedResult(null);
+      setErrorMessage(null);
+      setResendNotice(null);
+      setSubmitting(false);
+      setResending(false);
+    }
+  }, [sessionGeneration]);
 
   useEffect(() => {
     if (searchParams.has('token')) {
@@ -57,7 +82,10 @@ export function AcceptInvitePage(): React.ReactElement {
   }, [searchParams, setSearchParams]);
 
   const handleResendVerification = async () => {
-    const actingUserId = useAuthStore.getState().user?.id;
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      return;
+    }
     setResending(true);
     setResendNotice(null);
     setErrorMessage(null);
@@ -68,17 +96,29 @@ export function AcceptInvitePage(): React.ReactElement {
         emailVerified: boolean;
       }>('/auth/resend-verification', { method: 'POST' });
 
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+
       const currentUser = useAuthStore.getState().user;
-      if (res.alreadyVerified && currentUser && (!actingUserId || currentUser.id === actingUserId)) {
-        updateUser({ ...currentUser, emailVerified: true }, actingUserId);
-        setResendNotice('Your email address is already verified. You can now accept this invitation.');
-      } else {
+      if (res.alreadyVerified && currentUser && currentUser.id === startSession.userId) {
+        updateUser({ ...currentUser, emailVerified: true }, startSession.userId);
+        if (isMountedRef.current) {
+          setResendNotice(
+            'Your email address is already verified. You can now accept this invitation.'
+          );
+        }
+      } else if (isMountedRef.current) {
         setResendNotice('Verification email sent. Check your inbox and verify before accepting.');
       }
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Failed to send verification email.');
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setErrorMessage(err instanceof Error ? err.message : 'Failed to send verification email.');
+      }
     } finally {
-      setResending(false);
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setResending(false);
+      }
     }
   };
 
@@ -87,6 +127,11 @@ export function AcceptInvitePage(): React.ReactElement {
     const token = extractInviteTokenInput(tokenInput);
     if (!token) {
       setErrorMessage('Please enter your invitation token.');
+      return;
+    }
+
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
       return;
     }
 
@@ -103,24 +148,34 @@ export function AcceptInvitePage(): React.ReactElement {
         body: JSON.stringify({ token }),
       });
 
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['dashboard'] }),
-        queryClient.invalidateQueries({ queryKey: ['trips'] }),
-        queryClient.invalidateQueries({ queryKey: ['trip', res.tripId] }),
-        queryClient.invalidateQueries({ queryKey: ['pending-invites'] }),
+        queryClient.invalidateQueries({ queryKey: ['dashboard', startSession.userId] }),
+        queryClient.invalidateQueries({ queryKey: ['trips', startSession.userId] }),
+        queryClient.invalidateQueries({ queryKey: ['trip', res.tripId, startSession.userId] }),
+        queryClient.invalidateQueries({ queryKey: ['pending-invites', startSession.userId] }),
       ]);
 
-      setClaimedResult({
-        tripId: res.tripId,
-        tripName: res.trip.name,
-        role: res.role,
-      });
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setClaimedResult({
+          tripId: res.tripId,
+          tripName: res.trip.name,
+          role: res.role,
+        });
+      }
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Unable to redeem this invitation.'
-      );
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setErrorMessage(
+          err instanceof Error ? err.message : 'Unable to redeem this invitation.'
+        );
+      }
     } finally {
-      setSubmitting(false);
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setSubmitting(false);
+      }
     }
   };
 

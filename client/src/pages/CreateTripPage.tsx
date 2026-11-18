@@ -1,14 +1,16 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { Users, UsersRound } from 'lucide-react';
 import { nprToPaisa, type TripMode } from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
+import { captureAuthSessionSnapshot, isSameAuthSession } from '../stores/authStore.js';
 
 export function CreateTripPage(): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
+  const isMountedRef = useRef(true);
   const initialMode = (searchParams.get('mode') === 'FAMILY' ? 'FAMILY' : 'FRIENDS') as TripMode;
 
   const [mode, setMode] = useState<TripMode>(initialMode);
@@ -21,8 +23,21 @@ export function CreateTripPage(): React.ReactElement {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      setError('You must be signed in to create a trip.');
+      return;
+    }
+
     setError(null);
     setLoading(true);
 
@@ -44,13 +59,23 @@ export function CreateTripPage(): React.ReactElement {
         }),
       });
 
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      await queryClient.invalidateQueries({ queryKey: ['trips'] });
-      navigate(`/trips/${res.trip.id}`);
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+
+      await queryClient.invalidateQueries({ queryKey: ['dashboard', startSession.userId] });
+      await queryClient.invalidateQueries({ queryKey: ['trips', startSession.userId] });
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        navigate(`/trips/${res.trip.id}`);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create trip');
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setError(err instanceof Error ? err.message : 'Failed to create trip');
+      }
     } finally {
-      setLoading(false);
+      if (isMountedRef.current && isSameAuthSession(startSession)) {
+        setLoading(false);
+      }
     }
   };
 

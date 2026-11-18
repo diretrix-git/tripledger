@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -18,7 +18,11 @@ import {
   type TripStatus,
 } from '@tripledger/shared';
 import { apiRequest } from '../api/client.js';
-import { useAuthStore } from '../stores/authStore.js';
+import {
+  captureAuthSessionSnapshot,
+  isSameAuthSession,
+  useAuthStore,
+} from '../stores/authStore.js';
 
 export interface DashboardTripSummary {
   id: string;
@@ -61,8 +65,25 @@ export function DashboardPage(): React.ReactElement {
   const queryClient = useQueryClient();
   const user = useAuthStore((s) => s.user);
   const accessToken = useAuthStore((s) => s.accessToken);
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration);
+  const isMountedRef = useRef(true);
+  const prevGenerationRef = useRef(sessionGeneration);
   const [inviteCode, setInviteCode] = useState('');
   const [joinError, setJoinError] = useState<string | null>(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (prevGenerationRef.current !== sessionGeneration) {
+      prevGenerationRef.current = sessionGeneration;
+      setJoinError(null);
+    }
+  }, [sessionGeneration]);
 
   const { data, isLoading } = useQuery({
     queryKey: ['dashboard', user?.id ?? null],
@@ -84,15 +105,28 @@ export function DashboardPage(): React.ReactElement {
     setJoinError(null);
     if (!inviteCode.trim()) return;
 
+    const startSession = captureAuthSessionSnapshot();
+    if (!startSession.hasAccessToken || !startSession.userId) {
+      return;
+    }
+
     try {
       const res = await apiRequest<{ trip: { id: string } }>(
         `/trips/join/${inviteCode.trim().toUpperCase()}`,
         { method: 'POST' }
       );
-      await queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      navigate(`/trips/${res.trip.id}`);
+      if (!isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ['dashboard', startSession.userId] });
+      await queryClient.invalidateQueries({ queryKey: ['trips', startSession.userId] });
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        navigate(`/trips/${res.trip.id}`);
+      }
     } catch (err) {
-      setJoinError(err instanceof Error ? err.message : 'Invalid invite code');
+      if (isMountedRef.current && isSameAuthSession(startSession, { requireAuthenticated: true })) {
+        setJoinError(err instanceof Error ? err.message : 'Invalid invite code');
+      }
     }
   };
 
