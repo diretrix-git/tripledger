@@ -60,18 +60,37 @@ interface PersistedUserQueueEnvelope {
   queue: QueuedOfflineExpense[];
 }
 
+export type SyncLockAcquisitionContext = {
+  exclusiveCrossTab: boolean;
+};
+
+export type SyncLockResult =
+  | { status: 'executed'; exclusiveCrossTab: boolean }
+  | { status: 'busy' }
+  | { status: 'failed' };
+
 export interface OfflineQueueState {
   isOnline: boolean;
   isSyncing: boolean;
   activeUserId: string | null;
   queue: QueuedOfflineExpense[];
   legacyDiscardedCount: number;
+  crossTabCoordinationDegraded: boolean;
+  syncError: string | null;
   setOnlineStatus: (online: boolean) => void;
   setSyncing: (syncing: boolean) => void;
   dismissLegacyNotice: () => void;
+  dismissSyncError: () => void;
   syncAuthContext: () => void;
-  refreshUserQueueFromStorage: (expectedUserId?: string) => Promise<QueuedOfflineExpense[]>;
-  tryWithUserSyncLock: (userId: string, work: () => Promise<void>) => Promise<boolean>;
+  refreshUserQueueFromStorage: (
+    expectedUserId?: string,
+    options?: { recoverOrphanedSyncing?: boolean }
+  ) => Promise<QueuedOfflineExpense[]>;
+  tryWithUserSyncLock: (
+    userId: string,
+    work: (context: SyncLockAcquisitionContext) => Promise<void>,
+    options?: { waitForLock?: boolean }
+  ) => Promise<SyncLockResult>;
   enqueueExpense: (
     item: Omit<QueuedOfflineExpense, 'syncStatus' | 'queuedAt'>
   ) => Promise<boolean>;
@@ -107,6 +126,10 @@ function getLockManagerSafely(): LockManager | null {
   } catch {
     return null;
   }
+}
+
+export function hasWebLocksSupport(): boolean {
+  return getLockManagerSafely() !== null;
 }
 
 function resolveAuthenticatedUserId(): string | null {
@@ -293,7 +316,11 @@ function discardLegacyUnscopedQueue(): number {
  * Cross-tab concurrency guarantees:
  * - Primary: When the Web Locks API (`navigator.locks`) is available, queue read-merge-write
  *   mutations serialize under an exclusive per-user mutation lock, and queue flushing uses
- *   `{ ifAvailable: true }` leader election under a separate per-user sync lock.
+ *   `{ ifAvailable: true }` leader election (or blocking wait for orphaned `SYNCING` recovery)
+ *   under a separate per-user sync lock.
+ * - Lock failures: If `navigator.locks.request()` rejects asynchronously, mutations fall back to
+ *   in-tab FIFO serialization + live `localStorage` merge without claiming cross-tab exclusion,
+ *   while sync refuses unsafe concurrent flushing until exclusive lock ownership can be obtained.
  * - Fallback: When `navigator.locks` is unavailable (older browsers or Node/non-lock test hosts),
  *   a per-tab Promise mutex serializes operations within the tab and reconciles against live
  *   `localStorage` state before writing, without claiming cross-tab atomic mutual exclusion;
@@ -309,13 +336,39 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
     const runOperation = async (): Promise<T> => {
       const lockManager = getLockManagerSafely();
       if (lockManager) {
-        return lockManager.request(
-          getMutationLockName(userId),
-          { mode: 'exclusive' },
-          () => Promise.resolve(work())
-        );
+        let lockGranted = false;
+        try {
+          return await lockManager.request(
+            getMutationLockName(userId),
+            { mode: 'exclusive' },
+            async () => {
+              lockGranted = true;
+              if (
+                store.getState().activeUserId === userId &&
+                store.getState().crossTabCoordinationDegraded
+              ) {
+                store.setState({ crossTabCoordinationDegraded: false });
+              }
+              return await Promise.resolve(work());
+            }
+          );
+        } catch (err) {
+          if (lockGranted) {
+            throw err;
+          }
+          // Web Locks acquisition failed before entering `work()`. Degrade explicitly to in-tab
+          // FIFO serialization + live localStorage merge without claiming cross-tab mutual exclusion.
+          console.warn(
+            '[TripLedger] Web Locks mutation acquisition failed; continuing with in-tab serialization without cross-tab lock guarantee.',
+            err
+          );
+          if (store.getState().activeUserId === userId) {
+            store.setState({ crossTabCoordinationDegraded: true });
+          }
+          return await Promise.resolve(work());
+        }
       }
-      return work();
+      return await Promise.resolve(work());
     };
 
     const resultPromise = prevChain.then(runOperation, runOperation);
@@ -346,9 +399,12 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
     activeUserId: initialAuthUserId,
     queue: initialQueue,
     legacyDiscardedCount: initialLegacyDiscarded,
+    crossTabCoordinationDegraded: false,
+    syncError: null,
     setOnlineStatus: (isOnline) => set({ isOnline }),
     setSyncing: (isSyncing) => set({ isSyncing }),
     dismissLegacyNotice: () => set({ legacyDiscardedCount: 0 }),
+    dismissSyncError: () => set({ syncError: null }),
     syncAuthContext: () => {
       const nextUserId = resolveAuthenticatedUserId();
       const discardedNow = discardLegacyUnscopedQueue();
@@ -359,13 +415,17 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
           prevState.activeUserId !== null ||
           prevState.queue.length > 0 ||
           prevState.isSyncing ||
-          prevState.legacyDiscardedCount !== 0
+          prevState.legacyDiscardedCount !== 0 ||
+          prevState.crossTabCoordinationDegraded ||
+          prevState.syncError !== null
         ) {
           set({
             activeUserId: null,
             queue: [],
             isSyncing: false,
             legacyDiscardedCount: 0,
+            crossTabCoordinationDegraded: false,
+            syncError: null,
           });
         }
         return;
@@ -378,6 +438,8 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
           queue: nextQueue,
           isSyncing: false,
           legacyDiscardedCount: discardedNow,
+          crossTabCoordinationDegraded: false,
+          syncError: null,
         });
         return;
       }
@@ -396,39 +458,96 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
         }));
       }
     },
-    refreshUserQueueFromStorage: async (expectedUserId) => {
+    refreshUserQueueFromStorage: async (expectedUserId, options) => {
       const targetUserId = expectedUserId ?? get().activeUserId;
       if (!targetUserId) {
         return [];
       }
       return runWithUserQueueLock(targetUserId, () => {
         const storage = getLocalStorageSafely();
-        const latestQueue = storage
+        const baseQueue = storage
           ? readUserQueueFromStorage(targetUserId, { recoverStuckSyncing: false })
           : get().queue.filter((q) => q.userId === targetUserId);
-        if (get().activeUserId === targetUserId) {
-          set({ queue: latestQueue });
+
+        let nextQueue = baseQueue;
+        if (
+          options?.recoverOrphanedSyncing &&
+          baseQueue.some((q) => q.syncStatus === 'SYNCING')
+        ) {
+          nextQueue = baseQueue.map((q) =>
+            q.syncStatus === 'SYNCING' ? { ...q, syncStatus: 'PENDING' as const } : q
+          );
+          if (storage) {
+            writeUserQueueToStorage(targetUserId, nextQueue);
+          }
         }
-        return latestQueue;
+
+        if (get().activeUserId === targetUserId) {
+          set({ queue: nextQueue });
+        }
+        return nextQueue;
       });
     },
-    tryWithUserSyncLock: async (userId, work) => {
+    tryWithUserSyncLock: async (userId, work, options) => {
       const lockManager = getLockManagerSafely();
-      if (lockManager) {
-        return lockManager.request(
+      if (!lockManager) {
+        await work({ exclusiveCrossTab: false });
+        return { status: 'executed', exclusiveCrossTab: false };
+      }
+
+      let lockGranted = false;
+      try {
+        const result = await lockManager.request(
           getSyncLockName(userId),
-          { mode: 'exclusive', ifAvailable: true },
+          options?.waitForLock
+            ? { mode: 'exclusive' }
+            : { mode: 'exclusive', ifAvailable: true },
           async (lock) => {
             if (!lock) {
-              return false;
+              return 'busy' as const;
             }
-            await work();
-            return true;
+            lockGranted = true;
+            if (
+              get().activeUserId === userId &&
+              (get().syncError !== null || get().crossTabCoordinationDegraded)
+            ) {
+              set({ syncError: null, crossTabCoordinationDegraded: false });
+            }
+            await work({ exclusiveCrossTab: true });
+            return 'executed' as const;
           }
         );
+        if (result === 'busy') {
+          return { status: 'busy' };
+        }
+        return { status: 'executed', exclusiveCrossTab: true };
+      } catch (err) {
+        if (lockGranted) {
+          console.warn('[TripLedger] Offline queue synchronization interrupted cleanly:', err);
+          if (get().activeUserId === userId) {
+            set({
+              isSyncing: false,
+              syncError: 'Offline expense synchronization was interrupted. Click Sync Now to retry.',
+            });
+          }
+          return { status: 'failed' };
+        }
+        // Web Locks exists yet exclusive lock acquisition failed: avoid unsafe concurrent flushing
+        // when cross-tab ownership cannot be established.
+        console.warn(
+          '[TripLedger] Failed to acquire exclusive cross-tab sync lock; skipping flush cleanly.',
+          err
+        );
+        if (get().activeUserId === userId) {
+          set({
+            isSyncing: false,
+            crossTabCoordinationDegraded: true,
+            syncError:
+              'Unable to establish exclusive cross-tab sync lock. Queued expenses remain saved locally; click Sync Now to retry.',
+          });
+        }
+        return { status: 'failed' };
       }
-      await work();
-      return true;
     },
     enqueueExpense: async (item) => {
       const startSession = captureAuthSessionSnapshot();
@@ -561,7 +680,13 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
       if (event.key === null) {
         // Storage was cleared globally: ensure auth context & queue state are reconciled,
         // never leaving activeUserId stale or hydrating another user's items.
-        store.setState({ queue: [], isSyncing: false, legacyDiscardedCount: 0 });
+        store.setState({
+          queue: [],
+          isSyncing: false,
+          legacyDiscardedCount: 0,
+          crossTabCoordinationDegraded: false,
+          syncError: null,
+        });
         store.getState().syncAuthContext();
         return;
       }
@@ -582,7 +707,12 @@ export function createOfflineQueueStore(options: { bindWindowEvents?: boolean } 
         latestActiveUserId &&
         event.key === getOfflineQueueStorageKey(latestActiveUserId)
       ) {
-        void store.getState().refreshUserQueueFromStorage(latestActiveUserId);
+        void store
+          .getState()
+          .refreshUserQueueFromStorage(latestActiveUserId)
+          .catch((err) => {
+            console.warn('[TripLedger] Offline queue storage refresh failed:', err);
+          });
       }
     };
     window.addEventListener('storage', storageListener);

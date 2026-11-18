@@ -40,7 +40,10 @@ export function AppShell(): React.ReactElement {
     isSyncing,
     queue,
     legacyDiscardedCount,
+    crossTabCoordinationDegraded,
+    syncError,
     dismissLegacyNotice,
+    dismissSyncError,
     flushOfflineQueue,
   } = useOfflineSync();
   const [showQueueDrawer, setShowQueueDrawer] = useState(false);
@@ -252,6 +255,32 @@ export function AppShell(): React.ReactElement {
             >
               Dismiss
             </button>
+          </div>
+        )}
+
+        {/* Cross-tab sync lock or queue coordination error banner */}
+        {syncError && (
+          <div
+            role="alert"
+            className="bg-rose-50 border-b border-rose-200 px-4 py-2 flex items-center justify-between text-xs text-rose-800 gap-2"
+          >
+            <span>{syncError}</span>
+            <button
+              type="button"
+              onClick={dismissSyncError}
+              className="shrink-0 font-semibold text-rose-700 hover:text-rose-900 underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {crossTabCoordinationDegraded && !syncError && queue.length > 0 && (
+          <div
+            role="status"
+            className="bg-amber-50 border-b border-amber-200 px-4 py-1.5 text-[11px] text-amber-800"
+          >
+            Browser cross-tab lock failed; queued changes are serialized in this tab only—avoid simultaneous edits in other tabs.
           </div>
         )}
 
