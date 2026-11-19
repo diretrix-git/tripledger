@@ -2310,4 +2310,90 @@ describe('Phase 3.1.6: Offline queue account isolation (L-01) and async session 
       setItemSpy.mockRestore();
     }
   });
+
+  it('QuickAddExpenseModal submits and queues expenses cleanly on non-secure HTTP LAN origins where crypto.randomUUID is undefined', async () => {
+    const userA = makeUser({ id: 'user-a', name: 'Alice', email: 'alice@example.com' });
+    useAuthStore.getState().setAuth(userA, 'tok-a', 'ref-a');
+    useOfflineQueueStore.getState().setOnlineStatus(true);
+
+    const postedBodies: Array<{ title: string; clientMutationId: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/trips/trip-lan-1/expenses') && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as { title: string; clientMutationId: string };
+          postedBodies.push(body);
+          return jsonResponse({ success: true, data: { expense: { id: 'exp-lan-1' } } }, 201);
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      })
+    );
+
+    const originalCrypto = globalThis.crypto;
+    const nonSecureCrypto = {
+      getRandomValues: originalCrypto.getRandomValues.bind(originalCrypto),
+      randomUUID: undefined,
+    };
+    Object.defineProperty(globalThis, 'crypto', {
+      value: nonSecureCrypto,
+      configurable: true,
+      writable: true,
+    });
+
+    const onClose = vi.fn();
+    try {
+      render(
+        <QueryClientProvider
+          client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+        >
+          <QuickAddExpenseModal
+            tripId="trip-lan-1"
+            tripName="LAN Mobile Trip"
+            tripMode="FRIENDS"
+            myParticipantId="p-a"
+            participants={[
+              {
+                id: 'p-a',
+                tripId: 'trip-lan-1',
+                userId: 'user-a',
+                familyId: null,
+                name: 'Alice',
+                role: 'ORGANIZER',
+                memberType: 'ADULT',
+                defaultWeight: 1,
+                isActive: true,
+              },
+            ]}
+            families={[]}
+            onClose={onClose}
+          />
+        </QueryClientProvider>
+      );
+
+      fireEvent.change(
+        screen.getByPlaceholderText('e.g., Highway Fuel, Lunch, Resort Package'),
+        { target: { value: 'Mobile LAN Expense' } }
+      );
+      fireEvent.change(screen.getByPlaceholderText('e.g., 5000'), {
+        target: { value: '1250' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Save Expense' }));
+
+      await waitFor(() => {
+        expect(onClose).toHaveBeenCalledTimes(1);
+      });
+      expect(postedBodies).toHaveLength(1);
+      expect(postedBodies[0]!.title).toBe('Mobile LAN Expense');
+      expect(postedBodies[0]!.clientMutationId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      );
+    } finally {
+      Object.defineProperty(globalThis, 'crypto', {
+        value: originalCrypto,
+        configurable: true,
+        writable: true,
+      });
+    }
+  });
 });

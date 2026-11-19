@@ -87,6 +87,8 @@ describe('Phase 2 Commit 2: Email verification lifecycle, live DB checks & multi
 
     expect(regRes.status).toBe(201);
     expect(regRes.body.data.accessToken).toBeDefined();
+    expect(regRes.body.data.refreshToken).toBeDefined();
+    expect(regRes.body.data.emailVerificationSent).toBe(true);
     expect(regRes.body.data.user.emailVerified).toBe(false);
     expect(regRes.body.data.user.emailVerifiedAt).toBeNull();
     expect(regRes.body.data.verificationToken).toBeUndefined();
@@ -164,7 +166,7 @@ describe('Phase 2 Commit 2: Email verification lifecycle, live DB checks & multi
     expect(getTestEmailOutbox()).toHaveLength(0);
   });
 
-  it('preserves user and hashed expiring token on registration email delivery 503 failure, allowing login and resend recovery', async () => {
+  it('completes registration with 201 and emailVerificationSent: false on email delivery failure, preserving unverified status, tokens, contributor invite claiming, and resend recovery', async () => {
     const failingService = new EmailDeliveryService(
       buildEnvConfig({ NODE_ENV: 'development', EMAIL_PROVIDER: 'DISABLED' })
     );
@@ -176,21 +178,141 @@ describe('Phase 2 Commit 2: Email verification lifecycle, live DB checks & multi
       password: 'Password123',
     });
 
-    expect(regFailRes.status).toBe(503);
-    expect(regFailRes.body.error.code).toBe('EMAIL_DELIVERY_FAILED');
-    expect(regFailRes.body.data).toBeUndefined();
+    expect(regFailRes.status).toBe(201);
+    expect(regFailRes.body.success).toBe(true);
+    expect(regFailRes.body.data.emailVerificationSent).toBe(false);
+    expect(regFailRes.body.data.accessToken).toEqual(expect.any(String));
+    expect(regFailRes.body.data.refreshToken).toEqual(expect.any(String));
+    expect(regFailRes.body.data.user.emailVerified).toBe(false);
+    expect(regFailRes.body.data.user.emailVerifiedAt).toBeNull();
+    expect(regFailRes.body.data.verificationToken).toBeUndefined();
+    expect(regFailRes.body.data.rawToken).toBeUndefined();
+    expect(regFailRes.body.data.user.emailVerificationTokenHash).toBeUndefined();
 
-    // Account is NOT deleted; stays unverified with hashed, expiring verification token intact
+    // Account stays unverified with hashed, expiring verification token intact and no resend cooldown penalty
     const persisted = await UserModel.findOne({ email: 'recover@example.com' }).select(
-      '+emailVerificationTokenHash +emailVerificationExpiresAt'
+      '+emailVerificationTokenHash +emailVerificationExpiresAt +emailVerificationLastSentAt'
     );
     expect(persisted).not.toBeNull();
     expect(persisted?.emailVerified).toBe(false);
     expect(persisted?.emailVerificationTokenHash).toMatch(/^[a-f0-9]{64}$/);
     expect(persisted?.emailVerificationExpiresAt?.getTime()).toBeGreaterThan(Date.now());
+    expect(persisted?.emailVerificationLastSentAt).toBeNull();
     const originalHash = persisted!.emailVerificationTokenHash!;
+    expect(JSON.stringify(regFailRes.body)).not.toContain(originalHash);
 
-    // User can log in with password while unverified to recover
+    // Returned accessToken from registration is immediately usable for authenticated sessions
+    const initialAccessToken = regFailRes.body.data.accessToken as string;
+    const meRes = await request(app)
+      .get('/api/v1/auth/me')
+      .set('Authorization', `Bearer ${initialAccessToken}`);
+    expect(meRes.status).toBe(200);
+    expect(meRes.body.data.user.emailVerified).toBe(false);
+
+    // Unverified user can claim an email-less CONTRIBUTOR invitation, while privileged/email-bound invitations require verified email
+    const organizerRes = await request(app).post('/api/v1/auth/register').send({
+      name: 'Trip Organizer',
+      email: 'organizer.invite@example.com',
+      password: 'Password123',
+    });
+    const organizerToken = organizerRes.body.data.accessToken as string;
+    clearTestEmailOutbox();
+
+    const tripCreateRes = await request(app)
+      .post('/api/v1/trips')
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({ name: 'Closed Group MVP Trip', mode: 'FRIENDS' });
+    expect(tripCreateRes.status).toBe(201);
+    const tripId = tripCreateRes.body.data.trip.id as string;
+
+    const contribPartRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/participants`)
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({ name: 'Recoverable Contributor', role: 'PARTICIPANT' });
+    expect(contribPartRes.status).toBe(201);
+    const contribParticipantId = contribPartRes.body.data.participant.id as string;
+
+    const coOrgPartRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/participants`)
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({ name: 'Privileged Co-Organizer', role: 'PARTICIPANT' });
+    expect(coOrgPartRes.status).toBe(201);
+    const coOrgParticipantId = coOrgPartRes.body.data.participant.id as string;
+
+    const emailBoundPartRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/participants`)
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({
+        name: 'Email Bound Contributor',
+        email: 'recover@example.com',
+        role: 'PARTICIPANT',
+      });
+    expect(emailBoundPartRes.status).toBe(201);
+    const emailBoundParticipantId = emailBoundPartRes.body.data.participant.id as string;
+
+    const contribInviteRes = await request(appWithFailingMail)
+      .post(`/api/v1/trips/${tripId}/participants/${contribParticipantId}/invites`)
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({ grantedRole: 'CONTRIBUTOR' });
+    expect(contribInviteRes.status).toBe(201);
+    const contribInviteToken = contribInviteRes.body.data.rawToken as string;
+
+    const coOrgInviteRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/participants/${coOrgParticipantId}/invites`)
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({ grantedRole: 'ORGANIZER', intendedEmail: 'recover@example.com' });
+    expect(coOrgInviteRes.status).toBe(201);
+    const coOrgInviteToken = coOrgInviteRes.body.data.rawToken as string;
+
+    const emailBoundInviteRes = await request(app)
+      .post(`/api/v1/trips/${tripId}/participants/${emailBoundParticipantId}/invites`)
+      .set('Authorization', `Bearer ${organizerToken}`)
+      .send({ grantedRole: 'CONTRIBUTOR', intendedEmail: 'recover@example.com' });
+    expect(emailBoundInviteRes.status).toBe(201);
+    const emailBoundInviteToken = emailBoundInviteRes.body.data.rawToken as string;
+    clearTestEmailOutbox();
+
+    // Privileged ORGANIZER invite is blocked for unverified user (403 EMAIL_NOT_VERIFIED)
+    const claimCoOrg = await request(app)
+      .post('/api/v1/trips/invites/claim')
+      .set('Authorization', `Bearer ${initialAccessToken}`)
+      .send({ token: coOrgInviteToken });
+    expect(claimCoOrg.status).toBe(403);
+    expect(claimCoOrg.body.error.code).toBe('EMAIL_NOT_VERIFIED');
+
+    // Email-bound invite is blocked for unverified user (403 EMAIL_NOT_VERIFIED)
+    const claimEmailBound = await request(app)
+      .post('/api/v1/trips/invites/claim')
+      .set('Authorization', `Bearer ${initialAccessToken}`)
+      .send({ token: emailBoundInviteToken });
+    expect(claimEmailBound.status).toBe(403);
+    expect(claimEmailBound.body.error.code).toBe('EMAIL_NOT_VERIFIED');
+
+    // Email-less CONTRIBUTOR invite succeeds for unverified user (200)
+    const claimContrib = await request(app)
+      .post('/api/v1/trips/invites/claim')
+      .set('Authorization', `Bearer ${initialAccessToken}`)
+      .send({ token: contribInviteToken });
+    expect(claimContrib.status).toBe(200);
+    expect(claimContrib.body.data.role).toBe('CONTRIBUTOR');
+    const claimedParticipant = await ParticipantModel.findById(contribParticipantId);
+    expect(claimedParticipant?.userId?.toString()).toBe(persisted!._id.toString());
+    expect(claimedParticipant?.role).toBe('CONTRIBUTOR');
+
+    // Database creation failures still fail appropriately and never return 201
+    const createSpy = vi
+      .spyOn(UserModel, 'create')
+      .mockRejectedValueOnce(new Error('Simulated MongoDB write failure'));
+    const dbFailRes = await request(appWithFailingMail).post('/api/v1/auth/register').send({
+      name: 'DB Error User',
+      email: 'dberror@example.com',
+      password: 'Password123',
+    });
+    expect(dbFailRes.status).toBe(500);
+    expect(dbFailRes.body.success).toBe(false);
+    createSpy.mockRestore();
+
+    // User can also log in with password while unverified to recover
     const loginRes = await request(app).post('/api/v1/auth/login').send({
       email: 'recover@example.com',
       password: 'Password123',

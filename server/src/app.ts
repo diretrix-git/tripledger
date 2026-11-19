@@ -33,18 +33,66 @@ export interface CreateAppOptions {
   now?: () => number;
 }
 
+function isAllowedDevLanOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      host.endsWith('.localhost')
+    ) {
+      return true;
+    }
+    // RFC 1918 private IPv4 ranges for local Wi-Fi / LAN mobile testing in non-production
+    if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+    if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function createApp(options: CreateAppOptions = {}): express.Application {
   const app = express();
+  const isProduction = env.NODE_ENV === 'production';
   const effectiveRateLimit = resolveEffectiveRateLimitConfig(env, {
     enableInTest: options.enableRateLimitInTest,
     storeTypeOverride: options.rateLimitStoreOverride,
   });
 
   app.set('trust proxy', parseTrustProxySetting(env.TRUST_PROXY, env.NODE_ENV));
-  app.use(helmet());
+  app.use(
+    isProduction
+      ? helmet()
+      : helmet({
+          contentSecurityPolicy: false,
+          crossOriginOpenerPolicy: false,
+          originAgentCluster: false,
+          strictTransportSecurity: false,
+        })
+  );
   app.use(
     cors({
-      origin: env.CLIENT_URL,
+      origin: isProduction
+        ? env.CLIENT_URL
+        : (requestOrigin, callback) => {
+            if (
+              !requestOrigin ||
+              requestOrigin === env.CLIENT_URL ||
+              isAllowedDevLanOrigin(requestOrigin)
+            ) {
+              callback(null, requestOrigin ?? env.CLIENT_URL);
+              return;
+            }
+            callback(null, false);
+          },
       credentials: true,
     })
   );

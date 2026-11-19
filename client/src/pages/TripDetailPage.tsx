@@ -224,7 +224,35 @@ export function TripDetailPage(): React.ReactElement {
   const familyNameMap = new Map(families.map((f) => [f.id, f.name]));
 
   const copyToClipboard = (text: string, label: string) => {
-    void navigator.clipboard.writeText(text);
+    const fallbackCopy = () => {
+      if (typeof document === 'undefined') return;
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      try {
+        textarea.select();
+        document.execCommand('copy');
+      } catch {
+        // ignore fallback copy errors
+      } finally {
+        document.body.removeChild(textarea);
+      }
+    };
+
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.clipboard &&
+      typeof navigator.clipboard.writeText === 'function'
+    ) {
+      void navigator.clipboard.writeText(text).catch(() => {
+        fallbackCopy();
+      });
+    } else {
+      fallbackCopy();
+    }
     setCopiedBanner(label);
     setTimeout(() => setCopiedBanner(null), 2500);
   };

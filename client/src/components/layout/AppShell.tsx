@@ -1,5 +1,5 @@
 import React, { useContext, useEffect, useState } from 'react';
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { QueryClientContext } from '@tanstack/react-query';
 import {
   Compass,
@@ -47,12 +47,35 @@ export function AppShell(): React.ReactElement {
     flushOfflineQueue,
   } = useOfflineSync();
   const [showQueueDrawer, setShowQueueDrawer] = useState(false);
+  const location = useLocation();
+  const prevSessionGenRef = React.useRef(sessionGeneration);
+  const [showRegistrationMailNotice, setShowRegistrationMailNotice] = useState(() =>
+    Boolean(
+      location.state &&
+        typeof location.state === 'object' &&
+        (location.state as { emailVerificationSent?: unknown }).emailVerificationSent === false
+    )
+  );
 
   useAuthCacheIsolation();
 
   useEffect(() => {
     setShowQueueDrawer(false);
+    if (prevSessionGenRef.current !== sessionGeneration) {
+      prevSessionGenRef.current = sessionGeneration;
+      setShowRegistrationMailNotice(false);
+    }
   }, [sessionGeneration, user?.id]);
+
+  useEffect(() => {
+    if (
+      location.state &&
+      typeof location.state === 'object' &&
+      (location.state as { emailVerificationSent?: unknown }).emailVerificationSent === false
+    ) {
+      setShowRegistrationMailNotice(true);
+    }
+  }, [location.state]);
 
   useEffect(() => {
     if (!accessToken || !user?.id) return;
@@ -212,10 +235,21 @@ export function AppShell(): React.ReactElement {
             </button>
             <NavLink
               to="/settings"
+              title="Settings"
+              aria-label="Settings"
               className="p-1.5 text-slate-600 hover:text-slate-900 rounded-lg"
             >
               <Settings className="w-4 h-4" />
             </NavLink>
+            <button
+              type="button"
+              onClick={handleLogout}
+              title="Sign out"
+              aria-label="Sign out"
+              className="p-1.5 text-slate-600 hover:text-rose-600 rounded-lg transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
           </div>
         </header>
 
@@ -235,6 +269,26 @@ export function AppShell(): React.ReactElement {
             >
               Verify in Settings
             </NavLink>
+          </div>
+        )}
+
+        {user && user.emailVerified === false && showRegistrationMailNotice && (
+          <div
+            role="status"
+            className="bg-amber-50 text-amber-900 border-b border-amber-200 px-4 py-2 flex items-center justify-between text-xs gap-2"
+          >
+            <span>
+              Your account was created and you are signed in, but the verification email could not be
+              sent right now. You can continue using TripLedger and resend verification from
+              Settings.
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowRegistrationMailNotice(false)}
+              className="shrink-0 font-semibold text-amber-800 hover:text-amber-950 underline"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 

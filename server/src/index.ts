@@ -4,6 +4,7 @@ import { createApp } from './app.js';
 import { connectDatabase } from './config/database.js';
 import { env, validateProductionStartupConfig, type EnvConfig } from './config/env.js';
 import { ensureRateLimitIndexes } from './services/rateLimitStore.js';
+import { redactSensitiveText } from './utils/redact.js';
 
 export async function bootstrap(
   config: EnvConfig = env,
@@ -13,15 +14,15 @@ export async function bootstrap(
     createAppFn?: typeof createApp;
   } = {}
 ): Promise<void> {
-  // Validate production email delivery, HTTPS CLIENT_URL, proxy/rate-limit topology, and JWT secrets BEFORE connecting or listening.
+  // Validate production email delivery, HTTPS CLIENT_URL, MONGODB_URI, proxy/rate-limit topology, and JWT secrets BEFORE connecting or listening.
   validateProductionStartupConfig(config);
   await (deps.connectDb ? deps.connectDb() : connectDatabase());
   if (config.RATE_LIMIT_STORE === 'mongo') {
     await (deps.ensureIndexesFn ? deps.ensureIndexesFn() : ensureRateLimitIndexes());
   }
   const app = (deps.createAppFn ?? createApp)();
-  app.listen(config.PORT, () => {
-    console.log(`[TripLedger Server] Running on http://localhost:${config.PORT}`);
+  app.listen(config.PORT, '0.0.0.0', () => {
+    console.log(`[TripLedger Server] Running on http://0.0.0.0:${config.PORT}`);
   });
 }
 
@@ -31,7 +32,15 @@ const isEntrypoint =
 
 if (isEntrypoint) {
   bootstrap().catch((err) => {
-    console.error('[TripLedger Server] Fatal startup error:', err);
+    const rawMessage = err instanceof Error ? err.stack ?? err.message : String(err);
+    const safeMessage = redactSensitiveText(rawMessage, [
+      env.MONGODB_URI,
+      env.JWT_ACCESS_SECRET,
+      env.JWT_REFRESH_SECRET,
+      env.SMTP_PASS,
+      env.EMAIL_WEBHOOK_API_KEY,
+    ]);
+    console.error('[TripLedger Server] Fatal startup error:', safeMessage);
     process.exit(1);
   });
 }

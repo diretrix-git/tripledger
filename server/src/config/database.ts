@@ -22,10 +22,15 @@ export async function connectDatabase(
   const targetUri = uriOverride ?? env.MONGODB_URI;
   const autoIndexOpt =
     options?.autoIndex !== undefined ? { autoIndex: options.autoIndex } : {};
+  const isRemoteOrProd =
+    env.NODE_ENV === 'production' ||
+    targetUri.startsWith('mongodb+srv://') ||
+    !/\/\/(127\.0\.0\.1|localhost|\[::1\])(?::|\/|$)/i.test(targetUri);
+  const serverSelectionTimeoutMS = isRemoteOrProd ? 15_000 : 2500;
 
   try {
     await mongoose.connect(targetUri, {
-      serverSelectionTimeoutMS: 2500,
+      serverSelectionTimeoutMS,
       ...autoIndexOpt,
     });
     return;

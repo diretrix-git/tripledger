@@ -283,7 +283,7 @@ describe('M-05: Frontend email verification, cross-user isolation, history clean
     });
   });
 
-  it('handles SettingsPage resend verification & alreadyVerified sync, plus AuthPage 503 recovery banner', async () => {
+  it('handles SettingsPage resend verification & alreadyVerified sync, plus 201 registration with emailVerificationSent: false notice', async () => {
     const settingsUser: AuthUser = {
       id: 'user-settings-1',
       name: 'Settings User',
@@ -294,10 +294,20 @@ describe('M-05: Frontend email verification, cross-user isolation, history clean
     };
     useAuthStore.getState().setAuth(settingsUser, 'access-settings', 'refresh-settings');
 
+    const outageUser: AuthUser = {
+      id: 'user-outage-1',
+      name: 'Outage User',
+      email: 'outage@example.com',
+      emailVerified: false,
+      emailVerifiedAt: null,
+      defaultCurrency: 'NPR',
+    };
+
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/auth/me')) {
-        return jsonResponse({ success: true, data: { user: settingsUser } });
+        const currentUser = useAuthStore.getState().user ?? settingsUser;
+        return jsonResponse({ success: true, data: { user: currentUser } });
       }
       if (url.endsWith('/auth/resend-verification')) {
         return jsonResponse({
@@ -308,13 +318,15 @@ describe('M-05: Frontend email verification, cross-user isolation, history clean
       if (url.endsWith('/auth/register')) {
         return jsonResponse(
           {
-            success: false,
-            error: {
-              code: 'EMAIL_DELIVERY_FAILED',
-              message: 'Unable to deliver verification email.',
+            success: true,
+            data: {
+              user: outageUser,
+              accessToken: 'access-outage-201',
+              refreshToken: 'refresh-outage-201',
+              emailVerificationSent: false,
             },
           },
-          503
+          201
         );
       }
       throw new Error(`Unexpected fetch: ${url}`);
@@ -340,11 +352,19 @@ describe('M-05: Frontend email verification, cross-user isolation, history clean
 
     cleanup();
     useAuthStore.getState().clearAuth();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     render(
-      <MemoryRouter initialEntries={['/register']}>
-        <AuthPage mode="register" />
-      </MemoryRouter>
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/register']}>
+          <Routes>
+            <Route path="/register" element={<AuthPage mode="register" />} />
+            <Route path="/" element={<AppShell />}>
+              <Route index element={<div>Dashboard After Register</div>} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
     );
 
     fireEvent.change(screen.getByPlaceholderText(/Aarav Sharma/i), {
@@ -359,8 +379,13 @@ describe('M-05: Frontend email verification, cross-user isolation, history clean
     fireEvent.click(screen.getByRole('button', { name: /Create Account/i }));
 
     await waitFor(() => {
+      expect(useAuthStore.getState().accessToken).toBe('access-outage-201');
+      expect(useAuthStore.getState().user?.emailVerified).toBe(false);
+      expect(screen.getByText('Dashboard After Register')).toBeInTheDocument();
       expect(
-        screen.getByText(/Your account was created, but sending the verification email failed\./i)
+        screen.getByText(
+          /Your account was created and you are signed in, but the verification email could not be sent right now\./i
+        )
       ).toBeInTheDocument();
     });
   });

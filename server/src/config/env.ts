@@ -299,8 +299,31 @@ export function validateRateLimitTopologyConfig(config: EnvConfig): void {
   }
 }
 
+export function validateMongoUri(mongoUri: string, nodeEnv: string): void {
+  const trimmed = mongoUri.trim();
+  if (
+    !trimmed ||
+    (!trimmed.startsWith('mongodb://') && !trimmed.startsWith('mongodb+srv://'))
+  ) {
+    throw new Error(
+      'MONGODB_URI must be a valid mongodb:// or mongodb+srv:// connection string.'
+    );
+  }
+
+  if (nodeEnv === 'production') {
+    const hostMatch = trimmed.match(/^mongodb(?:\+srv)?:\/\/(?:[^@/]+@)?([^/?,]+)/i);
+    const firstHost = (hostMatch?.[1] ?? '').split(':')[0]?.toLowerCase() ?? '';
+    if (!firstHost || isLoopbackHost(firstHost)) {
+      throw new Error(
+        `MONGODB_URI host "${firstHost || 'empty'}" cannot be localhost or loopback in production. Configure a MongoDB Atlas or remote replica-set connection string.`
+      );
+    }
+  }
+}
+
 export function validateProductionStartupConfig(config: EnvConfig): void {
   validateClientUrl(config.CLIENT_URL, config.NODE_ENV);
+  validateMongoUri(config.MONGODB_URI, config.NODE_ENV);
   parseTrustProxySetting(config.TRUST_PROXY, config.NODE_ENV);
   validateEmailConfig(config);
   validateRateLimitTopologyConfig(config);

@@ -23,6 +23,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
   const [password, setPassword] = useState('');
   const [phone, setPhone] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -36,6 +37,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
     if (prevGenerationRef.current !== sessionGeneration) {
       prevGenerationRef.current = sessionGeneration;
       setError(null);
+      setNotice(null);
       setLoading(false);
     }
   }, [sessionGeneration]);
@@ -44,6 +46,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
     e.preventDefault();
     const startSession = captureAuthSessionSnapshot();
     setError(null);
+    setNotice(null);
     setLoading(true);
 
     try {
@@ -57,6 +60,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
         user: AuthUser;
         accessToken: string;
         refreshToken: string;
+        emailVerificationSent?: boolean;
       }>(endpoint, {
         method: 'POST',
         body: JSON.stringify(body),
@@ -75,6 +79,16 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
 
       clearAuthQueryCache(queryClient);
       setAuth(data.user, data.accessToken, data.refreshToken);
+      prevGenerationRef.current = useAuthStore.getState().sessionGeneration;
+
+      if (mode === 'register' && data.emailVerificationSent === false) {
+        setNotice(
+          'Your account was created and you are signed in, but the verification email could not be sent right now. You can continue using TripLedger and resend verification from Settings.'
+        );
+        navigate('/', { state: { emailVerificationSent: false } });
+        return;
+      }
+
       navigate('/');
     } catch (err) {
       if (!isMountedRef.current || !isSameAuthSession(startSession)) {
@@ -118,6 +132,15 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }): React.ReactE
               className="mb-4 rounded-xl bg-rose-50 border border-rose-200 p-3 text-xs font-medium text-rose-700"
             >
               {error}
+            </div>
+          )}
+
+          {notice && (
+            <div
+              role="status"
+              className="mb-4 rounded-xl bg-amber-50 border border-amber-200 p-3 text-xs font-medium text-amber-800"
+            >
+              {notice}
             </div>
           )}
 

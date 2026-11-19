@@ -18,6 +18,7 @@ import {
 import { apiRequest } from '../../api/client.js';
 import { captureAuthSessionSnapshot, isSameAuthSession } from '../../stores/authStore.js';
 import { useOfflineQueueStore } from '../../stores/offlineQueueStore.js';
+import { generateUUID } from '../../utils/uuid.js';
 
 interface QuickAddExpenseModalProps {
   tripId: string;
@@ -165,7 +166,7 @@ export function QuickAddExpenseModal({
         }
       }
 
-      const clientMutationId = crypto.randomUUID();
+      const clientMutationId = generateUUID();
 
       const customShares =
         splitMethod === 'CUSTOM'

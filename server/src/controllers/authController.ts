@@ -127,14 +127,23 @@ export function createAuthHandlers(
       throw err;
     }
 
-    // On delivery failure, preserve the created unverified user and its hashed, expiring token so
-    // the user can still log in and call resend-verification to recover once delivery recovers.
-    await emailDelivery.sendVerificationEmail({
-      to: user.email,
-      recipientName: user.name,
-      rawToken,
-      expiresInMinutes: EMAIL_VERIFICATION_TTL_MINUTES,
-    });
+    // On delivery failure, preserve the created unverified user and its hashed, expiring token,
+    // complete registration with HTTP 201 and emailVerificationSent: false so the user can proceed
+    // immediately and resend verification later from Settings.
+    let emailVerificationSent = false;
+    try {
+      await emailDelivery.sendVerificationEmail({
+        to: user.email,
+        recipientName: user.name,
+        rawToken,
+        expiresInMinutes: EMAIL_VERIFICATION_TTL_MINUTES,
+      });
+      emailVerificationSent = true;
+    } catch (err) {
+      if (!(err instanceof AppError && err.code === 'EMAIL_DELIVERY_FAILED')) {
+        throw err;
+      }
+    }
 
     const accessToken = signAccessToken({
       userId: user._id.toString(),
@@ -144,7 +153,9 @@ export function createAuthHandlers(
     const refreshToken = signRefreshToken({ userId: user._id.toString() });
 
     // Record successful verification send timestamp for the 60-second resend cooldown only AFTER delivery succeeds.
-    user.emailVerificationLastSentAt = new Date(nowProvider());
+    if (emailVerificationSent) {
+      user.emailVerificationLastSentAt = new Date(nowProvider());
+    }
     user.refreshTokenHash = hashToken(refreshToken);
     await user.save();
 
@@ -156,6 +167,7 @@ export function createAuthHandlers(
         accessToken,
         refreshToken,
         user: formatAuthUser(user),
+        emailVerificationSent,
       },
       201
     );

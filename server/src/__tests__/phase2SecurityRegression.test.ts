@@ -500,8 +500,10 @@ describe('Phase 2 Full Security Regression Suite (SEC-01 Auth & Membership Harde
       email: 'outage@example.com',
       password: 'Password123',
     });
-    expect(failedReg.status).toBe(503);
-    expect(failedReg.body.error.code).toBe('EMAIL_DELIVERY_FAILED');
+    expect(failedReg.status).toBe(201);
+    expect(failedReg.body.data.emailVerificationSent).toBe(false);
+    expect(failedReg.body.data.user.emailVerified).toBe(false);
+    expect(failedReg.body.data.accessToken).toEqual(expect.any(String));
 
     const recoveredLogin = await request(testServer).post('/api/v1/auth/login').send({
       email: 'outage@example.com',

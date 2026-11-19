@@ -149,12 +149,24 @@ describe('Phase 2 Commit 1: Email configuration, delivery providers, and startup
     expect(parseTrustProxySetting('1', 'production')).toBe(1);
     expect(parseTrustProxySetting('loopback', 'production')).toBe('loopback');
 
-    // Placeholder JWT secrets are rejected in production
+    // Placeholder JWT secrets and localhost MONGODB_URI are rejected in production
     expect(() =>
       validateProductionStartupConfig(
         buildEnvConfig(validProductionEnv({ JWT_ACCESS_SECRET: undefined }))
       )
     ).toThrow(/JWT_ACCESS_SECRET/i);
+    expect(() =>
+      validateProductionStartupConfig(
+        buildEnvConfig(validProductionEnv({ MONGODB_URI: undefined }))
+      )
+    ).toThrow(/MONGODB_URI/i);
+    expect(() =>
+      validateProductionStartupConfig(
+        buildEnvConfig(
+          validProductionEnv({ MONGODB_URI: 'mongodb://localhost:27017/tripledger' })
+        )
+      )
+    ).toThrow(/MONGODB_URI/i);
   });
 
   it('fails fast during bootstrap before connecting DB or calling app.listen when production email config is invalid', async () => {
